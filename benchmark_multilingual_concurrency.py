@@ -5,8 +5,10 @@ import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import torch
+import torchaudio as ta
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
@@ -77,6 +79,7 @@ def run_concurrency_level(
     language_id: str,
     audio_prompt_path: str | None,
     device: str,
+    output_dir: str | None,
 ):
     sessions = []
     if impl in {"streaming", "concurrent"}:
@@ -110,6 +113,7 @@ def run_concurrency_level(
             "latency_s": ended - started,
             "num_samples": None if wav is None else int(wav.shape[-1]),
             "error": error,
+            "wav": wav,
         }
 
     wall_start = time.perf_counter()
@@ -119,6 +123,18 @@ def run_concurrency_level(
             future.result()
     maybe_sync(device)
     wall_s = time.perf_counter() - wall_start
+
+    saved_wavs = []
+    if output_dir:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        for index, item in enumerate(results):
+            wav = item["wav"]
+            if wav is None or item["error"] is not None:
+                continue
+            wav_path = output_path / f"{impl}_c{concurrency}_r{index}.wav"
+            ta.save(str(wav_path), wav, model.sr)
+            saved_wavs.append(str(wav_path))
 
     latencies = [item["latency_s"] for item in results if item["error"] is None]
     sample_counts = [item["num_samples"] for item in results if item["num_samples"] is not None]
@@ -134,6 +150,7 @@ def run_concurrency_level(
         "audio_seconds_total": round(total_audio_s, 4),
         "audio_seconds_per_second": round(total_audio_s / wall_s, 4) if wall_s > 0 else None,
         "errors": [item["error"] for item in results if item["error"] is not None],
+        "saved_wavs": saved_wavs,
     }
 
 
@@ -147,6 +164,7 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
     parser.add_argument("--trace-shapes", action="store_true")
+    parser.add_argument("--output-dir")
     args = parser.parse_args()
 
     configure_shape_logging(args.trace_shapes)
@@ -169,6 +187,7 @@ def main():
             language_id=args.language_id,
             audio_prompt_path=args.audio_prompt_path,
             device=args.device,
+            output_dir=args.output_dir,
         )
         print(f"concurrency={summary['concurrency']}")
         print(f"wall_s={summary['wall_s']:.4f}")
@@ -178,6 +197,7 @@ def main():
         print(f"num_samples={summary['num_samples']}")
         print(f"audio_seconds_total={summary['audio_seconds_total']}")
         print(f"audio_seconds_per_second={summary['audio_seconds_per_second']}")
+        print(f"saved_wavs={summary['saved_wavs']}")
         print(f"errors={summary['errors']}")
 
 
