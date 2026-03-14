@@ -15,6 +15,7 @@ from ..models.t3.inference.scheduled_decode import (
 
 
 shape_logger = logging.getLogger("chatterbox.shape")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -26,6 +27,10 @@ class _PendingScheduledRequest:
     submitted_at: float = field(default_factory=time.perf_counter)
     first_started_at: float | None = None
     first_token_at: float | None = None
+    first_audio_chunk_at: float | None = None
+    first_audio_chunk_num_samples: int | None = None
+    first_audio_chunk_token_count: int | None = None
+    first_audio_chunk_s3_s: float | None = None
     completed_at: float | None = None
     metrics: dict = field(default_factory=dict)
 
@@ -46,9 +51,10 @@ class T3DecodeScheduler:
     older cohorts are still decoding.
     """
 
-    def __init__(self, t3, *, batching_window_ms: float = 5.0):
+    def __init__(self, t3, *, batching_window_ms: float = 5.0, partial_audio_callback=None):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
+        self.partial_audio_callback = partial_audio_callback
         self.condition = threading.Condition()
         self.pending: list[_PendingScheduledRequest] = []
         self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
@@ -141,7 +147,7 @@ class T3DecodeScheduler:
             if item.first_started_at is None:
                 item.first_started_at = step_started_at
 
-        finished_results, first_token_session_ids, cohort_complete = advance_scheduled_cohort(
+        finished_results, first_token_session_ids, first_audio_candidates, cohort_complete = advance_scheduled_cohort(
             self.t3,
             cohort.cohort_state,
             patched_model=self.patched_model,
@@ -152,6 +158,24 @@ class T3DecodeScheduler:
             item = cohort.pending_by_session.get(session_id)
             if item is not None and item.first_token_at is None:
                 item.first_token_at = first_token_recorded_at
+        if self.partial_audio_callback is not None:
+            for session_id, speech_tokens in first_audio_candidates:
+                item = cohort.pending_by_session.get(session_id)
+                if item is None or item.first_audio_chunk_at is not None:
+                    continue
+                chunk_started_at = time.perf_counter()
+                try:
+                    num_samples = self.partial_audio_callback(item.decode_request, speech_tokens)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("first audio chunk synthesis failed for %s: %r", session_id, exc)
+                    continue
+                chunk_finished_at = time.perf_counter()
+                if num_samples is None:
+                    continue
+                item.first_audio_chunk_at = chunk_finished_at
+                item.first_audio_chunk_num_samples = int(num_samples)
+                item.first_audio_chunk_token_count = int(speech_tokens.shape[-1])
+                item.first_audio_chunk_s3_s = chunk_finished_at - chunk_started_at
 
         for session_id, result in finished_results:
             item = cohort.pending_by_session.pop(session_id)
@@ -159,6 +183,10 @@ class T3DecodeScheduler:
             item.metrics = {
                 "t3_wait_s": 0.0 if item.first_started_at is None else item.first_started_at - item.submitted_at,
                 "t3_first_token_s": 0.0 if item.first_token_at is None else item.first_token_at - item.submitted_at,
+                "first_audio_chunk_s": 0.0 if item.first_audio_chunk_at is None else item.first_audio_chunk_at - item.submitted_at,
+                "first_audio_chunk_num_samples": 0.0 if item.first_audio_chunk_num_samples is None else item.first_audio_chunk_num_samples,
+                "first_audio_chunk_token_count": 0.0 if item.first_audio_chunk_token_count is None else item.first_audio_chunk_token_count,
+                "first_audio_chunk_s3_s": 0.0 if item.first_audio_chunk_s3_s is None else item.first_audio_chunk_s3_s,
                 "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
                 "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
             }

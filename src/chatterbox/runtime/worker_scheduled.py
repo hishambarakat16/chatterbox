@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 
 import torch
@@ -28,13 +29,23 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
 
     def __init__(self, *args, batching_window_ms: float = 5.0, **kwargs):
         super().__init__(*args, **kwargs)
-        self.t3_scheduler = T3DecodeScheduler(self.t3, batching_window_ms=batching_window_ms)
+        self.s3_lock = threading.Lock()
+        self.first_audio_chunk_token_count = 16
+        self.t3_scheduler = T3DecodeScheduler(
+            self.t3,
+            batching_window_ms=batching_window_ms,
+            partial_audio_callback=self._synthesize_first_audio_chunk,
+        )
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         request_start = time.perf_counter()
         profile = {
             "text_prep_s": 0.0,
             "t3_first_token_s": 0.0,
+            "first_audio_chunk_s": 0.0,
+            "first_audio_chunk_num_samples": 0.0,
+            "first_audio_chunk_token_count": 0.0,
+            "first_audio_chunk_s3_s": 0.0,
             "t3_wait_s": 0.0,
             "t3_active_s": 0.0,
             "t3_s": 0.0,
@@ -81,6 +92,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         decode_request = ScheduledDecodeRequest(
             session_id=session.session_id,
             t3_cond=active_conds.t3,
+            s3_ref_dict=active_conds.gen,
             text_tokens=text_tokens,
             max_new_tokens=active_options.max_new_tokens,
             temperature=active_options.temperature,
@@ -88,6 +100,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             min_p=active_options.min_p,
             repetition_penalty=active_options.repetition_penalty,
             cfg_weight=active_options.cfg_weight,
+            first_audio_chunk_token_count=self.first_audio_chunk_token_count,
         )
 
         with torch.inference_mode():
@@ -106,10 +119,11 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
             s3_start = time.perf_counter()
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=active_conds.gen,
-            )
+            with self.s3_lock:
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=active_conds.gen,
+                )
             profile["s3_s"] = time.perf_counter() - s3_start
             profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()
@@ -132,3 +146,25 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         updated.emotion_adv = exaggeration * torch.ones(1, 1, 1)
         conds.t3 = updated.to(device=self.device)
         return conds
+
+    def _synthesize_first_audio_chunk(self, request: ScheduledDecodeRequest, speech_tokens: torch.Tensor):
+        speech_tokens = speech_tokens[0]
+        speech_tokens = drop_invalid_tokens(speech_tokens)
+        if speech_tokens.numel() <= 3:
+            return None
+
+        speech_tokens = speech_tokens.to(self.device).unsqueeze(0)
+        speech_token_lens = torch.tensor([speech_tokens.shape[-1]], device=self.device, dtype=torch.long)
+
+        with self.s3_lock:
+            output_mels = self.s3gen.flow_inference(
+                speech_tokens=speech_tokens,
+                ref_dict=request.s3_ref_dict,
+                finalize=False,
+                speech_token_lens=speech_token_lens,
+            )
+            output_mels = output_mels.to(dtype=self.s3gen.dtype)
+            output_wavs, _ = self.s3gen.hift_inference(output_mels, None)
+            if not self.s3gen.training:
+                output_wavs[:, :len(self.s3gen.trim_fade)] *= self.s3gen.trim_fade
+        return int(output_wavs.shape[-1])
