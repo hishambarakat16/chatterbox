@@ -10,6 +10,7 @@ import torch
 from ..models.t3.inference.scheduled_decode import (
     ScheduledDecodeRequest,
     advance_scheduled_cohort,
+    AlignmentPolicy,
     build_scheduled_runtime_components,
     prepare_scheduled_cohort,
 )
@@ -54,6 +55,8 @@ class T3DecodeScheduler:
         batching_window_ms: float = 5.0,
         enable_alignment: bool = True,
         alignment_inspect_every: int = 1,
+        alignment_head_count: int = 3,
+        alignment_policy: AlignmentPolicy | None = None,
     ):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
@@ -65,6 +68,8 @@ class T3DecodeScheduler:
             self.t3,
             enable_alignment=enable_alignment,
             alignment_inspect_every=alignment_inspect_every,
+            alignment_head_count=alignment_head_count,
+            alignment_policy=alignment_policy,
         )
         self.worker = threading.Thread(
             target=self._run_loop,
@@ -177,6 +182,35 @@ class T3DecodeScheduler:
                 "alignment_inspect_every": (
                     float(self.alignment_controller.inspect_every)
                     if self.alignment_controller is not None
+                    else 0.0
+                ),
+                "alignment_head_count": (
+                    float(len(self.alignment_controller.selected_heads))
+                    if self.alignment_controller is not None
+                    else 0.0
+                ),
+                "alignment_policy_block_eos": (
+                    1.0
+                    if self.alignment_controller is not None
+                    and self.alignment_controller.policy.block_eos_before_completion
+                    else 0.0
+                ),
+                "alignment_policy_force_long_tail": (
+                    1.0
+                    if self.alignment_controller is not None
+                    and self.alignment_controller.policy.force_on_long_tail
+                    else 0.0
+                ),
+                "alignment_policy_force_alignment_repetition": (
+                    1.0
+                    if self.alignment_controller is not None
+                    and self.alignment_controller.policy.force_on_alignment_repetition
+                    else 0.0
+                ),
+                "alignment_policy_force_token_repetition": (
+                    1.0
+                    if self.alignment_controller is not None
+                    and self.alignment_controller.policy.force_on_token_repetition
                     else 0.0
                 ),
             }

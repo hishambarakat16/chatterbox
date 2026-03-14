@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 LLAMA_ALIGNED_HEADS = [(12, 15), (13, 11), (9, 2)]
 
 
+@dataclass(frozen=True)
+class AlignmentPolicy:
+    block_eos_before_completion: bool = True
+    force_on_long_tail: bool = True
+    force_on_alignment_repetition: bool = True
+    force_on_token_repetition: bool = True
+
+
 @dataclass
 class ScheduledAlignmentState:
     text_tokens_slice: tuple[int, int]
@@ -56,7 +64,14 @@ class ScheduledAlignmentState:
             logger.warning("🚨 Detected 2x repetition of token %s", self.generated_tokens[-1])
         return token_repetition
 
-    def step(self, logits: torch.Tensor, aligned_attn: torch.Tensor, next_token=None) -> torch.Tensor:
+    def step(
+        self,
+        logits: torch.Tensor,
+        aligned_attn: torch.Tensor,
+        next_token=None,
+        policy: AlignmentPolicy | None = None,
+    ) -> torch.Tensor:
+        policy = policy or AlignmentPolicy()
         self.attention_steps += 1
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
@@ -94,23 +109,27 @@ class ScheduledAlignmentState:
 
         token_repetition = self._update_generated_tokens(next_token=next_token)
 
-        if cur_text_posn < text_len - 3 and text_len > 5:
+        if policy.block_eos_before_completion and cur_text_posn < text_len - 3 and text_len > 5:
             self.eos_blocked_steps += 1
             logits[..., self.eos_idx] = -(2**15)
 
-        if long_tail or alignment_repetition or token_repetition:
+        force_long_tail = policy.force_on_long_tail and long_tail
+        force_alignment_repetition = policy.force_on_alignment_repetition and alignment_repetition
+        force_token_repetition = policy.force_on_token_repetition and token_repetition
+
+        if force_long_tail or force_alignment_repetition or force_token_repetition:
             self.forced_eos_steps += 1
-            if long_tail:
+            if force_long_tail:
                 self.forced_eos_long_tail_steps += 1
-            if alignment_repetition:
+            if force_alignment_repetition:
                 self.forced_eos_alignment_repetition_steps += 1
-            if token_repetition:
+            if force_token_repetition:
                 self.forced_eos_token_repetition_steps += 1
             logger.warning(
                 "forcing EOS token, long_tail=%s, alignment_repetition=%s, token_repetition=%s",
-                long_tail,
-                alignment_repetition,
-                token_repetition,
+                force_long_tail,
+                force_alignment_repetition,
+                force_token_repetition,
             )
             logits = -(2**15) * torch.ones_like(logits)
             logits[..., self.eos_idx] = 2**15
@@ -118,10 +137,16 @@ class ScheduledAlignmentState:
         self.curr_frame_pos += 1
         return logits
 
-    def step_without_attention(self, logits: torch.Tensor, next_token=None) -> torch.Tensor:
+    def step_without_attention(
+        self,
+        logits: torch.Tensor,
+        next_token=None,
+        policy: AlignmentPolicy | None = None,
+    ) -> torch.Tensor:
+        policy = policy or AlignmentPolicy()
         self.cheap_steps += 1
         token_repetition = self._update_generated_tokens(next_token=next_token)
-        if token_repetition:
+        if policy.force_on_token_repetition and token_repetition:
             self.forced_eos_steps += 1
             self.forced_eos_token_repetition_steps += 1
             logger.warning("forcing EOS token without attention, token_repetition=%s", token_repetition)
@@ -152,14 +177,23 @@ class ScheduledAlignmentController:
     `(0, 2, 4, ...)` from the batched forward pass.
     """
 
-    def __init__(self, tfmr, *, inspect_every: int = 1):
+    def __init__(
+        self,
+        tfmr,
+        *,
+        inspect_every: int = 1,
+        selected_heads: list[tuple[int, int]] | None = None,
+        policy: AlignmentPolicy | None = None,
+    ):
         self.tfmr = tfmr
         self.inspect_every = max(1, int(inspect_every))
+        self.selected_heads = list(selected_heads or LLAMA_ALIGNED_HEADS)
+        self.policy = policy or AlignmentPolicy()
         self.original_output_attentions = None
         self.hook_handles = []
-        self.last_aligned_attns = [None] * len(LLAMA_ALIGNED_HEADS)
+        self.last_aligned_attns = [None] * len(self.selected_heads)
 
-        for buffer_idx, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
+        for buffer_idx, (layer_idx, head_idx) in enumerate(self.selected_heads):
             self._add_attention_spy(buffer_idx, layer_idx, head_idx)
 
     def _add_attention_spy(self, buffer_idx, layer_idx, head_idx):
@@ -207,11 +241,13 @@ class ScheduledAlignmentController:
                     logits[index : index + 1],
                     aligned_attn[index],
                     next_token=next_token,
+                    policy=self.policy,
                 )
             else:
                 logits[index : index + 1] = state.step_without_attention(
                     logits[index : index + 1],
                     next_token=next_token,
+                    policy=self.policy,
                 )
         return logits
 

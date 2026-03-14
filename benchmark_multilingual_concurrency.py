@@ -57,9 +57,23 @@ def configure_shape_logging(enabled: bool):
         logger.addHandler(handler)
 
 
-def configure_scheduled_runtime(alignment_mode: str, inspect_every: int, trace_step_shapes: bool):
+def configure_scheduled_runtime(
+    alignment_mode: str,
+    inspect_every: int,
+    trace_step_shapes: bool,
+    head_count: int,
+    block_eos: str,
+    force_long_tail: str,
+    force_alignment_repetition: str,
+    force_token_repetition: str,
+):
     os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT"] = alignment_mode
     os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_INSPECT_EVERY"] = str(max(1, inspect_every))
+    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_HEAD_COUNT"] = str(max(1, head_count))
+    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_BLOCK_EOS"] = block_eos
+    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_LONG_TAIL"] = force_long_tail
+    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_ALIGNMENT_REPETITION"] = force_alignment_repetition
+    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_TOKEN_REPETITION"] = force_token_repetition
     if trace_step_shapes:
         os.environ["CHATTERBOX_TRACE_STEP_SHAPES"] = "1"
     else:
@@ -261,10 +275,24 @@ def main():
     parser.add_argument("--output-dir")
     parser.add_argument("--scheduled-alignment", choices=["on", "off"], default="on")
     parser.add_argument("--scheduled-inspect-every", type=int, default=1)
+    parser.add_argument("--scheduled-alignment-head-count", type=int, default=3)
+    parser.add_argument("--scheduled-alignment-block-eos", choices=["on", "off"], default="on")
+    parser.add_argument("--scheduled-alignment-force-long-tail", choices=["on", "off"], default="on")
+    parser.add_argument("--scheduled-alignment-force-alignment-repetition", choices=["on", "off"], default="on")
+    parser.add_argument("--scheduled-alignment-force-token-repetition", choices=["on", "off"], default="on")
     args = parser.parse_args()
 
     configure_shape_logging(args.trace_shapes)
-    configure_scheduled_runtime(args.scheduled_alignment, args.scheduled_inspect_every, args.trace_step_shapes)
+    configure_scheduled_runtime(
+        args.scheduled_alignment,
+        args.scheduled_inspect_every,
+        args.trace_step_shapes,
+        args.scheduled_alignment_head_count,
+        args.scheduled_alignment_block_eos,
+        args.scheduled_alignment_force_long_tail,
+        args.scheduled_alignment_force_alignment_repetition,
+        args.scheduled_alignment_force_token_repetition,
+    )
 
     load_start = time.perf_counter()
     model = load_model(args.impl, args.device, args.checkpoint_dir)
