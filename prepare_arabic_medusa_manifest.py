@@ -34,7 +34,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Prepare a clean Arabic text manifest for T3 Medusa distillation."
     )
-    parser.add_argument("--input-csv", required=True)
+    parser.add_argument("--input-csv", help="Single input path kept for backward compatibility.")
+    parser.add_argument(
+        "--input-path",
+        action="append",
+        default=[],
+        help="Input path to include. Can be passed multiple times for JSONL and/or CSV sources.",
+    )
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1337)
@@ -44,10 +50,14 @@ def main() -> None:
     parser.add_argument("--min-arabic-chars", type=int, default=4)
     args = parser.parse_args()
 
-    input_path = Path(args.input_csv)
     output_path = Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_dir = input_path.parent
+
+    input_paths = [Path(path) for path in args.input_path]
+    if args.input_csv:
+        input_paths.append(Path(args.input_csv))
+    if not input_paths:
+        raise ValueError("Provide at least one input via --input-path or --input-csv")
 
     rows = []
     seen = set()
@@ -68,43 +78,47 @@ def main() -> None:
             }
         )
 
-    if input_path.suffix.lower() == ".jsonl":
-        with input_path.open("r", encoding="utf-8") as handle:
-            for line_index, line in enumerate(handle):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "messages" in record:
-                    for turn_index, message in enumerate(record["messages"]):
-                        if message.get("role") != "assistant":
-                            continue
+    for input_path in input_paths:
+        metadata_dir = input_path.parent
+        source_prefix = input_path.stem
+        if input_path.suffix.lower() == ".jsonl":
+            with input_path.open("r", encoding="utf-8") as handle:
+                for line_index, line in enumerate(handle):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if "messages" in record:
+                        for turn_index, message in enumerate(record["messages"]):
+                            if message.get("role") != "assistant":
+                                continue
+                            maybe_add_row(
+                                sample_id=f"{source_prefix}_{line_index:06d}_assistant_{turn_index:02d}",
+                                text=message.get("content", ""),
+                            )
+                    elif "response" in record:
                         maybe_add_row(
-                            sample_id=f"jsonl_{line_index:06d}_assistant_{turn_index:02d}",
-                            text=message.get("content", ""),
+                            sample_id=f"{source_prefix}_{line_index:06d}_response",
+                            text=record.get("response", ""),
                         )
-                elif "response" in record:
+                    else:
+                        maybe_add_row(
+                            sample_id=f"{source_prefix}_{line_index:06d}",
+                            text=record.get("text", ""),
+                        )
+        else:
+            with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    relative_wav = row.get("relative_wav_path", "")
+                    source_wav_path = str((metadata_dir / relative_wav).resolve()) if relative_wav else ""
+                    raw_id = row.get("id", "")
                     maybe_add_row(
-                        sample_id=f"jsonl_{line_index:06d}_response",
-                        text=record.get("response", ""),
+                        sample_id=f"{source_prefix}_{raw_id}" if raw_id else source_prefix,
+                        text=row.get("text", ""),
+                        source_wav_path=source_wav_path,
+                        duration=row.get("duration", ""),
                     )
-                else:
-                    maybe_add_row(
-                        sample_id=f"jsonl_{line_index:06d}",
-                        text=record.get("text", ""),
-                    )
-    else:
-        with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                relative_wav = row.get("relative_wav_path", "")
-                source_wav_path = str((metadata_dir / relative_wav).resolve()) if relative_wav else ""
-                maybe_add_row(
-                    sample_id=row.get("id", ""),
-                    text=row.get("text", ""),
-                    source_wav_path=source_wav_path,
-                    duration=row.get("duration", ""),
-                )
 
     if args.shuffle:
         rng = random.Random(args.seed)
@@ -121,7 +135,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"input_csv={input_path}")
+    print(f"input_paths={[str(path) for path in input_paths]}")
     print(f"output_csv={output_path}")
     print(f"num_rows={len(rows)}")
 
