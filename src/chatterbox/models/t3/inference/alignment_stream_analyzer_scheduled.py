@@ -25,6 +25,14 @@ class ScheduledAlignmentState:
     complete: bool = False
     completed_at: int | None = None
     generated_tokens: list[int] = field(default_factory=list)
+    attention_steps: int = 0
+    cheap_steps: int = 0
+    eos_blocked_steps: int = 0
+    forced_eos_steps: int = 0
+    forced_eos_long_tail_steps: int = 0
+    forced_eos_alignment_repetition_steps: int = 0
+    forced_eos_token_repetition_steps: int = 0
+    token_repetition_hits: int = 0
 
     @classmethod
     def create(cls, *, text_tokens_slice: tuple[int, int], eos_idx: int):
@@ -35,7 +43,21 @@ class ScheduledAlignmentState:
             alignment=torch.zeros(0, j - i),
         )
 
+    def _update_generated_tokens(self, next_token=None) -> bool:
+        if next_token is not None:
+            token_id = next_token.item() if isinstance(next_token, torch.Tensor) else next_token
+            self.generated_tokens.append(token_id)
+            if len(self.generated_tokens) > 8:
+                self.generated_tokens = self.generated_tokens[-8:]
+
+        token_repetition = len(self.generated_tokens) >= 3 and len(set(self.generated_tokens[-2:])) == 1
+        if token_repetition:
+            self.token_repetition_hits += 1
+            logger.warning("🚨 Detected 2x repetition of token %s", self.generated_tokens[-1])
+        return token_repetition
+
     def step(self, logits: torch.Tensor, aligned_attn: torch.Tensor, next_token=None) -> torch.Tensor:
+        self.attention_steps += 1
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
             attn_chunk = aligned_attn[j:, i:j].clone().cpu()
@@ -70,20 +92,20 @@ class ScheduledAlignmentState:
             alignment[self.completed_at :, :-5].max(dim=1).values.sum() > 5
         )
 
-        if next_token is not None:
-            token_id = next_token.item() if isinstance(next_token, torch.Tensor) else next_token
-            self.generated_tokens.append(token_id)
-            if len(self.generated_tokens) > 8:
-                self.generated_tokens = self.generated_tokens[-8:]
-
-        token_repetition = len(self.generated_tokens) >= 3 and len(set(self.generated_tokens[-2:])) == 1
-        if token_repetition:
-            logger.warning("🚨 Detected 2x repetition of token %s", self.generated_tokens[-1])
+        token_repetition = self._update_generated_tokens(next_token=next_token)
 
         if cur_text_posn < text_len - 3 and text_len > 5:
+            self.eos_blocked_steps += 1
             logits[..., self.eos_idx] = -(2**15)
 
         if long_tail or alignment_repetition or token_repetition:
+            self.forced_eos_steps += 1
+            if long_tail:
+                self.forced_eos_long_tail_steps += 1
+            if alignment_repetition:
+                self.forced_eos_alignment_repetition_steps += 1
+            if token_repetition:
+                self.forced_eos_token_repetition_steps += 1
             logger.warning(
                 "forcing EOS token, long_tail=%s, alignment_repetition=%s, token_repetition=%s",
                 long_tail,
@@ -96,6 +118,30 @@ class ScheduledAlignmentState:
         self.curr_frame_pos += 1
         return logits
 
+    def step_without_attention(self, logits: torch.Tensor, next_token=None) -> torch.Tensor:
+        self.cheap_steps += 1
+        token_repetition = self._update_generated_tokens(next_token=next_token)
+        if token_repetition:
+            self.forced_eos_steps += 1
+            self.forced_eos_token_repetition_steps += 1
+            logger.warning("forcing EOS token without attention, token_repetition=%s", token_repetition)
+            logits = -(2**15) * torch.ones_like(logits)
+            logits[..., self.eos_idx] = 2**15
+        self.curr_frame_pos += 1
+        return logits
+
+    def export_metrics(self) -> dict[str, float]:
+        return {
+            "alignment_attention_steps": float(self.attention_steps),
+            "alignment_cheap_steps": float(self.cheap_steps),
+            "alignment_eos_blocked_steps": float(self.eos_blocked_steps),
+            "alignment_forced_eos_steps": float(self.forced_eos_steps),
+            "alignment_forced_eos_long_tail_steps": float(self.forced_eos_long_tail_steps),
+            "alignment_forced_eos_alignment_repetition_steps": float(self.forced_eos_alignment_repetition_steps),
+            "alignment_forced_eos_token_repetition_steps": float(self.forced_eos_token_repetition_steps),
+            "alignment_token_repetition_hits": float(self.token_repetition_hits),
+        }
+
 
 class ScheduledAlignmentController:
     """
@@ -106,8 +152,9 @@ class ScheduledAlignmentController:
     `(0, 2, 4, ...)` from the batched forward pass.
     """
 
-    def __init__(self, tfmr):
+    def __init__(self, tfmr, *, inspect_every: int = 1):
         self.tfmr = tfmr
+        self.inspect_every = max(1, int(inspect_every))
         self.original_output_attentions = None
         self.hook_handles = []
         self.last_aligned_attns = [None] * len(LLAMA_ALIGNED_HEADS)
@@ -130,26 +177,42 @@ class ScheduledAlignmentController:
                 self.original_output_attentions = self.tfmr.config.output_attentions
             self.tfmr.config.output_attentions = True
 
-    def step(
+    def prepare_for_forward(self, request_attentions: bool):
+        if request_attentions:
+            self.last_aligned_attns = [None] * len(LLAMA_ALIGNED_HEADS)
+
+    def should_inspect_state(self, state: ScheduledAlignmentState) -> bool:
+        return state.curr_frame_pos == 0 or state.curr_frame_pos % self.inspect_every == 0
+
+    def should_request_attentions(self, active_states: list[ScheduledAlignmentState]) -> bool:
+        return any(self.should_inspect_state(state) for state in active_states)
+
+    def apply(
         self,
         logits: torch.Tensor,
         *,
         active_states: list[ScheduledAlignmentState],
         next_tokens: list[int | None],
+        attentions_requested: bool,
     ) -> torch.Tensor:
         if not active_states:
             return logits
-        if any(attn is None for attn in self.last_aligned_attns):
-            return logits
-
-        aligned_attn = torch.stack(self.last_aligned_attns).mean(dim=0)
+        aligned_attn = None
+        if attentions_requested and not any(attn is None for attn in self.last_aligned_attns):
+            aligned_attn = torch.stack(self.last_aligned_attns).mean(dim=0)
         for index, state in enumerate(active_states):
             next_token = next_tokens[index] if index < len(next_tokens) else None
-            logits[index : index + 1] = state.step(
-                logits[index : index + 1],
-                aligned_attn[index],
-                next_token=next_token,
-            )
+            if aligned_attn is not None and self.should_inspect_state(state):
+                logits[index : index + 1] = state.step(
+                    logits[index : index + 1],
+                    aligned_attn[index],
+                    next_token=next_token,
+                )
+            else:
+                logits[index : index + 1] = state.step_without_attention(
+                    logits[index : index + 1],
+                    next_token=next_token,
+                )
         return logits
 
     def close(self):
