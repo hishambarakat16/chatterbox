@@ -9,6 +9,7 @@ from pathlib import Path
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[\.\!\?؟؛…])\s+|[\r\n]+")
 CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[،,:;؛])\s+")
+PLACEHOLDER_RE = re.compile(r"\(…\)|\(\.\.\.\)|\[…\]|\[\.\.\.\]|…|\.\.\.")
 
 
 def normalize_text(text: str) -> str:
@@ -21,6 +22,8 @@ def looks_usable(text: str, min_chars: int, max_chars: int, min_arabic_chars: in
     if not text:
         return False
     if "$$$" in text:
+        return False
+    if PLACEHOLDER_RE.search(text):
         return False
     if len(text) < min_chars or len(text) > max_chars:
         return False
