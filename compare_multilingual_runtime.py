@@ -8,6 +8,7 @@ import torchaudio as ta
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
+from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
 from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
 
 
@@ -21,8 +22,10 @@ def load_model(impl: str, device: str, checkpoint_dir: str | None):
         model_cls = ChatterboxMultilingualTTS
     elif impl == "streaming":
         model_cls = ChatterboxMultilingualStreamingTTS
-    else:
+    elif impl == "concurrent":
         model_cls = ChatterboxMultilingualConcurrentTTS
+    else:
+        model_cls = ChatterboxMultilingualScheduledTTS
     if checkpoint_dir:
         return model_cls.from_local(checkpoint_dir, device)
     return model_cls.from_pretrained(device)
@@ -44,8 +47,8 @@ def configure_shape_logging(enabled: bool):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare baseline and streaming-safe multilingual Chatterbox runtimes.")
-    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent"], required=True)
+    parser = argparse.ArgumentParser(description="Compare multilingual Chatterbox runtime variants.")
+    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled"], required=True)
     parser.add_argument("--text", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--audio-prompt-path")
@@ -64,7 +67,7 @@ def main():
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
 
-    if args.impl in {"streaming", "concurrent"}:
+    if args.impl in {"streaming", "concurrent", "scheduled"}:
         session = model.create_session(
             audio_prompt_path=args.audio_prompt_path,
             language_id=args.language_id,
