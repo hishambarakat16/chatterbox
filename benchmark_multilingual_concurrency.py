@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
 from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
 
 
@@ -18,7 +19,12 @@ def maybe_sync(device: str):
 
 
 def load_model(impl: str, device: str, checkpoint_dir: str | None):
-    model_cls = ChatterboxMultilingualTTS if impl == "baseline" else ChatterboxMultilingualStreamingTTS
+    if impl == "baseline":
+        model_cls = ChatterboxMultilingualTTS
+    elif impl == "streaming":
+        model_cls = ChatterboxMultilingualStreamingTTS
+    else:
+        model_cls = ChatterboxMultilingualConcurrentTTS
     if checkpoint_dir:
         return model_cls.from_local(checkpoint_dir, device)
     return model_cls.from_pretrained(device)
@@ -53,7 +59,7 @@ def percentile(values: list[float], q: float) -> float:
 
 
 def build_request(session_or_none, model, impl: str, text: str, language_id: str, audio_prompt_path: str | None):
-    if impl == "streaming":
+    if impl in {"streaming", "concurrent"}:
         return lambda: model.generate_with_session(session_or_none, text)
     return lambda: model.generate(
         text=text,
@@ -73,7 +79,7 @@ def run_concurrency_level(
     device: str,
 ):
     sessions = []
-    if impl == "streaming":
+    if impl in {"streaming", "concurrent"}:
         for _ in range(concurrency):
             sessions.append(
                 model.create_session(
@@ -133,7 +139,7 @@ def run_concurrency_level(
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark baseline vs streaming-safe multilingual Chatterbox under simultaneous requests.")
-    parser.add_argument("--impl", choices=["baseline", "streaming"], required=True)
+    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent"], required=True)
     parser.add_argument("--text", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--audio-prompt-path")

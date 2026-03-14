@@ -10,3 +10,4 @@ from .tts import ChatterboxTTS
 from .vc import ChatterboxVC
 from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 from .mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
+from .mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
