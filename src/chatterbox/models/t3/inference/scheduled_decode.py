@@ -262,7 +262,10 @@ def advance_scheduled_cohort(
             state.past_key_values = state_past
         cohort.prefill_inputs = None
     else:
-        is_first_cached_step = all(state.decode_step == 0 for state in cohort.active_states)
+        # `decode_step` is incremented at the end of the prefill round after we
+        # sample the first token and prepare the first cached-step input embed.
+        # So the first cached transformer call arrives with `decode_step == 1`.
+        is_first_cached_step = all(state.decode_step == 1 for state in cohort.active_states)
         next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
         batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
         batched_inputs = torch.cat(next_inputs, dim=0)
