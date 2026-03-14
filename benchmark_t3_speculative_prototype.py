@@ -11,10 +11,12 @@ import torchaudio as ta
 from chatterbox.mtl_tts import SUPPORTED_LANGUAGES, punc_norm
 from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
 from chatterbox.models.s3tokenizer import drop_invalid_tokens
+from chatterbox.models.t3.inference.draft_model import build_layer_subset_draft_model
 from chatterbox.models.t3.inference.scheduled_decode import ScheduledDecodeRequest
 from chatterbox.models.t3.inference.speculative_decode import (
     run_baseline_greedy_decode,
     run_self_speculative_decode,
+    run_speculative_decode_with_draft,
 )
 from chatterbox.runtime.session import clone_conditionals
 
@@ -182,16 +184,24 @@ def run_timed_baseline(device: str, t3, request: ScheduledDecodeRequest):
     return tokens, elapsed, memory_stats
 
 
-def run_timed_speculative(device: str, t3, request: ScheduledDecodeRequest, speculate_k: int):
+def run_timed_speculative(device: str, target_t3, draft_t3, request: ScheduledDecodeRequest, speculate_k: int):
     maybe_sync(device)
     memory_stats = capture_cuda_memory_stats(device)
     reset_cuda_peak_stats(device)
     started = time.perf_counter()
-    result = run_self_speculative_decode(
-        t3,
-        request,
-        speculate_k=speculate_k,
-    )
+    if draft_t3 is target_t3:
+        result = run_self_speculative_decode(
+            target_t3,
+            request,
+            speculate_k=speculate_k,
+        )
+    else:
+        result = run_speculative_decode_with_draft(
+            target_t3,
+            draft_t3,
+            request,
+            speculate_k=speculate_k,
+        )
     maybe_sync(device)
     elapsed = time.perf_counter() - started
     memory_stats = finalize_cuda_memory_stats(device, memory_stats)
@@ -209,6 +219,9 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--speculate-k", type=int, default=4)
+    parser.add_argument("--draft-mode", choices=["self", "layer_subset"], default="self")
+    parser.add_argument("--draft-layers", type=int, default=12)
+    parser.add_argument("--draft-layer-selection", choices=["even", "first", "last"], default="even")
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--trace-shapes", action="store_true")
@@ -230,6 +243,14 @@ def main():
         audio_prompt_path=args.audio_prompt_path,
         max_new_tokens=args.max_new_tokens,
     )
+    draft_t3 = model.worker.t3
+    draft_metadata = None
+    if args.draft_mode == "layer_subset":
+        draft_t3, draft_metadata = build_layer_subset_draft_model(
+            model.worker.t3,
+            num_layers=args.draft_layers,
+            layer_selection=args.draft_layer_selection,
+        )
 
     total_runs = args.warmup_runs + args.runs
     orders = ["baseline_first" if run_index % 2 == 0 else "speculative_first" for run_index in range(total_runs)]
@@ -264,6 +285,7 @@ def main():
             speculative_run, speculative_elapsed, speculative_memory = run_timed_speculative(
                 args.device,
                 model.worker.t3,
+                draft_t3,
                 request,
                 args.speculate_k,
             )
@@ -271,6 +293,7 @@ def main():
             speculative_run, speculative_elapsed, speculative_memory = run_timed_speculative(
                 args.device,
                 model.worker.t3,
+                draft_t3,
                 request,
                 args.speculate_k,
             )
@@ -336,11 +359,18 @@ def main():
         }
 
     print("benchmark=t3_speculative_prototype")
-    print("mode=self_draft_greedy_cfg_on_alignment_off")
+    mode = "self_draft_greedy_cfg_on_alignment_off" if args.draft_mode == "self" else "layer_subset_draft_greedy_cfg_on_alignment_off"
+    print(f"mode={mode}")
     print(f"device={args.device}")
     print(f"load_s={load_s:.4f}")
     print(f"speculate_k={args.speculate_k}")
     print(f"max_new_tokens={args.max_new_tokens}")
+    print(f"draft_mode={args.draft_mode}")
+    if draft_metadata is not None:
+        print(f"draft_layers={draft_metadata.num_layers}")
+        print(f"draft_total_layers={draft_metadata.total_layers}")
+        print(f"draft_layer_selection={draft_metadata.layer_selection}")
+        print(f"draft_layer_indices={list(draft_metadata.layer_indices)}")
     print(f"warmup_runs={args.warmup_runs}")
     print(f"runs={args.runs}")
     print(f"run_orders={orders}")

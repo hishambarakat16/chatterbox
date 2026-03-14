@@ -126,6 +126,13 @@ class SpeculativePrototypeResult:
     correction_tokens_total: int
 
 
+@dataclass
+class DraftProposal:
+    proposed_tokens: Tensor
+    next_logits: Tensor
+    next_past_key_values: object
+
+
 @torch.inference_mode()
 def prefill_prototype_state(t3, request: ScheduledDecodeRequest) -> _PrototypeState:
     cohort = prepare_scheduled_cohort(t3, [request])
@@ -192,12 +199,48 @@ def run_baseline_greedy_decode(t3, request: ScheduledDecodeRequest) -> Tensor:
 
 
 @torch.inference_mode()
-def draft_propose_block_self(
+def _rebuild_prototype_state(
+    t3,
+    request: ScheduledDecodeRequest,
+    committed_tokens: Tensor,
+) -> _PrototypeState:
+    state = prefill_prototype_state(t3, request)
+    if committed_tokens.numel() == 0:
+        return state
+
+    assert committed_tokens.dim() == 2 and committed_tokens.size(0) == 1
+    for index in range(committed_tokens.size(1)):
+        next_token = committed_tokens[:, index : index + 1]
+        state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
+
+        if torch.all(next_token.view(-1) == t3.hp.stop_speech_token):
+            state.decode_step += 1
+            break
+
+        step_inputs = _build_cfg_step_inputs(
+            t3,
+            tokens=next_token,
+            start_pos=state.decode_step + 1,
+        )
+        raw_logits, next_past = _forward_raw_t3(
+            t3,
+            inputs_embeds=step_inputs,
+            past_key_values=state.past_key_values,
+        )
+        state.next_logits = _cfg_combine(raw_logits[:, -1, :], request.cfg_weight)
+        state.past_key_values = next_past
+        state.decode_step += 1
+
+    return state
+
+
+@torch.inference_mode()
+def draft_propose_block(
     t3,
     *,
     state: _PrototypeState,
     speculate_k: int,
-) -> Tensor:
+) -> DraftProposal:
     assert speculate_k >= 1
     work_logits = state.next_logits
     work_past = state.past_key_values
@@ -234,7 +277,11 @@ def draft_propose_block_self(
         shape_logger.info("[models/t3/inference/speculative_decode.py] draft.proposed")
         shape_logger.info("  proposed_tokens %s %s %s", tuple(proposed_tokens.shape), proposed_tokens.dtype, proposed_tokens.device)
         shape_logger.info("  proposed_token_ids %s", proposed_tokens.view(-1).tolist())
-    return proposed_tokens
+    return DraftProposal(
+        proposed_tokens=proposed_tokens,
+        next_logits=work_logits,
+        next_past_key_values=work_past,
+    )
 
 
 @torch.inference_mode()
@@ -318,15 +365,17 @@ def verify_block_greedy(
 
 
 @torch.inference_mode()
-def run_self_speculative_decode(
-    t3,
+def run_speculative_decode_with_draft(
+    target_t3,
+    draft_t3,
     request: ScheduledDecodeRequest,
     *,
     speculate_k: int,
 ) -> SpeculativePrototypeResult:
     assert speculate_k >= 1
     _reset_trace_counters()
-    state = prefill_prototype_state(t3, request)
+    target_state = prefill_prototype_state(target_t3, request)
+    draft_state = prefill_prototype_state(draft_t3, request)
     predicted_tokens: list[Tensor] = []
     rounds = 0
     proposed_tokens_total = 0
@@ -335,23 +384,36 @@ def run_self_speculative_decode(
 
     while sum(token.size(1) for token in predicted_tokens) < request.max_new_tokens:
         remaining = request.max_new_tokens - sum(token.size(1) for token in predicted_tokens)
-        proposed_tokens = draft_propose_block_self(
-            t3,
-            state=state,
+        proposal = draft_propose_block(
+            draft_t3,
+            state=draft_state,
             speculate_k=min(speculate_k, remaining),
         )
         verify = verify_block_greedy(
-            t3,
-            state=state,
-            proposed_tokens=proposed_tokens,
+            target_t3,
+            state=target_state,
+            proposed_tokens=proposal.proposed_tokens,
         )
 
         committed_tokens = verify.committed_tokens
         predicted_tokens.append(committed_tokens)
-        state.generated_ids = torch.cat([state.generated_ids, committed_tokens], dim=1)
-        state.past_key_values = verify.next_past_key_values
-        state.next_logits = verify.next_logits
-        state.decode_step += committed_tokens.size(1)
+        target_state.generated_ids = torch.cat([target_state.generated_ids, committed_tokens], dim=1)
+        target_state.past_key_values = verify.next_past_key_values
+        target_state.next_logits = verify.next_logits
+        target_state.decode_step += committed_tokens.size(1)
+
+        if verify.correction_token is None and verify.accepted_draft_tokens == verify.proposed_tokens:
+            draft_state.generated_ids = torch.cat([draft_state.generated_ids, committed_tokens], dim=1)
+            draft_state.past_key_values = proposal.next_past_key_values
+            draft_state.next_logits = proposal.next_logits
+            draft_state.decode_step += committed_tokens.size(1)
+        else:
+            committed_history = torch.cat(predicted_tokens, dim=1)
+            draft_state = _rebuild_prototype_state(
+                draft_t3,
+                request,
+                committed_history,
+            )
 
         rounds += 1
         proposed_tokens_total += verify.proposed_tokens
@@ -359,13 +421,13 @@ def run_self_speculative_decode(
         if verify.correction_token is not None:
             correction_tokens_total += 1
 
-        if torch.any(committed_tokens == t3.hp.stop_speech_token):
+        if torch.any(committed_tokens == target_t3.hp.stop_speech_token):
             break
 
     if predicted_tokens:
         speech_tokens = torch.cat(predicted_tokens, dim=1)
     else:
-        speech_tokens = torch.empty((1, 0), dtype=torch.long, device=t3.device)
+        speech_tokens = torch.empty((1, 0), dtype=torch.long, device=target_t3.device)
 
     return SpeculativePrototypeResult(
         speech_tokens=speech_tokens,
@@ -373,4 +435,19 @@ def run_self_speculative_decode(
         proposed_tokens_total=proposed_tokens_total,
         accepted_draft_tokens_total=accepted_draft_tokens_total,
         correction_tokens_total=correction_tokens_total,
+    )
+
+
+@torch.inference_mode()
+def run_self_speculative_decode(
+    t3,
+    request: ScheduledDecodeRequest,
+    *,
+    speculate_k: int,
+) -> SpeculativePrototypeResult:
+    return run_speculative_decode_with_draft(
+        t3,
+        t3,
+        request,
+        speculate_k=speculate_k,
     )
