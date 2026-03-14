@@ -101,11 +101,21 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, --num-shards)")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = output_dir / "samples.jsonl"
+    if args.num_shards == 1:
+        jsonl_path = output_dir / "samples.jsonl"
+    else:
+        jsonl_path = output_dir / f"samples.shard_{args.shard_index:02d}_of_{args.num_shards:02d}.jsonl"
 
     model = load_model(args.device, args.checkpoint_dir)
 
@@ -117,6 +127,9 @@ def main() -> None:
 
     if args.limit > 0:
         records = records[: args.limit]
+
+    if args.num_shards > 1:
+        records = records[args.shard_index :: args.num_shards]
 
     written = 0
     failures = 0
@@ -177,6 +190,9 @@ def main() -> None:
 
     print(f"output_dir={output_dir}")
     print(f"jsonl_path={jsonl_path}")
+    print(f"num_shards={args.num_shards}")
+    print(f"shard_index={args.shard_index}")
+    print(f"records_assigned={len(records)}")
     print(f"written={written}")
     print(f"failures={failures}")
     if conds_path_written is not None:
