@@ -44,7 +44,6 @@ def load_model(impl: str, device: str, checkpoint_dir: str | None):
 def configure_shape_logging(enabled: bool):
     if not enabled:
         os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
-        os.environ.pop("CHATTERBOX_TRACE_STEP_SHAPES", None)
         return
 
     os.environ["CHATTERBOX_TRACE_SHAPES"] = "1"
@@ -55,15 +54,6 @@ def configure_shape_logging(enabled: bool):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
-
-
-def configure_scheduled_runtime(alignment_mode: str, inspect_every: int, trace_step_shapes: bool):
-    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT"] = alignment_mode
-    os.environ["CHATTERBOX_SCHEDULED_ALIGNMENT_INSPECT_EVERY"] = str(max(1, inspect_every))
-    if trace_step_shapes:
-        os.environ["CHATTERBOX_TRACE_STEP_SHAPES"] = "1"
-    else:
-        os.environ.pop("CHATTERBOX_TRACE_STEP_SHAPES", None)
 
 
 def begin_vram_measurement(device: str):
@@ -257,14 +247,10 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
     parser.add_argument("--trace-shapes", action="store_true")
-    parser.add_argument("--trace-step-shapes", action="store_true")
     parser.add_argument("--output-dir")
-    parser.add_argument("--scheduled-alignment", choices=["on", "off"], default="on")
-    parser.add_argument("--scheduled-inspect-every", type=int, default=1)
     args = parser.parse_args()
 
     configure_shape_logging(args.trace_shapes)
-    configure_scheduled_runtime(args.scheduled_alignment, args.scheduled_inspect_every, args.trace_step_shapes)
 
     load_start = time.perf_counter()
     model = load_model(args.impl, args.device, args.checkpoint_dir)

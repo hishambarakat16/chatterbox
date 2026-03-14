@@ -134,7 +134,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
     )
 
 
-def build_scheduled_runtime_components(t3, *, enable_alignment: bool = True, alignment_inspect_every: int = 1):
+def build_scheduled_runtime_components(t3):
     patched_model = T3HuggingfaceBackend(
         config=t3.cfg,
         llama=t3.tfmr,
@@ -142,12 +142,7 @@ def build_scheduled_runtime_components(t3, *, enable_alignment: bool = True, ali
         speech_head=t3.speech_head,
         alignment_stream_analyzer=None,
     )
-    alignment_controller = None
-    if enable_alignment and t3.hp.is_multilingual:
-        alignment_controller = ScheduledAlignmentController(
-            t3.tfmr,
-            inspect_every=alignment_inspect_every,
-        )
+    alignment_controller = ScheduledAlignmentController(t3.tfmr) if t3.hp.is_multilingual else None
     return patched_model, alignment_controller
 
 
@@ -198,16 +193,11 @@ def advance_scheduled_cohort(
     *,
     patched_model,
     alignment_controller,
-) -> tuple[list[tuple[str, Tensor, dict[str, float]]], list[str], bool]:
+) -> tuple[list[tuple[str, Tensor]], list[str], bool]:
     if not cohort.active_states:
         return [], [], True
 
-    output_attentions = False
-    if alignment_controller is not None:
-        output_attentions = alignment_controller.should_request_attentions(
-            [state.alignment_state for state in cohort.active_states]
-        )
-        alignment_controller.prepare_for_forward(output_attentions)
+    output_attentions = alignment_controller is not None
 
     if cohort.prefill_inputs is not None:
         inputs_embeds = torch.cat(cohort.prefill_inputs, dim=0)
@@ -231,7 +221,7 @@ def advance_scheduled_cohort(
         next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
         batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
         batched_inputs = torch.cat(next_inputs, dim=0)
-        if os.getenv("CHATTERBOX_TRACE_STEP_SHAPES"):
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[models/t3/inference/scheduled_decode.py] decode.batch")
             shape_logger.info("  requests %s", len(cohort.active_states))
             shape_logger.info("  inputs_embeds %s %s %s", tuple(batched_inputs.shape), batched_inputs.dtype, batched_inputs.device)
@@ -262,14 +252,13 @@ def advance_scheduled_cohort(
             state.generated_ids[0, -1].item() if state.generated_ids.size(1) > 0 else None
             for state in cohort.active_states
         ]
-        logits = alignment_controller.apply(
+        logits = alignment_controller.step(
             logits,
             active_states=[state.alignment_state for state in cohort.active_states],
             next_tokens=last_tokens,
-            attentions_requested=output_attentions,
         )
 
-    finished_results: list[tuple[str, Tensor, dict[str, float]]] = []
+    finished_results: list[tuple[str, Tensor]] = []
     first_token_session_ids: list[str] = []
     next_round_states = []
     for row_index, state in enumerate(cohort.active_states):
@@ -299,10 +288,7 @@ def advance_scheduled_cohort(
         if stop_on_eos or hit_limit:
             if stop_on_eos:
                 logger.info("✅ EOS token detected for %s", request.session_id)
-            alignment_metrics = {}
-            if state.alignment_state is not None:
-                alignment_metrics = state.alignment_state.export_metrics()
-            finished_results.append((request.session_id, _finalize_prediction(t3, state), alignment_metrics))
+            finished_results.append((request.session_id, _finalize_prediction(t3, state)))
             continue
 
         next_token_embed = t3.speech_emb(next_token)

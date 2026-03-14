@@ -15,17 +15,6 @@ from .worker import ChatterboxMultilingualStreamingWorker
 shape_logger = logging.getLogger("chatterbox.shape")
 
 
-def _read_scheduled_alignment_config():
-    alignment_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT", "on").strip().lower()
-    enable_alignment = alignment_raw not in {"0", "false", "off", "no"}
-    inspect_every_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_INSPECT_EVERY", "1").strip()
-    try:
-        inspect_every = max(1, int(inspect_every_raw))
-    except ValueError:
-        inspect_every = 1
-    return enable_alignment, inspect_every
-
-
 class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorker):
     """
     Scheduler-driven T3 worker.
@@ -39,13 +28,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
 
     def __init__(self, *args, batching_window_ms: float = 5.0, **kwargs):
         super().__init__(*args, **kwargs)
-        enable_alignment, alignment_inspect_every = _read_scheduled_alignment_config()
-        self.t3_scheduler = T3DecodeScheduler(
-            self.t3,
-            batching_window_ms=batching_window_ms,
-            enable_alignment=enable_alignment,
-            alignment_inspect_every=alignment_inspect_every,
-        )
+        self.t3_scheduler = T3DecodeScheduler(self.t3, batching_window_ms=batching_window_ms)
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         request_start = time.perf_counter()

@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 import time
 from collections import deque
@@ -47,25 +46,14 @@ class T3DecodeScheduler:
     older cohorts are still decoding.
     """
 
-    def __init__(
-        self,
-        t3,
-        *,
-        batching_window_ms: float = 5.0,
-        enable_alignment: bool = True,
-        alignment_inspect_every: int = 1,
-    ):
+    def __init__(self, t3, *, batching_window_ms: float = 5.0):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
         self.condition = threading.Condition()
         self.pending: list[_PendingScheduledRequest] = []
         self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
         self.stopped = False
-        self.patched_model, self.alignment_controller = build_scheduled_runtime_components(
-            self.t3,
-            enable_alignment=enable_alignment,
-            alignment_inspect_every=alignment_inspect_every,
-        )
+        self.patched_model, self.alignment_controller = build_scheduled_runtime_components(self.t3)
         self.worker = threading.Thread(
             target=self._run_loop,
             name="chatterbox-t3-scheduler",
@@ -142,7 +130,7 @@ class T3DecodeScheduler:
                 shape_logger.info("  active_cohorts %s", len(self.active_cohorts))
 
     def _process_one_step(self, cohort: _ActiveScheduledCohort):
-        if os.getenv("CHATTERBOX_TRACE_STEP_SHAPES"):
+        if shape_logger.isEnabledFor(logging.INFO):
             shape_logger.info("[runtime/t3_scheduler.py] step_cohort")
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info("  active_requests %s", len(cohort.cohort_state.active_states))
@@ -165,7 +153,7 @@ class T3DecodeScheduler:
             if item is not None and item.first_token_at is None:
                 item.first_token_at = first_token_recorded_at
 
-        for session_id, result, alignment_metrics in finished_results:
+        for session_id, result in finished_results:
             item = cohort.pending_by_session.pop(session_id)
             item.completed_at = time.perf_counter()
             item.metrics = {
@@ -173,14 +161,7 @@ class T3DecodeScheduler:
                 "t3_first_token_s": 0.0 if item.first_token_at is None else item.first_token_at - item.submitted_at,
                 "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
                 "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
-                "alignment_guard_enabled": 1.0 if self.alignment_controller is not None else 0.0,
-                "alignment_inspect_every": (
-                    float(self.alignment_controller.inspect_every)
-                    if self.alignment_controller is not None
-                    else 0.0
-                ),
             }
-            item.metrics.update(alignment_metrics)
             item.result = result
             item.done.set()
 
