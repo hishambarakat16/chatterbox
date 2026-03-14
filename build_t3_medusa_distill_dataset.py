@@ -6,6 +6,10 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal envs
+    tqdm = None
 
 from chatterbox.mtl_tts import SUPPORTED_LANGUAGES, punc_norm
 from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
@@ -163,8 +167,26 @@ def run_shard(args: argparse.Namespace) -> int:
     failures = 0
     conds_path_written = None
     log_prefix = f"[shard {args.shard_index}/{args.num_shards}] " if args.num_shards > 1 else ""
+    progress_desc = (
+        f"shard {args.shard_index + 1}/{args.num_shards}"
+        if args.num_shards > 1
+        else "medusa-distill"
+    )
+    progress_position = args.shard_index if args.num_shards > 1 else 0
+    progress_bar = (
+        tqdm(
+            records,
+            total=len(records),
+            desc=progress_desc,
+            position=progress_position,
+            dynamic_ncols=True,
+            leave=True,
+        )
+        if tqdm is not None
+        else records
+    )
     with jsonl_path.open("w", encoding="utf-8") as sink:
-        for index, row in enumerate(records):
+        for index, row in enumerate(progress_bar):
             text = row["text"]
             sample_id = row.get("sample_id") or f"sample_{index:06d}"
             try:
@@ -216,11 +238,18 @@ def run_shard(args: argparse.Namespace) -> int:
                 }
                 sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                 written += 1
-                if written % max(args.save_every, 1) == 0:
+                if tqdm is not None:
+                    progress_bar.set_postfix(written=written, failures=failures)
+                elif written % max(args.save_every, 1) == 0:
                     print(f"{log_prefix}written={written} failures={failures}")
             except Exception as exc:  # pragma: no cover - dataset generation should continue on bad rows
                 failures += 1
+                if tqdm is not None:
+                    progress_bar.set_postfix(written=written, failures=failures)
                 print(f"{log_prefix}failed sample_id={sample_id}: {exc}")
+
+    if tqdm is not None:
+        progress_bar.close()
 
     print(f"{log_prefix}output_dir={output_dir}")
     print(f"{log_prefix}jsonl_path={jsonl_path}")

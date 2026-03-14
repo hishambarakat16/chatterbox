@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[\.\!\?؟؛…])\s+|[\r\n]+")
+CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[،,:;؛])\s+")
 
 
 def normalize_text(text: str) -> str:
@@ -30,6 +32,54 @@ def looks_usable(text: str, min_chars: int, max_chars: int, min_arabic_chars: in
     return True
 
 
+def split_by_max_chars(text: str, max_chars: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    chunks = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        chunks.append(current)
+        current = word
+    chunks.append(current)
+    return chunks
+
+
+def iter_text_segments(text: str, *, max_chars: int, split_sentences: bool) -> list[str]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+    if not split_sentences:
+        return [normalized]
+
+    sentence_candidates = []
+    for part in SENTENCE_BOUNDARY_RE.split(normalized):
+        part = normalize_text(part)
+        if not part:
+            continue
+        if len(part) <= max_chars:
+            sentence_candidates.append(part)
+            continue
+
+        clause_parts = []
+        for clause in CLAUSE_BOUNDARY_RE.split(part):
+            clause = normalize_text(clause)
+            if not clause:
+                continue
+            if len(clause) <= max_chars:
+                clause_parts.append(clause)
+            else:
+                clause_parts.extend(split_by_max_chars(clause, max_chars))
+        sentence_candidates.extend(clause_parts)
+
+    return sentence_candidates or [normalized]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Prepare a clean Arabic text manifest for T3 Medusa distillation."
@@ -48,6 +98,11 @@ def main() -> None:
     parser.add_argument("--min-chars", type=int, default=8)
     parser.add_argument("--max-chars", type=int, default=180)
     parser.add_argument("--min-arabic-chars", type=int, default=4)
+    parser.add_argument(
+        "--split-sentences",
+        action="store_true",
+        help="Split long multi-sentence rows into shorter sentence/clause-sized samples.",
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output_csv)
@@ -63,20 +118,26 @@ def main() -> None:
     seen = set()
 
     def maybe_add_row(sample_id: str, text: str, source_wav_path: str = "", duration: str = "") -> None:
-        normalized = normalize_text(text)
-        if not looks_usable(normalized, args.min_chars, args.max_chars, args.min_arabic_chars):
-            return
-        if normalized in seen:
-            return
-        seen.add(normalized)
-        rows.append(
-            {
-                "sample_id": sample_id,
-                "text": normalized,
-                "source_wav_path": source_wav_path,
-                "duration": duration,
-            }
+        segments = iter_text_segments(
+            text,
+            max_chars=args.max_chars,
+            split_sentences=args.split_sentences,
         )
+        for segment_index, normalized in enumerate(segments):
+            if not looks_usable(normalized, args.min_chars, args.max_chars, args.min_arabic_chars):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            segment_sample_id = sample_id if len(segments) == 1 else f"{sample_id}_seg_{segment_index:02d}"
+            rows.append(
+                {
+                    "sample_id": segment_sample_id,
+                    "text": normalized,
+                    "source_wav_path": source_wav_path,
+                    "duration": duration,
+                }
+            )
 
     for input_path in input_paths:
         metadata_dir = input_path.parent
