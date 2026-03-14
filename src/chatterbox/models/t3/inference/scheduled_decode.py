@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 class ScheduledDecodeRequest:
     session_id: str
     t3_cond: object
-    s3_ref_dict: dict
     text_tokens: Tensor
     max_new_tokens: int
     temperature: float
@@ -33,7 +32,6 @@ class ScheduledDecodeRequest:
     min_p: float
     repetition_penalty: float
     cfg_weight: float
-    first_audio_chunk_token_count: int = 16
 
     def batch_key(self) -> tuple[int, int]:
         prompt = getattr(self.t3_cond, "cond_prompt_speech_tokens", None)
@@ -50,7 +48,6 @@ class _ActiveDecodeState:
     past_key_values: object = None
     decode_step: int = 0
     next_inputs_embeds: Tensor | None = None
-    first_audio_chunk_emitted: bool = False
 
 
 @dataclass
@@ -196,9 +193,9 @@ def advance_scheduled_cohort(
     *,
     patched_model,
     alignment_controller,
-) -> tuple[list[tuple[str, Tensor]], list[str], list[tuple[str, Tensor]], bool]:
+) -> tuple[list[tuple[str, Tensor]], list[str], bool]:
     if not cohort.active_states:
-        return [], [], [], True
+        return [], [], True
 
     output_attentions = alignment_controller is not None
 
@@ -263,7 +260,6 @@ def advance_scheduled_cohort(
 
     finished_results: list[tuple[str, Tensor]] = []
     first_token_session_ids: list[str] = []
-    first_audio_candidates: list[tuple[str, Tensor]] = []
     next_round_states = []
     for row_index, state in enumerate(cohort.active_states):
         request = state.request
@@ -286,12 +282,6 @@ def advance_scheduled_cohort(
         state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
         if len(state.predicted_tokens) == 1:
             first_token_session_ids.append(request.session_id)
-        if (
-            not state.first_audio_chunk_emitted
-            and len(state.predicted_tokens) >= request.first_audio_chunk_token_count
-        ):
-            first_audio_candidates.append((request.session_id, torch.cat(state.predicted_tokens, dim=1)))
-            state.first_audio_chunk_emitted = True
 
         stop_on_eos = torch.all(next_token.view(-1) == t3.hp.stop_speech_token)
         hit_limit = len(state.predicted_tokens) >= request.max_new_tokens
@@ -308,4 +298,4 @@ def advance_scheduled_cohort(
         next_round_states.append(state)
 
     cohort.active_states = next_round_states
-    return finished_results, first_token_session_ids, first_audio_candidates, not cohort.active_states
+    return finished_results, first_token_session_ids, not cohort.active_states
