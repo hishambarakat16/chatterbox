@@ -11,8 +11,6 @@ from transformers.generation.logits_process import (
 )
 
 from .alignment_stream_analyzer_scheduled import (
-    AlignmentPolicy,
-    LLAMA_ALIGNED_HEADS,
     ScheduledAlignmentController,
     ScheduledAlignmentState,
 )
@@ -136,14 +134,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
     )
 
 
-def build_scheduled_runtime_components(
-    t3,
-    *,
-    enable_alignment: bool = True,
-    alignment_inspect_every: int = 1,
-    alignment_head_count: int = 3,
-    alignment_policy: AlignmentPolicy | None = None,
-):
+def build_scheduled_runtime_components(t3, *, enable_alignment: bool = True, alignment_inspect_every: int = 1):
     patched_model = T3HuggingfaceBackend(
         config=t3.cfg,
         llama=t3.tfmr,
@@ -156,15 +147,8 @@ def build_scheduled_runtime_components(
         alignment_controller = ScheduledAlignmentController(
             t3.tfmr,
             inspect_every=alignment_inspect_every,
-            selected_heads=alignment_stream_analyzer_heads(alignment_head_count),
-            policy=alignment_policy,
         )
     return patched_model, alignment_controller
-
-
-def alignment_stream_analyzer_heads(head_count: int) -> list[tuple[int, int]]:
-    head_count = max(1, min(int(head_count), len(LLAMA_ALIGNED_HEADS)))
-    return list(LLAMA_ALIGNED_HEADS[:head_count])
 
 
 def prepare_scheduled_cohort(t3, requests: list[ScheduledDecodeRequest]) -> ScheduledDecodeCohort:

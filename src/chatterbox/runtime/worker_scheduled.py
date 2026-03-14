@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from ..models.s3tokenizer import drop_invalid_tokens
-from ..models.t3.inference.alignment_stream_analyzer_scheduled import AlignmentPolicy
 from ..models.t3.inference.scheduled_decode import ScheduledDecodeRequest
 from ..mtl_tts import SUPPORTED_LANGUAGES, punc_norm
 from .t3_scheduler import T3DecodeScheduler
@@ -20,30 +19,11 @@ def _read_scheduled_alignment_config():
     alignment_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT", "on").strip().lower()
     enable_alignment = alignment_raw not in {"0", "false", "off", "no"}
     inspect_every_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_INSPECT_EVERY", "1").strip()
-    head_count_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_HEAD_COUNT", "3").strip()
-    block_eos_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_BLOCK_EOS", "on").strip().lower()
-    long_tail_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_LONG_TAIL", "on").strip().lower()
-    align_repeat_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_ALIGNMENT_REPETITION", "on").strip().lower()
-    token_repeat_raw = os.getenv("CHATTERBOX_SCHEDULED_ALIGNMENT_FORCE_TOKEN_REPETITION", "on").strip().lower()
     try:
         inspect_every = max(1, int(inspect_every_raw))
     except ValueError:
         inspect_every = 1
-    try:
-        head_count = max(1, int(head_count_raw))
-    except ValueError:
-        head_count = 3
-
-    def to_bool(raw: str) -> bool:
-        return raw not in {"0", "false", "off", "no"}
-
-    policy = AlignmentPolicy(
-        block_eos_before_completion=to_bool(block_eos_raw),
-        force_on_long_tail=to_bool(long_tail_raw),
-        force_on_alignment_repetition=to_bool(align_repeat_raw),
-        force_on_token_repetition=to_bool(token_repeat_raw),
-    )
-    return enable_alignment, inspect_every, head_count, policy
+    return enable_alignment, inspect_every
 
 
 class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorker):
@@ -59,14 +39,12 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
 
     def __init__(self, *args, batching_window_ms: float = 5.0, **kwargs):
         super().__init__(*args, **kwargs)
-        enable_alignment, alignment_inspect_every, alignment_head_count, alignment_policy = _read_scheduled_alignment_config()
+        enable_alignment, alignment_inspect_every = _read_scheduled_alignment_config()
         self.t3_scheduler = T3DecodeScheduler(
             self.t3,
             batching_window_ms=batching_window_ms,
             enable_alignment=enable_alignment,
             alignment_inspect_every=alignment_inspect_every,
-            alignment_head_count=alignment_head_count,
-            alignment_policy=alignment_policy,
         )
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
