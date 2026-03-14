@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,14 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         self.t3_scheduler = T3DecodeScheduler(self.t3, batching_window_ms=batching_window_ms)
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
+        profile = {
+            "text_prep_s": 0.0,
+            "t3_wait_s": 0.0,
+            "t3_active_s": 0.0,
+            "t3_s": 0.0,
+            "s3_s": 0.0,
+            "watermark_s": 0.0,
+        }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
         language_id = active_options.language_id
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -45,6 +54,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
                 f"Supported languages: {supported_langs}"
             )
 
+        prep_start = time.perf_counter()
         active_conds = session.clone_conditionals()
         active_conds = active_conds.to(device=self.device)
         active_conds = self._apply_exaggeration_copy(active_conds, active_options.exaggeration)
@@ -59,6 +69,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        profile["text_prep_s"] = time.perf_counter() - prep_start
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[runtime/worker_scheduled.py] generate.text_tokens")
             shape_logger.info("  session_id %s", session.session_id)
@@ -77,7 +88,9 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         )
 
         with torch.inference_mode():
-            speech_tokens = self.t3_scheduler.submit(decode_request)[0]
+            speech_tokens, scheduler_metrics = self.t3_scheduler.submit(decode_request)
+            profile.update(scheduler_metrics)
+            speech_tokens = speech_tokens[0]
             if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                 shape_logger.info("[runtime/worker_scheduled.py] generate.speech_tokens.raw")
                 shape_logger.info("  session_id %s", session.session_id)
@@ -89,12 +102,17 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
                 shape_logger.info("  session_id %s", session.session_id)
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
+            s3_start = time.perf_counter()
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=active_conds.gen,
             )
+            profile["s3_s"] = time.perf_counter() - s3_start
             wav = wav.squeeze(0).detach().cpu().numpy()
+            watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            profile["watermark_s"] = time.perf_counter() - watermark_start
+        self._set_last_profile(profile)
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[runtime/worker_scheduled.py] generate.output")
             shape_logger.info("  session_id %s", session.session_id)

@@ -119,6 +119,17 @@ def build_request(session_or_none, model, impl: str, text: str, language_id: str
     )
 
 
+def get_last_profile(model) -> dict:
+    if hasattr(model, "get_last_profile"):
+        return model.get_last_profile() or {}
+
+    worker = getattr(model, "worker", None)
+    if worker is not None and hasattr(worker, "get_last_profile"):
+        return worker.get_last_profile() or {}
+
+    return {}
+
+
 def run_concurrency_level(
     *,
     model,
@@ -160,11 +171,13 @@ def run_concurrency_level(
             error = repr(exc)
             maybe_sync(device)
         ended = time.perf_counter()
+        profile = get_last_profile(model) if error is None else {}
         results[index] = {
             "latency_s": ended - started,
             "num_samples": None if wav is None else int(wav.shape[-1]),
             "error": error,
             "wav": wav,
+            "profile": profile,
         }
 
     wall_start = time.perf_counter()
@@ -191,6 +204,21 @@ def run_concurrency_level(
     sample_counts = [item["num_samples"] for item in results if item["num_samples"] is not None]
     total_audio_s = sum(sample_counts) / 24000.0 if sample_counts else 0.0
     vram_summary = finish_vram_measurement(device, vram_state)
+    profile_keys = sorted(
+        {
+            key
+            for item in results
+            for key in item.get("profile", {}).keys()
+        }
+    )
+    profile_summary = {}
+    for key in profile_keys:
+        values = [item["profile"].get(key) for item in results if item["error"] is None and key in item.get("profile", {})]
+        if not values:
+            continue
+        rounded_values = [round(float(value), 4) for value in values]
+        profile_summary[f"stage_{key}"] = rounded_values
+        profile_summary[f"stage_{key}_mean"] = round(statistics.mean(values), 4)
 
     summary = {
         "concurrency": concurrency,
@@ -205,6 +233,7 @@ def run_concurrency_level(
         "saved_wavs": saved_wavs,
     }
     summary.update(vram_summary)
+    summary.update(profile_summary)
     return summary
 
 
@@ -262,6 +291,9 @@ def main():
             "vram_peak_reserved_delta_mb",
         ]:
             if key in summary:
+                print(f"{key}={summary[key]}")
+        for key in sorted(summary.keys()):
+            if key.startswith("stage_"):
                 print(f"{key}={summary[key]}")
         print(f"saved_wavs={summary['saved_wavs']}")
         print(f"errors={summary['errors']}")

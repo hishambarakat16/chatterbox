@@ -23,6 +23,10 @@ class _PendingScheduledRequest:
     done: threading.Event = field(default_factory=threading.Event)
     result: torch.Tensor | None = None
     error: Exception | None = None
+    submitted_at: float = field(default_factory=time.perf_counter)
+    first_started_at: float | None = None
+    completed_at: float | None = None
+    metrics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -56,7 +60,7 @@ class T3DecodeScheduler:
         )
         self.worker.start()
 
-    def submit(self, decode_request: ScheduledDecodeRequest) -> torch.Tensor:
+    def submit(self, decode_request: ScheduledDecodeRequest) -> tuple[torch.Tensor, dict]:
         pending = _PendingScheduledRequest(decode_request=decode_request)
         with self.condition:
             self.pending.append(pending)
@@ -66,7 +70,7 @@ class T3DecodeScheduler:
         if pending.error is not None:
             raise pending.error
         assert pending.result is not None
-        return pending.result
+        return pending.result, pending.metrics
 
     def close(self):
         with self.condition:
@@ -130,6 +134,12 @@ class T3DecodeScheduler:
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info("  active_requests %s", len(cohort.cohort_state.active_states))
 
+        step_started_at = time.perf_counter()
+        for state in cohort.cohort_state.active_states:
+            item = cohort.pending_by_session[state.request.session_id]
+            if item.first_started_at is None:
+                item.first_started_at = step_started_at
+
         finished_results, cohort_complete = advance_scheduled_cohort(
             self.t3,
             cohort.cohort_state,
@@ -139,6 +149,12 @@ class T3DecodeScheduler:
 
         for session_id, result in finished_results:
             item = cohort.pending_by_session.pop(session_id)
+            item.completed_at = time.perf_counter()
+            item.metrics = {
+                "t3_wait_s": 0.0 if item.first_started_at is None else item.first_started_at - item.submitted_at,
+                "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
+                "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
+            }
             item.result = result
             item.done.set()
 

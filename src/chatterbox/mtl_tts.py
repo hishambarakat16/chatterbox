@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import threading
+import time
 
 import librosa
 import torch
@@ -155,6 +157,13 @@ class ChatterboxMultilingualTTS:
         self.device = device
         self.conds = conds
         self.watermarker = create_watermarker()
+        self._profile_local = threading.local()
+
+    def _set_last_profile(self, profile: dict):
+        self._profile_local.last_profile = profile
+
+    def get_last_profile(self) -> dict:
+        return getattr(self._profile_local, "last_profile", {})
 
     @classmethod
     def get_supported_languages(cls):
@@ -276,6 +285,12 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        profile = {
+            "text_prep_s": 0.0,
+            "t3_s": 0.0,
+            "s3_s": 0.0,
+            "watermark_s": 0.0,
+        }
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[mtl_tts.py] generate.input")
             shape_logger.info("  text %r", text)
@@ -289,6 +304,7 @@ class ChatterboxMultilingualTTS:
                 f"Supported languages: {supported_langs}"
             )
         
+        prep_start = time.perf_counter()
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -312,11 +328,13 @@ class ChatterboxMultilingualTTS:
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        profile["text_prep_s"] = time.perf_counter() - prep_start
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[mtl_tts.py] generate.text_tokens")
             shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
 
         with torch.inference_mode():
+            t3_start = time.perf_counter()
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
@@ -327,6 +345,7 @@ class ChatterboxMultilingualTTS:
                 min_p=min_p,
                 top_p=top_p,
             )
+            profile["t3_s"] = time.perf_counter() - t3_start
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
             if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -340,12 +359,17 @@ class ChatterboxMultilingualTTS:
                 shape_logger.info("[mtl_tts.py] generate.speech_tokens.filtered")
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
+            s3_start = time.perf_counter()
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
             )
+            profile["s3_s"] = time.perf_counter() - s3_start
             wav = wav.squeeze(0).detach().cpu().numpy()
+            watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            profile["watermark_s"] = time.perf_counter() - watermark_start
+        self._set_last_profile(profile)
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[mtl_tts.py] generate.output")
             shape_logger.info("  wav %s %s", watermarked_wav.shape, watermarked_wav.dtype)

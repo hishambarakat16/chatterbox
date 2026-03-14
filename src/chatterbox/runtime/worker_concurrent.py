@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import time
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,14 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
         self.t3_decode_lock = threading.Lock()
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
+        profile = {
+            "text_prep_s": 0.0,
+            "t3_wait_s": 0.0,
+            "t3_decode_s": 0.0,
+            "t3_s": 0.0,
+            "s3_s": 0.0,
+            "watermark_s": 0.0,
+        }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
         language_id = active_options.language_id
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -44,6 +53,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                 f"Supported languages: {supported_langs}"
             )
 
+        prep_start = time.perf_counter()
         active_conds = session.clone_conditionals()
         active_conds = active_conds.to(device=self.device)
         active_conds = self._apply_exaggeration_copy(active_conds, active_options.exaggeration)
@@ -58,13 +68,16 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        profile["text_prep_s"] = time.perf_counter() - prep_start
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[runtime/worker_concurrent.py] generate.text_tokens")
             shape_logger.info("  session_id %s", session.session_id)
             shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
 
         with torch.inference_mode():
+            wait_start = time.perf_counter()
             with self.t3_decode_lock:
+                acquired_at = time.perf_counter()
                 if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                     shape_logger.info("[runtime/worker_concurrent.py] acquire_t3_decode_lock")
                     shape_logger.info("  session_id %s", session.session_id)
@@ -79,6 +92,10 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                     min_p=active_options.min_p,
                     top_p=active_options.top_p,
                 )
+                t3_end = time.perf_counter()
+            profile["t3_wait_s"] = acquired_at - wait_start
+            profile["t3_decode_s"] = t3_end - acquired_at
+            profile["t3_s"] = t3_end - wait_start
             speech_tokens = speech_tokens[0]
             if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                 shape_logger.info("[runtime/worker_concurrent.py] generate.speech_tokens.raw")
@@ -91,12 +108,17 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                 shape_logger.info("  session_id %s", session.session_id)
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
+            s3_start = time.perf_counter()
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=active_conds.gen,
             )
+            profile["s3_s"] = time.perf_counter() - s3_start
             wav = wav.squeeze(0).detach().cpu().numpy()
+            watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            profile["watermark_s"] = time.perf_counter() - watermark_start
+        self._set_last_profile(profile)
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[runtime/worker_concurrent.py] generate.output")
             shape_logger.info("  session_id %s", session.session_id)
