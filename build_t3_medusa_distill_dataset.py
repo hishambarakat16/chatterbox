@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import multiprocessing as mp
 from pathlib import Path
 
 import torch
@@ -74,16 +75,25 @@ def build_single_request(
     return request, session, normalized_text, text_tokens_single
 
 
-def save_conditionals_once(session, output_dir: Path) -> Path:
+def shard_jsonl_path(output_dir: Path, num_shards: int, shard_index: int) -> Path:
+    if num_shards == 1:
+        return output_dir / "samples.jsonl"
+    return output_dir / f"samples.shard_{shard_index:02d}_of_{num_shards:02d}.jsonl"
+
+
+def save_conditionals_once(session, output_dir: Path, *, num_shards: int, shard_index: int) -> Path:
     conds_dir = output_dir / "conditionals"
     conds_dir.mkdir(parents=True, exist_ok=True)
-    conds_path = conds_dir / "prompt_000.pt"
+    if num_shards == 1:
+        conds_path = conds_dir / "prompt_000.pt"
+    else:
+        conds_path = conds_dir / f"prompt_shard_{shard_index:02d}_of_{num_shards:02d}.pt"
     if not conds_path.exists():
         clone_conditionals(session.conditionals).save(conds_path)
     return conds_path
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate a T3 Medusa distillation dataset from Arabic text prompts."
     )
@@ -103,37 +113,56 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--mp-workers",
+        type=int,
+        default=1,
+        help="Spawn this many worker processes and split the manifest evenly across them.",
+    )
+    return parser
 
-    if args.num_shards < 1:
-        raise ValueError("--num-shards must be >= 1")
-    if args.shard_index < 0 or args.shard_index >= args.num_shards:
-        raise ValueError("--shard-index must be in [0, --num-shards)")
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if args.num_shards == 1:
-        jsonl_path = output_dir / "samples.jsonl"
-    else:
-        jsonl_path = output_dir / f"samples.shard_{args.shard_index:02d}_of_{args.num_shards:02d}.jsonl"
-
-    model = load_model(args.device, args.checkpoint_dir)
-
+def load_records(manifest_csv: str, limit: int, num_shards: int, shard_index: int):
     records = []
-    with Path(args.manifest_csv).open("r", encoding="utf-8", newline="") as handle:
+    with Path(manifest_csv).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             records.append(row)
 
-    if args.limit > 0:
-        records = records[: args.limit]
+    if limit > 0:
+        records = records[:limit]
 
-    if args.num_shards > 1:
-        records = records[args.shard_index :: args.num_shards]
+    if num_shards > 1:
+        records = records[shard_index::num_shards]
+
+    return records
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, --num-shards)")
+    if args.mp_workers < 1:
+        raise ValueError("--mp-workers must be >= 1")
+    if args.mp_workers > 1 and (args.num_shards != 1 or args.shard_index != 0):
+        raise ValueError("Use either --mp-workers or manual --num-shards/--shard-index, not both together")
+
+
+def run_shard(args: argparse.Namespace) -> int:
+    validate_args(args)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = shard_jsonl_path(output_dir, args.num_shards, args.shard_index)
+
+    model = load_model(args.device, args.checkpoint_dir)
+    records = load_records(args.manifest_csv, args.limit, args.num_shards, args.shard_index)
 
     written = 0
     failures = 0
     conds_path_written = None
+    log_prefix = f"[shard {args.shard_index}/{args.num_shards}] " if args.num_shards > 1 else ""
     with jsonl_path.open("w", encoding="utf-8") as sink:
         for index, row in enumerate(records):
             text = row["text"]
@@ -152,7 +181,12 @@ def main() -> None:
                     top_p=args.top_p,
                 )
                 if conds_path_written is None:
-                    conds_path_written = save_conditionals_once(session, output_dir)
+                    conds_path_written = save_conditionals_once(
+                        session,
+                        output_dir,
+                        num_shards=args.num_shards,
+                        shard_index=args.shard_index,
+                    )
 
                 teacher_tokens = run_baseline_greedy_decode(model.worker.t3, request)
                 teacher_tokens = drop_invalid_tokens(teacher_tokens[0]).to("cpu")
@@ -183,20 +217,56 @@ def main() -> None:
                 sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                 written += 1
                 if written % max(args.save_every, 1) == 0:
-                    print(f"written={written} failures={failures}")
+                    print(f"{log_prefix}written={written} failures={failures}")
             except Exception as exc:  # pragma: no cover - dataset generation should continue on bad rows
                 failures += 1
-                print(f"failed sample_id={sample_id}: {exc}")
+                print(f"{log_prefix}failed sample_id={sample_id}: {exc}")
 
-    print(f"output_dir={output_dir}")
-    print(f"jsonl_path={jsonl_path}")
-    print(f"num_shards={args.num_shards}")
-    print(f"shard_index={args.shard_index}")
-    print(f"records_assigned={len(records)}")
-    print(f"written={written}")
-    print(f"failures={failures}")
+    print(f"{log_prefix}output_dir={output_dir}")
+    print(f"{log_prefix}jsonl_path={jsonl_path}")
+    print(f"{log_prefix}num_shards={args.num_shards}")
+    print(f"{log_prefix}shard_index={args.shard_index}")
+    print(f"{log_prefix}records_assigned={len(records)}")
+    print(f"{log_prefix}written={written}")
+    print(f"{log_prefix}failures={failures}")
     if conds_path_written is not None:
-        print(f"conditionals_path={conds_path_written}")
+        print(f"{log_prefix}conditionals_path={conds_path_written}")
+    return failures
+
+
+def launch_mp_workers(args: argparse.Namespace) -> None:
+    validate_args(args)
+    ctx = mp.get_context("spawn")
+    procs = []
+    for shard_index in range(args.mp_workers):
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.mp_workers = 1
+        worker_args.num_shards = args.mp_workers
+        worker_args.shard_index = shard_index
+        proc = ctx.Process(target=run_shard, args=(worker_args,), name=f"medusa_distill_{shard_index}")
+        proc.start()
+        procs.append(proc)
+
+    exit_codes = []
+    for proc in procs:
+        proc.join()
+        exit_codes.append(proc.exitcode)
+
+    if any(code != 0 for code in exit_codes):
+        raise SystemExit(f"mp worker exit codes={exit_codes}")
+
+    print(f"mp_workers={args.mp_workers}")
+    print(f"completed_shards={args.mp_workers}")
+    print(f"output_dir={args.output_dir}")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.mp_workers > 1:
+        launch_mp_workers(args)
+        return
+    run_shard(args)
 
 
 if __name__ == "__main__":
