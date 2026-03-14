@@ -9,10 +9,30 @@ from .scheduled_decode import ScheduledDecodeRequest, prepare_scheduled_cohort
 
 
 shape_logger = logging.getLogger("chatterbox.shape")
+_TRACE_COUNTS: dict[str, int] = {}
 
 
 def _trace_enabled() -> bool:
     return bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
+
+
+def _trace_stride() -> int:
+    raw_stride = os.getenv("CHATTERBOX_TRACE_SPEC_EVERY", "6")
+    try:
+        return max(int(raw_stride), 1)
+    except ValueError:
+        return 6
+
+
+def _reset_trace_counters() -> None:
+    _TRACE_COUNTS.clear()
+
+
+def _should_trace_event(name: str) -> tuple[bool, int]:
+    occurrence = _TRACE_COUNTS.get(name, 0) + 1
+    _TRACE_COUNTS[name] = occurrence
+    stride = _trace_stride()
+    return occurrence == 1 or occurrence % stride == 0, occurrence
 
 
 def _cfg_combine(raw_logits: Tensor, cfg_weight: float) -> Tensor:
@@ -67,8 +87,10 @@ def _build_cfg_step_inputs(t3, *, tokens: Tensor, start_pos: int) -> Tensor:
     assert base_embed.shape == pos_embed.shape, (tuple(base_embed.shape), tuple(pos_embed.shape))
     single = base_embed + pos_embed
     duplicated = torch.cat([single, single], dim=0)
-    if _trace_enabled():
+    should_trace, occurrence = _should_trace_event("build_cfg_step_inputs")
+    if _trace_enabled() and should_trace:
         shape_logger.info("[models/t3/inference/speculative_decode.py] build_cfg_step_inputs")
+        shape_logger.info("  occurrence %s", occurrence)
         shape_logger.info("  tokens %s %s %s", tuple(tokens.shape), tokens.dtype, tokens.device)
         shape_logger.info("  base_embed %s %s %s", tuple(base_embed.shape), base_embed.dtype, base_embed.device)
         shape_logger.info("  pos_embed %s %s %s", tuple(pos_embed.shape), pos_embed.dtype, pos_embed.device)
@@ -138,6 +160,7 @@ def prefill_prototype_state(t3, request: ScheduledDecodeRequest) -> _PrototypeSt
 
 @torch.inference_mode()
 def run_baseline_greedy_decode(t3, request: ScheduledDecodeRequest) -> Tensor:
+    _reset_trace_counters()
     state = prefill_prototype_state(t3, request)
     predicted_tokens: list[Tensor] = []
 
@@ -302,6 +325,7 @@ def run_self_speculative_decode(
     speculate_k: int,
 ) -> SpeculativePrototypeResult:
     assert speculate_k >= 1
+    _reset_trace_counters()
     state = prefill_prototype_state(t3, request)
     predicted_tokens: list[Tensor] = []
     rounds = 0

@@ -24,12 +24,14 @@ def maybe_sync(device: str):
         torch.cuda.synchronize()
 
 
-def configure_shape_logging(enabled: bool):
+def configure_shape_logging(enabled: bool, trace_spec_every: int):
     if not enabled:
         os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
+        os.environ.pop("CHATTERBOX_TRACE_SPEC_EVERY", None)
         return
 
     os.environ["CHATTERBOX_TRACE_SHAPES"] = "1"
+    os.environ["CHATTERBOX_TRACE_SPEC_EVERY"] = str(max(trace_spec_every, 1))
     logger = logging.getLogger("chatterbox.shape")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -121,10 +123,11 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--speculate-k", type=int, default=4)
     parser.add_argument("--trace-shapes", action="store_true")
+    parser.add_argument("--trace-spec-every", type=int, default=6)
     parser.add_argument("--output-dir")
     args = parser.parse_args()
 
-    configure_shape_logging(args.trace_shapes)
+    configure_shape_logging(args.trace_shapes, args.trace_spec_every)
 
     load_started = time.perf_counter()
     model = load_model(args.device, args.checkpoint_dir)
@@ -182,6 +185,7 @@ def main():
     print(f"load_s={load_s:.4f}")
     print(f"speculate_k={args.speculate_k}")
     print(f"max_new_tokens={args.max_new_tokens}")
+    print(f"trace_spec_every={max(args.trace_spec_every, 1)}")
     print(f"text_tokens_shape={tuple(request.text_tokens.shape)}")
     print(f"cfg_weight={request.cfg_weight}")
     print(f"baseline_t3_s={baseline_s:.4f}")
