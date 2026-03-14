@@ -30,12 +30,15 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
         self.t3_decode_lock = threading.Lock()
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
+        request_start = time.perf_counter()
         profile = {
             "text_prep_s": 0.0,
+            "t3_first_token_s": 0.0,
             "t3_wait_s": 0.0,
             "t3_decode_s": 0.0,
             "t3_s": 0.0,
             "s3_s": 0.0,
+            "audio_ready_s": 0.0,
             "watermark_s": 0.0,
         }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
@@ -81,7 +84,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                 if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                     shape_logger.info("[runtime/worker_concurrent.py] acquire_t3_decode_lock")
                     shape_logger.info("  session_id %s", session.session_id)
-                speech_tokens = run_concurrent_t3_inference(
+                speech_tokens, t3_metrics = run_concurrent_t3_inference(
                     self.t3,
                     t3_cond=active_conds.t3,
                     text_tokens=text_tokens,
@@ -96,6 +99,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
             profile["t3_wait_s"] = acquired_at - wait_start
             profile["t3_decode_s"] = t3_end - acquired_at
             profile["t3_s"] = t3_end - wait_start
+            profile["t3_first_token_s"] = profile["t3_wait_s"] + float(t3_metrics.get("first_token_decode_s", 0.0))
             speech_tokens = speech_tokens[0]
             if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                 shape_logger.info("[runtime/worker_concurrent.py] generate.speech_tokens.raw")
@@ -114,6 +118,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                 ref_dict=active_conds.gen,
             )
             profile["s3_s"] = time.perf_counter() - s3_start
+            profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

@@ -116,10 +116,12 @@ class ChatterboxMultilingualStreamingWorker:
         return session
 
     def generate(self, *, session: StreamingSession, text: str, options: GenerationOptions | None = None) -> torch.Tensor:
+        request_start = time.perf_counter()
         profile = {
             "text_prep_s": 0.0,
             "t3_s": 0.0,
             "s3_s": 0.0,
+            "audio_ready_s": 0.0,
             "watermark_s": 0.0,
         }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
@@ -188,6 +190,7 @@ class ChatterboxMultilingualStreamingWorker:
                 ref_dict=active_conds.gen,
             )
             profile["s3_s"] = time.perf_counter() - s3_start
+            profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

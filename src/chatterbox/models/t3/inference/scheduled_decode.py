@@ -193,9 +193,9 @@ def advance_scheduled_cohort(
     *,
     patched_model,
     alignment_controller,
-) -> tuple[list[tuple[str, Tensor]], bool]:
+) -> tuple[list[tuple[str, Tensor]], list[str], bool]:
     if not cohort.active_states:
-        return [], True
+        return [], [], True
 
     output_attentions = alignment_controller is not None
 
@@ -259,6 +259,7 @@ def advance_scheduled_cohort(
         )
 
     finished_results: list[tuple[str, Tensor]] = []
+    first_token_session_ids: list[str] = []
     next_round_states = []
     for row_index, state in enumerate(cohort.active_states):
         request = state.request
@@ -279,6 +280,8 @@ def advance_scheduled_cohort(
         next_token = torch.multinomial(probs, num_samples=1)
         state.predicted_tokens.append(next_token)
         state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
+        if len(state.predicted_tokens) == 1:
+            first_token_session_ids.append(request.session_id)
 
         stop_on_eos = torch.all(next_token.view(-1) == t3.hp.stop_speech_token)
         hit_limit = len(state.predicted_tokens) >= request.max_new_tokens
@@ -295,4 +298,4 @@ def advance_scheduled_cohort(
         next_round_states.append(state)
 
     cohort.active_states = next_round_states
-    return finished_results, not cohort.active_states
+    return finished_results, first_token_session_ids, not cohort.active_states

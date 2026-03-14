@@ -31,12 +31,15 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         self.t3_scheduler = T3DecodeScheduler(self.t3, batching_window_ms=batching_window_ms)
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
+        request_start = time.perf_counter()
         profile = {
             "text_prep_s": 0.0,
+            "t3_first_token_s": 0.0,
             "t3_wait_s": 0.0,
             "t3_active_s": 0.0,
             "t3_s": 0.0,
             "s3_s": 0.0,
+            "audio_ready_s": 0.0,
             "watermark_s": 0.0,
         }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
@@ -108,6 +111,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
                 ref_dict=active_conds.gen,
             )
             profile["s3_s"] = time.perf_counter() - s3_start
+            profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

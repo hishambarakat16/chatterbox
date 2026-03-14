@@ -25,6 +25,7 @@ class _PendingScheduledRequest:
     error: Exception | None = None
     submitted_at: float = field(default_factory=time.perf_counter)
     first_started_at: float | None = None
+    first_token_at: float | None = None
     completed_at: float | None = None
     metrics: dict = field(default_factory=dict)
 
@@ -140,18 +141,24 @@ class T3DecodeScheduler:
             if item.first_started_at is None:
                 item.first_started_at = step_started_at
 
-        finished_results, cohort_complete = advance_scheduled_cohort(
+        finished_results, first_token_session_ids, cohort_complete = advance_scheduled_cohort(
             self.t3,
             cohort.cohort_state,
             patched_model=self.patched_model,
             alignment_controller=self.alignment_controller,
         )
+        first_token_recorded_at = time.perf_counter()
+        for session_id in first_token_session_ids:
+            item = cohort.pending_by_session.get(session_id)
+            if item is not None and item.first_token_at is None:
+                item.first_token_at = first_token_recorded_at
 
         for session_id, result in finished_results:
             item = cohort.pending_by_session.pop(session_id)
             item.completed_at = time.perf_counter()
             item.metrics = {
                 "t3_wait_s": 0.0 if item.first_started_at is None else item.first_started_at - item.submitted_at,
+                "t3_first_token_s": 0.0 if item.first_token_at is None else item.first_token_at - item.submitted_at,
                 "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
                 "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
             }

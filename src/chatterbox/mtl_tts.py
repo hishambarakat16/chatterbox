@@ -285,10 +285,12 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        request_start = time.perf_counter()
         profile = {
             "text_prep_s": 0.0,
             "t3_s": 0.0,
             "s3_s": 0.0,
+            "audio_ready_s": 0.0,
             "watermark_s": 0.0,
         }
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -365,6 +367,7 @@ class ChatterboxMultilingualTTS:
                 ref_dict=self.conds.gen,
             )
             profile["s3_s"] = time.perf_counter() - s3_start
+            profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermark_start = time.perf_counter()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)

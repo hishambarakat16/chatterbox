@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -92,6 +93,8 @@ def run_concurrent_t3_inference(
         shape_logger.info("  has_alignment_stream_analyzer %s", alignment_stream_analyzer is not None)
 
     try:
+        decode_started_at = time.perf_counter()
+        first_token_decode_s = None
         device = embeds.device
         bos_token = torch.tensor([[t3.hp.start_speech_token]], dtype=torch.long, device=device)
         bos_embed = t3.speech_emb(bos_token)
@@ -143,6 +146,8 @@ def run_concurrent_t3_inference(
 
             predicted.append(next_token)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            if first_token_decode_s is None:
+                first_token_decode_s = time.perf_counter() - decode_started_at
 
             if stop_on_eos and torch.all(next_token.view(-1) == t3.hp.stop_speech_token):
                 logger.info("✅ EOS token detected! Stopping generation at step %s", i + 1)
@@ -174,7 +179,9 @@ def run_concurrent_t3_inference(
                 predicted_tokens.dtype,
                 predicted_tokens.device,
             )
-        return predicted_tokens
+        return predicted_tokens, {
+            "first_token_decode_s": 0.0 if first_token_decode_s is None else first_token_decode_s,
+        }
     finally:
         if alignment_stream_analyzer is not None:
             alignment_stream_analyzer.close()
