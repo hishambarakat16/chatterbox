@@ -24,6 +24,65 @@ def maybe_sync(device: str):
         torch.cuda.synchronize()
 
 
+def is_cuda_device(device: str) -> bool:
+    return device.startswith("cuda") and torch.cuda.is_available()
+
+
+def reset_cuda_peak_stats(device: str):
+    if is_cuda_device(device):
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def capture_cuda_memory_stats(device: str) -> dict[str, float]:
+    if not is_cuda_device(device):
+        return {
+            "allocated_start_mb": 0.0,
+            "reserved_start_mb": 0.0,
+            "allocated_end_mb": 0.0,
+            "reserved_end_mb": 0.0,
+            "peak_allocated_mb": 0.0,
+            "peak_reserved_mb": 0.0,
+            "peak_allocated_delta_mb": 0.0,
+            "peak_reserved_delta_mb": 0.0,
+        }
+
+    to_mb = 1024.0 * 1024.0
+    allocated_start = torch.cuda.memory_allocated(device) / to_mb
+    reserved_start = torch.cuda.memory_reserved(device) / to_mb
+    return {
+        "allocated_start_mb": allocated_start,
+        "reserved_start_mb": reserved_start,
+        "allocated_end_mb": 0.0,
+        "reserved_end_mb": 0.0,
+        "peak_allocated_mb": 0.0,
+        "peak_reserved_mb": 0.0,
+        "peak_allocated_delta_mb": 0.0,
+        "peak_reserved_delta_mb": 0.0,
+    }
+
+
+def finalize_cuda_memory_stats(device: str, memory_stats: dict[str, float]) -> dict[str, float]:
+    if not is_cuda_device(device):
+        return memory_stats
+
+    to_mb = 1024.0 * 1024.0
+    allocated_end = torch.cuda.memory_allocated(device) / to_mb
+    reserved_end = torch.cuda.memory_reserved(device) / to_mb
+    peak_allocated = torch.cuda.max_memory_allocated(device) / to_mb
+    peak_reserved = torch.cuda.max_memory_reserved(device) / to_mb
+    memory_stats["allocated_end_mb"] = allocated_end
+    memory_stats["reserved_end_mb"] = reserved_end
+    memory_stats["peak_allocated_mb"] = peak_allocated
+    memory_stats["peak_reserved_mb"] = peak_reserved
+    memory_stats["peak_allocated_delta_mb"] = peak_allocated - memory_stats["allocated_start_mb"]
+    memory_stats["peak_reserved_delta_mb"] = peak_reserved - memory_stats["reserved_start_mb"]
+    return memory_stats
+
+
+def mean_or_zero(values: list[float]) -> float:
+    return 0.0 if not values else sum(values) / len(values)
+
+
 def configure_shape_logging(enabled: bool, trace_spec_every: int):
     if not enabled:
         os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
@@ -111,6 +170,34 @@ def render_tokens(worker, session, tokens: torch.Tensor, output_path: Path):
     return int(filtered.numel()), int(wav.shape[-1])
 
 
+def run_timed_baseline(device: str, t3, request: ScheduledDecodeRequest):
+    maybe_sync(device)
+    memory_stats = capture_cuda_memory_stats(device)
+    reset_cuda_peak_stats(device)
+    started = time.perf_counter()
+    tokens = run_baseline_greedy_decode(t3, request)
+    maybe_sync(device)
+    elapsed = time.perf_counter() - started
+    memory_stats = finalize_cuda_memory_stats(device, memory_stats)
+    return tokens, elapsed, memory_stats
+
+
+def run_timed_speculative(device: str, t3, request: ScheduledDecodeRequest, speculate_k: int):
+    maybe_sync(device)
+    memory_stats = capture_cuda_memory_stats(device)
+    reset_cuda_peak_stats(device)
+    started = time.perf_counter()
+    result = run_self_speculative_decode(
+        t3,
+        request,
+        speculate_k=speculate_k,
+    )
+    maybe_sync(device)
+    elapsed = time.perf_counter() - started
+    memory_stats = finalize_cuda_memory_stats(device, memory_stats)
+    return result, elapsed, memory_stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prototype speculative decoding on the current multilingual T3 using a self-draft greedy path."
@@ -122,6 +209,8 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--speculate-k", type=int, default=4)
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--trace-shapes", action="store_true")
     parser.add_argument("--trace-spec-every", type=int, default=6)
     parser.add_argument("--output-dir")
@@ -142,29 +231,96 @@ def main():
         max_new_tokens=args.max_new_tokens,
     )
 
-    maybe_sync(args.device)
-    baseline_started = time.perf_counter()
-    baseline_tokens = run_baseline_greedy_decode(model.worker.t3, request)
-    maybe_sync(args.device)
-    baseline_s = time.perf_counter() - baseline_started
+    total_runs = args.warmup_runs + args.runs
+    orders = ["baseline_first" if run_index % 2 == 0 else "speculative_first" for run_index in range(total_runs)]
 
-    maybe_sync(args.device)
-    speculative_started = time.perf_counter()
-    speculative = run_self_speculative_decode(
-        model.worker.t3,
-        request,
-        speculate_k=args.speculate_k,
-    )
-    maybe_sync(args.device)
-    speculative_s = time.perf_counter() - speculative_started
+    baseline_times: list[float] = []
+    speculative_times: list[float] = []
+    baseline_tokens_per_s: list[float] = []
+    speculative_tokens_per_s: list[float] = []
+    baseline_peak_allocated_delta_mb: list[float] = []
+    baseline_peak_reserved_delta_mb: list[float] = []
+    speculative_peak_allocated_delta_mb: list[float] = []
+    speculative_peak_reserved_delta_mb: list[float] = []
+    speculative_rounds: list[int] = []
+    speculative_proposed_tokens_total: list[int] = []
+    speculative_accepted_draft_tokens_total: list[int] = []
+    speculative_correction_tokens_total: list[int] = []
+    speculative_acceptance_rates: list[float] = []
+    exact_match_all_runs = True
+    last_mismatch_index = None
+    baseline_tokens = None
+    speculative_tokens = None
 
-    speculative_tokens = speculative.speech_tokens
-    mismatch_index = first_mismatch_index(baseline_tokens, speculative_tokens)
-    exact_match = mismatch_index is None
+    for run_index, order in enumerate(orders):
+        measured = run_index >= args.warmup_runs
+
+        if order == "baseline_first":
+            baseline_tokens_run, baseline_elapsed, baseline_memory = run_timed_baseline(
+                args.device,
+                model.worker.t3,
+                request,
+            )
+            speculative_run, speculative_elapsed, speculative_memory = run_timed_speculative(
+                args.device,
+                model.worker.t3,
+                request,
+                args.speculate_k,
+            )
+        else:
+            speculative_run, speculative_elapsed, speculative_memory = run_timed_speculative(
+                args.device,
+                model.worker.t3,
+                request,
+                args.speculate_k,
+            )
+            baseline_tokens_run, baseline_elapsed, baseline_memory = run_timed_baseline(
+                args.device,
+                model.worker.t3,
+                request,
+            )
+
+        speculative_tokens_run = speculative_run.speech_tokens
+        mismatch_index = first_mismatch_index(baseline_tokens_run, speculative_tokens_run)
+        exact_match = mismatch_index is None
+        if not exact_match:
+            exact_match_all_runs = False
+            last_mismatch_index = mismatch_index
+            break
+
+        baseline_tokens = baseline_tokens_run
+        speculative_tokens = speculative_tokens_run
+
+        if not measured:
+            continue
+
+        baseline_times.append(baseline_elapsed)
+        speculative_times.append(speculative_elapsed)
+        baseline_tokens_per_s.append(
+            0.0 if baseline_elapsed == 0.0 else baseline_tokens_run.size(1) / baseline_elapsed
+        )
+        speculative_tokens_per_s.append(
+            0.0 if speculative_elapsed == 0.0 else speculative_tokens_run.size(1) / speculative_elapsed
+        )
+        baseline_peak_allocated_delta_mb.append(baseline_memory["peak_allocated_delta_mb"])
+        baseline_peak_reserved_delta_mb.append(baseline_memory["peak_reserved_delta_mb"])
+        speculative_peak_allocated_delta_mb.append(speculative_memory["peak_allocated_delta_mb"])
+        speculative_peak_reserved_delta_mb.append(speculative_memory["peak_reserved_delta_mb"])
+        speculative_rounds.append(speculative_run.rounds)
+        speculative_proposed_tokens_total.append(speculative_run.proposed_tokens_total)
+        speculative_accepted_draft_tokens_total.append(speculative_run.accepted_draft_tokens_total)
+        speculative_correction_tokens_total.append(speculative_run.correction_tokens_total)
+        speculative_acceptance_rates.append(
+            0.0 if speculative_run.proposed_tokens_total == 0
+            else speculative_run.accepted_draft_tokens_total / speculative_run.proposed_tokens_total
+        )
+
+    if not exact_match_all_runs:
+        raise AssertionError(f"speculative prototype tokens did not match baseline greedy decode at index {last_mismatch_index}")
 
     saved_wavs = []
     rendered = {}
-    if args.output_dir:
+    if args.output_dir and baseline_tokens is not None and speculative_tokens is not None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         baseline_path = output_dir / "baseline_greedy.wav"
@@ -185,34 +341,46 @@ def main():
     print(f"load_s={load_s:.4f}")
     print(f"speculate_k={args.speculate_k}")
     print(f"max_new_tokens={args.max_new_tokens}")
+    print(f"warmup_runs={args.warmup_runs}")
+    print(f"runs={args.runs}")
+    print(f"run_orders={orders}")
     print(f"trace_spec_every={max(args.trace_spec_every, 1)}")
     print(f"text_tokens_shape={tuple(request.text_tokens.shape)}")
     print(f"cfg_weight={request.cfg_weight}")
-    print(f"baseline_t3_s={baseline_s:.4f}")
-    print(f"speculative_t3_s={speculative_s:.4f}")
-    print(f"baseline_num_tokens={baseline_tokens.size(1)}")
-    print(f"speculative_num_tokens={speculative_tokens.size(1)}")
-    print(f"speculative_rounds={speculative.rounds}")
-    print(f"speculative_proposed_tokens_total={speculative.proposed_tokens_total}")
-    print(f"speculative_accepted_draft_tokens_total={speculative.accepted_draft_tokens_total}")
-    print(f"speculative_correction_tokens_total={speculative.correction_tokens_total}")
-    acceptance_rate = (
-        0.0 if speculative.proposed_tokens_total == 0
-        else speculative.accepted_draft_tokens_total / speculative.proposed_tokens_total
-    )
-    print(f"speculative_acceptance_rate={acceptance_rate:.4f}")
-    print(f"exact_token_match={exact_match}")
-    print(f"first_mismatch_index={mismatch_index}")
-    if mismatch_index is not None:
-        print(f"baseline_mismatch_token={baseline_tokens[0, mismatch_index].item() if mismatch_index < baseline_tokens.size(1) else None}")
-        print(f"speculative_mismatch_token={speculative_tokens[0, mismatch_index].item() if mismatch_index < speculative_tokens.size(1) else None}")
+    print(f"baseline_t3_s={baseline_times}")
+    print(f"speculative_t3_s={speculative_times}")
+    print(f"baseline_t3_s_mean={mean_or_zero(baseline_times):.4f}")
+    print(f"speculative_t3_s_mean={mean_or_zero(speculative_times):.4f}")
+    mean_baseline = mean_or_zero(baseline_times)
+    mean_speculative = mean_or_zero(speculative_times)
+    speedup_pct = 0.0 if mean_baseline == 0.0 else ((mean_baseline - mean_speculative) / mean_baseline) * 100.0
+    print(f"speculative_vs_baseline_speedup_pct={speedup_pct:.2f}")
+    print(f"baseline_tokens_per_s={baseline_tokens_per_s}")
+    print(f"speculative_tokens_per_s={speculative_tokens_per_s}")
+    print(f"baseline_tokens_per_s_mean={mean_or_zero(baseline_tokens_per_s):.4f}")
+    print(f"speculative_tokens_per_s_mean={mean_or_zero(speculative_tokens_per_s):.4f}")
+    print(f"baseline_peak_allocated_delta_mb={baseline_peak_allocated_delta_mb}")
+    print(f"baseline_peak_reserved_delta_mb={baseline_peak_reserved_delta_mb}")
+    print(f"speculative_peak_allocated_delta_mb={speculative_peak_allocated_delta_mb}")
+    print(f"speculative_peak_reserved_delta_mb={speculative_peak_reserved_delta_mb}")
+    print(f"baseline_peak_allocated_delta_mb_mean={mean_or_zero(baseline_peak_allocated_delta_mb):.4f}")
+    print(f"baseline_peak_reserved_delta_mb_mean={mean_or_zero(baseline_peak_reserved_delta_mb):.4f}")
+    print(f"speculative_peak_allocated_delta_mb_mean={mean_or_zero(speculative_peak_allocated_delta_mb):.4f}")
+    print(f"speculative_peak_reserved_delta_mb_mean={mean_or_zero(speculative_peak_reserved_delta_mb):.4f}")
+    print(f"baseline_num_tokens={baseline_tokens.size(1) if baseline_tokens is not None else 0}")
+    print(f"speculative_num_tokens={speculative_tokens.size(1) if speculative_tokens is not None else 0}")
+    print(f"speculative_rounds={speculative_rounds}")
+    print(f"speculative_rounds_mean={mean_or_zero([float(value) for value in speculative_rounds]):.4f}")
+    print(f"speculative_proposed_tokens_total={speculative_proposed_tokens_total}")
+    print(f"speculative_accepted_draft_tokens_total={speculative_accepted_draft_tokens_total}")
+    print(f"speculative_correction_tokens_total={speculative_correction_tokens_total}")
+    print(f"speculative_acceptance_rate={speculative_acceptance_rates}")
+    print(f"speculative_acceptance_rate_mean={mean_or_zero(speculative_acceptance_rates):.4f}")
+    print(f"exact_token_match={exact_match_all_runs}")
+    print(f"first_mismatch_index={last_mismatch_index}")
     print(f"saved_wavs={saved_wavs}")
     for key, value in rendered.items():
         print(f"{key}={value}")
-
-    if not exact_match:
-        raise AssertionError("speculative prototype tokens did not match baseline greedy decode")
-
 
 if __name__ == "__main__":
     main()
