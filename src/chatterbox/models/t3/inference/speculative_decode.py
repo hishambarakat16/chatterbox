@@ -124,6 +124,12 @@ class SpeculativePrototypeResult:
     proposed_tokens_total: int
     accepted_draft_tokens_total: int
     correction_tokens_total: int
+    rebuild_count: int
+    rebuild_tokens_total: int
+    full_accept_rounds: int
+    zero_accept_rounds: int
+    partial_accept_rounds: int
+    match_len_hist: tuple[int, ...]
 
 
 @dataclass
@@ -381,6 +387,12 @@ def run_speculative_decode_with_draft(
     proposed_tokens_total = 0
     accepted_draft_tokens_total = 0
     correction_tokens_total = 0
+    rebuild_count = 0
+    rebuild_tokens_total = 0
+    full_accept_rounds = 0
+    zero_accept_rounds = 0
+    partial_accept_rounds = 0
+    match_len_hist = [0] * (speculate_k + 1)
 
     while sum(token.size(1) for token in predicted_tokens) < request.max_new_tokens:
         remaining = request.max_new_tokens - sum(token.size(1) for token in predicted_tokens)
@@ -402,6 +414,15 @@ def run_speculative_decode_with_draft(
         target_state.next_logits = verify.next_logits
         target_state.decode_step += committed_tokens.size(1)
 
+        accepted_tokens = verify.accepted_draft_tokens
+        match_len_hist[accepted_tokens] += 1
+        if verify.correction_token is None and accepted_tokens == verify.proposed_tokens:
+            full_accept_rounds += 1
+        elif accepted_tokens == 0:
+            zero_accept_rounds += 1
+        else:
+            partial_accept_rounds += 1
+
         if verify.correction_token is None and verify.accepted_draft_tokens == verify.proposed_tokens:
             draft_state.generated_ids = torch.cat([draft_state.generated_ids, committed_tokens], dim=1)
             draft_state.past_key_values = proposal.next_past_key_values
@@ -409,6 +430,8 @@ def run_speculative_decode_with_draft(
             draft_state.decode_step += committed_tokens.size(1)
         else:
             committed_history = torch.cat(predicted_tokens, dim=1)
+            rebuild_count += 1
+            rebuild_tokens_total += int(committed_history.size(1))
             draft_state = _rebuild_prototype_state(
                 draft_t3,
                 request,
@@ -435,6 +458,12 @@ def run_speculative_decode_with_draft(
         proposed_tokens_total=proposed_tokens_total,
         accepted_draft_tokens_total=accepted_draft_tokens_total,
         correction_tokens_total=correction_tokens_total,
+        rebuild_count=rebuild_count,
+        rebuild_tokens_total=rebuild_tokens_total,
+        full_accept_rounds=full_accept_rounds,
+        zero_accept_rounds=zero_accept_rounds,
+        partial_accept_rounds=partial_accept_rounds,
+        match_len_hist=tuple(match_len_hist),
     )
 
 

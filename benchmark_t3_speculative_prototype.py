@@ -268,6 +268,12 @@ def main():
     speculative_accepted_draft_tokens_total: list[int] = []
     speculative_correction_tokens_total: list[int] = []
     speculative_acceptance_rates: list[float] = []
+    speculative_rebuild_count: list[int] = []
+    speculative_rebuild_tokens_total: list[int] = []
+    speculative_full_accept_rounds: list[int] = []
+    speculative_zero_accept_rounds: list[int] = []
+    speculative_partial_accept_rounds: list[int] = []
+    speculative_match_len_hist_total = [0] * (args.speculate_k + 1)
     exact_match_all_runs = True
     last_mismatch_index = None
     baseline_tokens = None
@@ -333,10 +339,17 @@ def main():
         speculative_proposed_tokens_total.append(speculative_run.proposed_tokens_total)
         speculative_accepted_draft_tokens_total.append(speculative_run.accepted_draft_tokens_total)
         speculative_correction_tokens_total.append(speculative_run.correction_tokens_total)
+        speculative_rebuild_count.append(speculative_run.rebuild_count)
+        speculative_rebuild_tokens_total.append(speculative_run.rebuild_tokens_total)
+        speculative_full_accept_rounds.append(speculative_run.full_accept_rounds)
+        speculative_zero_accept_rounds.append(speculative_run.zero_accept_rounds)
+        speculative_partial_accept_rounds.append(speculative_run.partial_accept_rounds)
         speculative_acceptance_rates.append(
             0.0 if speculative_run.proposed_tokens_total == 0
             else speculative_run.accepted_draft_tokens_total / speculative_run.proposed_tokens_total
         )
+        for index, count in enumerate(speculative_run.match_len_hist):
+            speculative_match_len_hist_total[index] += count
 
     if not exact_match_all_runs:
         raise AssertionError(f"speculative prototype tokens did not match baseline greedy decode at index {last_mismatch_index}")
@@ -404,6 +417,14 @@ def main():
     print(f"speculative_proposed_tokens_total={speculative_proposed_tokens_total}")
     print(f"speculative_accepted_draft_tokens_total={speculative_accepted_draft_tokens_total}")
     print(f"speculative_correction_tokens_total={speculative_correction_tokens_total}")
+    print(f"speculative_rebuild_count={speculative_rebuild_count}")
+    print(f"speculative_rebuild_count_mean={mean_or_zero([float(value) for value in speculative_rebuild_count]):.4f}")
+    print(f"speculative_rebuild_tokens_total={speculative_rebuild_tokens_total}")
+    print(f"speculative_rebuild_tokens_total_mean={mean_or_zero([float(value) for value in speculative_rebuild_tokens_total]):.4f}")
+    print(f"speculative_full_accept_rounds={speculative_full_accept_rounds}")
+    print(f"speculative_zero_accept_rounds={speculative_zero_accept_rounds}")
+    print(f"speculative_partial_accept_rounds={speculative_partial_accept_rounds}")
+    print(f"speculative_match_len_hist_total={speculative_match_len_hist_total}")
     print(f"speculative_acceptance_rate={speculative_acceptance_rates}")
     print(f"speculative_acceptance_rate_mean={mean_or_zero(speculative_acceptance_rates):.4f}")
     print(f"exact_token_match={exact_match_all_runs}")
