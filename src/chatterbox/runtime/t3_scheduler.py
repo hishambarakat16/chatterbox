@@ -1,11 +1,17 @@
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import torch
 
-from ..models.t3.inference.scheduled_decode import ScheduledDecodeRequest, run_scheduled_t3_batch
+from ..models.t3.inference.scheduled_decode import (
+    ScheduledDecodeRequest,
+    advance_scheduled_cohort,
+    build_scheduled_runtime_components,
+    prepare_scheduled_cohort,
+)
 
 
 shape_logger = logging.getLogger("chatterbox.shape")
@@ -19,13 +25,20 @@ class _PendingScheduledRequest:
     error: Exception | None = None
 
 
+@dataclass
+class _ActiveScheduledCohort:
+    cohort_state: object
+    pending_by_session: dict[str, _PendingScheduledRequest]
+
+
 class T3DecodeScheduler:
     """
-    First-pass scheduler for batching T3 decode across multiple concurrent requests.
+    Dynamic scheduler for batched T3 decode.
 
-    This implementation groups pending requests with matching batch keys into a
-    cohort, runs one batched T3 decode to completion, and then releases each
-    request back to its caller for S3 inference.
+    Requests are still grouped into same-shape cohorts, but cohorts no longer run
+    to completion in one call. Instead, the scheduler advances one decode step at
+    a time and rotates across active cohorts, which lets new requests enter while
+    older cohorts are still decoding.
     """
 
     def __init__(self, t3, *, batching_window_ms: float = 5.0):
@@ -33,7 +46,9 @@ class T3DecodeScheduler:
         self.batching_window_ms = batching_window_ms
         self.condition = threading.Condition()
         self.pending: list[_PendingScheduledRequest] = []
+        self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
         self.stopped = False
+        self.patched_model, self.alignment_controller = build_scheduled_runtime_components(self.t3)
         self.worker = threading.Thread(
             target=self._run_loop,
             name="chatterbox-t3-scheduler",
@@ -58,60 +73,101 @@ class T3DecodeScheduler:
             self.stopped = True
             self.condition.notify_all()
         self.worker.join(timeout=1.0)
+        if self.alignment_controller is not None:
+            self.alignment_controller.close()
 
-    def _pop_cohort(self) -> list[_PendingScheduledRequest] | None:
+    def _drain_pending(self, *, block_if_idle: bool) -> list[_PendingScheduledRequest] | None:
         with self.condition:
-            while not self.pending and not self.stopped:
+            while block_if_idle and not self.pending and not self.stopped and not self.active_cohorts:
                 self.condition.wait()
 
-            if self.stopped and not self.pending:
+            if self.stopped and not self.pending and not self.active_cohorts:
                 return None
 
-            first = self.pending.pop(0)
-            cohort = [first]
-            batch_key = first.decode_request.batch_key()
-            deadline = time.perf_counter() + (self.batching_window_ms / 1000.0)
+            if not self.pending:
+                return []
 
+            deadline = time.perf_counter() + (self.batching_window_ms / 1000.0)
             while True:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
-                if not self.pending:
-                    self.condition.wait(timeout=remaining)
-                matched = []
-                still_pending = []
-                for pending in self.pending:
-                    if pending.decode_request.batch_key() == batch_key:
-                        matched.append(pending)
-                    else:
-                        still_pending.append(pending)
-                self.pending = still_pending
-                cohort.extend(matched)
-                if not matched and not self.pending:
-                    break
+                self.condition.wait(timeout=remaining)
 
-            return cohort
+            pending = self.pending
+            self.pending = []
+            return pending
+
+    def _activate_pending(self, pending_items: list[_PendingScheduledRequest]):
+        if not pending_items:
+            return
+
+        grouped: dict[tuple[int, int], list[_PendingScheduledRequest]] = {}
+        for item in pending_items:
+            grouped.setdefault(item.decode_request.batch_key(), []).append(item)
+
+        for batch_key, items in grouped.items():
+            decode_requests = [item.decode_request for item in items]
+            cohort_state = prepare_scheduled_cohort(self.t3, decode_requests)
+            pending_by_session = {item.decode_request.session_id: item for item in items}
+            self.active_cohorts.append(
+                _ActiveScheduledCohort(
+                    cohort_state=cohort_state,
+                    pending_by_session=pending_by_session,
+                )
+            )
+
+            if shape_logger.isEnabledFor(logging.INFO):
+                shape_logger.info("[runtime/t3_scheduler.py] run_cohort")
+                shape_logger.info("  requests %s", len(decode_requests))
+                shape_logger.info("  batch_key %s", batch_key)
+                shape_logger.info("  sessions %s", [request.session_id for request in decode_requests])
+                shape_logger.info("  active_cohorts %s", len(self.active_cohorts))
+
+    def _process_one_step(self, cohort: _ActiveScheduledCohort):
+        if shape_logger.isEnabledFor(logging.INFO):
+            shape_logger.info("[runtime/t3_scheduler.py] step_cohort")
+            shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
+            shape_logger.info("  active_requests %s", len(cohort.cohort_state.active_states))
+
+        finished_results, cohort_complete = advance_scheduled_cohort(
+            self.t3,
+            cohort.cohort_state,
+            patched_model=self.patched_model,
+            alignment_controller=self.alignment_controller,
+        )
+
+        for session_id, result in finished_results:
+            item = cohort.pending_by_session.pop(session_id)
+            item.result = result
+            item.done.set()
+
+        if not cohort_complete:
+            self.active_cohorts.append(cohort)
+            return
+
+        if shape_logger.isEnabledFor(logging.INFO):
+            shape_logger.info("[runtime/t3_scheduler.py] complete_cohort")
+            shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
+            shape_logger.info("  remaining_active_cohorts %s", len(self.active_cohorts))
+
+    def _fail_cohort(self, cohort: _ActiveScheduledCohort, exc: Exception):
+        for item in cohort.pending_by_session.values():
+            item.error = exc
+            item.done.set()
 
     def _run_loop(self):
         while True:
-            cohort = self._pop_cohort()
-            if cohort is None:
+            pending_items = self._drain_pending(block_if_idle=not self.active_cohorts)
+            if pending_items is None:
                 return
-            self._process_cohort(cohort)
+            self._activate_pending(pending_items)
 
-    def _process_cohort(self, cohort: list[_PendingScheduledRequest]):
-        decode_requests = [item.decode_request for item in cohort]
-        if shape_logger.isEnabledFor(logging.INFO):
-            shape_logger.info("[runtime/t3_scheduler.py] run_cohort")
-            shape_logger.info("  requests %s", len(decode_requests))
-            shape_logger.info("  batch_key %s", decode_requests[0].batch_key())
-            shape_logger.info("  sessions %s", [request.session_id for request in decode_requests])
-        try:
-            results = run_scheduled_t3_batch(self.t3, decode_requests)
-            for item, result in zip(cohort, results):
-                item.result = result
-                item.done.set()
-        except Exception as exc:  # noqa: BLE001
-            for item in cohort:
-                item.error = exc
-                item.done.set()
+            if not self.active_cohorts:
+                continue
+
+            cohort = self.active_cohorts.popleft()
+            try:
+                self._process_one_step(cohort)
+            except Exception as exc:  # noqa: BLE001
+                self._fail_cohort(cohort, exc)

@@ -21,6 +21,12 @@ def maybe_sync(device: str):
         torch.cuda.synchronize()
 
 
+def get_cuda_device(device: str):
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return None
+    return torch.device(device if ":" in device else "cuda:0")
+
+
 def load_model(impl: str, device: str, checkpoint_dir: str | None):
     if impl == "baseline":
         model_cls = ChatterboxMultilingualTTS
@@ -48,6 +54,46 @@ def configure_shape_logging(enabled: bool):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
+
+
+def begin_vram_measurement(device: str):
+    cuda_device = get_cuda_device(device)
+    if cuda_device is None:
+        return None
+
+    maybe_sync(device)
+    allocated_start = torch.cuda.memory_allocated(cuda_device)
+    reserved_start = torch.cuda.memory_reserved(cuda_device)
+    torch.cuda.reset_peak_memory_stats(cuda_device)
+    return {
+        "device": cuda_device,
+        "allocated_start": allocated_start,
+        "reserved_start": reserved_start,
+    }
+
+
+def finish_vram_measurement(device: str, state):
+    if state is None:
+        return {}
+
+    cuda_device = state["device"]
+    maybe_sync(device)
+    peak_allocated = torch.cuda.max_memory_allocated(cuda_device)
+    peak_reserved = torch.cuda.max_memory_reserved(cuda_device)
+    allocated_end = torch.cuda.memory_allocated(cuda_device)
+    reserved_end = torch.cuda.memory_reserved(cuda_device)
+
+    mib = 1024 * 1024
+    return {
+        "vram_allocated_start_mb": round(state["allocated_start"] / mib, 1),
+        "vram_reserved_start_mb": round(state["reserved_start"] / mib, 1),
+        "vram_allocated_end_mb": round(allocated_end / mib, 1),
+        "vram_reserved_end_mb": round(reserved_end / mib, 1),
+        "vram_peak_allocated_mb": round(peak_allocated / mib, 1),
+        "vram_peak_reserved_mb": round(peak_reserved / mib, 1),
+        "vram_peak_allocated_delta_mb": round(max(0, peak_allocated - state["allocated_start"]) / mib, 1),
+        "vram_peak_reserved_delta_mb": round(max(0, peak_reserved - state["reserved_start"]) / mib, 1),
+    }
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -84,6 +130,8 @@ def run_concurrency_level(
     device: str,
     output_dir: str | None,
 ):
+    vram_state = begin_vram_measurement(device)
+
     sessions = []
     if impl in {"streaming", "concurrent", "scheduled"}:
         for _ in range(concurrency):
@@ -142,8 +190,9 @@ def run_concurrency_level(
     latencies = [item["latency_s"] for item in results if item["error"] is None]
     sample_counts = [item["num_samples"] for item in results if item["num_samples"] is not None]
     total_audio_s = sum(sample_counts) / 24000.0 if sample_counts else 0.0
+    vram_summary = finish_vram_measurement(device, vram_state)
 
-    return {
+    summary = {
         "concurrency": concurrency,
         "wall_s": wall_s,
         "request_latencies_s": [round(item["latency_s"], 4) for item in results],
@@ -155,6 +204,8 @@ def run_concurrency_level(
         "errors": [item["error"] for item in results if item["error"] is not None],
         "saved_wavs": saved_wavs,
     }
+    summary.update(vram_summary)
+    return summary
 
 
 def main():
@@ -200,6 +251,18 @@ def main():
         print(f"num_samples={summary['num_samples']}")
         print(f"audio_seconds_total={summary['audio_seconds_total']}")
         print(f"audio_seconds_per_second={summary['audio_seconds_per_second']}")
+        for key in [
+            "vram_allocated_start_mb",
+            "vram_reserved_start_mb",
+            "vram_allocated_end_mb",
+            "vram_reserved_end_mb",
+            "vram_peak_allocated_mb",
+            "vram_peak_reserved_mb",
+            "vram_peak_allocated_delta_mb",
+            "vram_peak_reserved_delta_mb",
+        ]:
+            if key in summary:
+                print(f"{key}={summary[key]}")
         print(f"saved_wavs={summary['saved_wavs']}")
         print(f"errors={summary['errors']}")
 

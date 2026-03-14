@@ -1,6 +1,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
+
 import torch
 from torch import Tensor
 from transformers.generation.logits_process import (
@@ -46,8 +47,14 @@ class _ActiveDecodeState:
     alignment_state: ScheduledAlignmentState | None = None
     past_key_values: object = None
     decode_step: int = 0
-    finished: bool = False
     next_inputs_embeds: Tensor | None = None
+
+
+@dataclass
+class ScheduledDecodeCohort:
+    batch_key: tuple[int, int]
+    active_states: list[_ActiveDecodeState]
+    prefill_inputs: list[Tensor] | None
 
 
 def _ensure_bot_eot(text_tokens: Tensor, hp):
@@ -127,24 +134,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
     )
 
 
-@torch.inference_mode()
-def run_scheduled_t3_batch(t3, requests: list[ScheduledDecodeRequest]) -> list[Tensor]:
-    if not requests:
-        return []
-
-    active_states: list[_ActiveDecodeState] = []
-    all_states: list[_ActiveDecodeState] = []
-    prefill_inputs = []
-    batch_keys = {request.batch_key() for request in requests}
-    if len(batch_keys) != 1:
-        raise ValueError("scheduled batch currently requires matching text/prompt lengths")
-
-    for request in requests:
-        state, inputs_embeds = _build_initial_state(t3, request)
-        active_states.append(state)
-        all_states.append(state)
-        prefill_inputs.append(inputs_embeds)
-
+def build_scheduled_runtime_components(t3):
     patched_model = T3HuggingfaceBackend(
         config=t3.cfg,
         llama=t3.tfmr,
@@ -153,127 +143,156 @@ def run_scheduled_t3_batch(t3, requests: list[ScheduledDecodeRequest]) -> list[T
         alignment_stream_analyzer=None,
     )
     alignment_controller = ScheduledAlignmentController(t3.tfmr) if t3.hp.is_multilingual else None
+    return patched_model, alignment_controller
 
-    try:
-        inputs_embeds = torch.cat(prefill_inputs, dim=0)
+
+def prepare_scheduled_cohort(t3, requests: list[ScheduledDecodeRequest]) -> ScheduledDecodeCohort:
+    if not requests:
+        raise ValueError("scheduled cohort requires at least one request")
+
+    batch_keys = {request.batch_key() for request in requests}
+    if len(batch_keys) != 1:
+        raise ValueError("scheduled cohort currently requires matching text/prompt lengths")
+
+    active_states: list[_ActiveDecodeState] = []
+    prefill_inputs = []
+    for request in requests:
+        state, inputs_embeds = _build_initial_state(t3, request)
+        active_states.append(state)
+        prefill_inputs.append(inputs_embeds)
+
+    return ScheduledDecodeCohort(
+        batch_key=requests[0].batch_key(),
+        active_states=active_states,
+        prefill_inputs=prefill_inputs,
+    )
+
+
+def _finalize_prediction(t3, state: _ActiveDecodeState) -> Tensor:
+    if state.predicted_tokens:
+        predicted_tokens = torch.cat(state.predicted_tokens, dim=1)
+    else:
+        predicted_tokens = torch.empty((1, 0), dtype=torch.long, device=t3.device)
+
+    if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        shape_logger.info("[models/t3/inference/scheduled_decode.py] inference.output")
+        shape_logger.info("  session_id %s", state.request.session_id)
+        shape_logger.info(
+            "  predicted_tokens %s %s %s",
+            tuple(predicted_tokens.shape),
+            predicted_tokens.dtype,
+            predicted_tokens.device,
+        )
+    return predicted_tokens
+
+
+@torch.inference_mode()
+def advance_scheduled_cohort(
+    t3,
+    cohort: ScheduledDecodeCohort,
+    *,
+    patched_model,
+    alignment_controller,
+) -> tuple[list[tuple[str, Tensor]], bool]:
+    if not cohort.active_states:
+        return [], True
+
+    output_attentions = alignment_controller is not None
+
+    if cohort.prefill_inputs is not None:
+        inputs_embeds = torch.cat(cohort.prefill_inputs, dim=0)
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[models/t3/inference/scheduled_decode.py] prefill.batch")
-            shape_logger.info("  requests %s", len(active_states))
+            shape_logger.info("  requests %s", len(cohort.active_states))
             shape_logger.info("  inputs_embeds %s %s %s", tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device)
-
         output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
+            output_attentions=output_attentions,
             output_hidden_states=True,
             return_dict=True,
         )
-        past_splits = _split_past_key_values(output.past_key_values, [2] * len(active_states))
-        for state, state_past in zip(active_states, past_splits):
+        past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
+        for state, state_past in zip(cohort.active_states, past_splits):
+            state.past_key_values = state_past
+        cohort.prefill_inputs = None
+    else:
+        next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
+        batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
+        batched_inputs = torch.cat(next_inputs, dim=0)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/inference/scheduled_decode.py] decode.batch")
+            shape_logger.info("  requests %s", len(cohort.active_states))
+            shape_logger.info("  inputs_embeds %s %s %s", tuple(batched_inputs.shape), batched_inputs.dtype, batched_inputs.device)
+        output = patched_model(
+            inputs_embeds=batched_inputs,
+            past_key_values=batched_past,
+            use_cache=True,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
+        for state, state_past in zip(cohort.active_states, past_splits):
             state.past_key_values = state_past
 
-        global_max_steps = max(request.max_new_tokens for request in requests)
+    logits_step = output.logits[:, -1, :]
+    cond = logits_step[0::2, :]
+    uncond = logits_step[1::2, :]
+    cfg_weights = torch.tensor(
+        [state.request.cfg_weight for state in cohort.active_states],
+        device=cond.device,
+        dtype=cond.dtype,
+    ).unsqueeze(-1)
+    logits = cond + cfg_weights * (cond - uncond)
 
-        for _ in range(global_max_steps):
-            if not active_states:
-                break
+    if alignment_controller is not None:
+        last_tokens = [
+            state.generated_ids[0, -1].item() if state.generated_ids.size(1) > 0 else None
+            for state in cohort.active_states
+        ]
+        logits = alignment_controller.step(
+            logits,
+            active_states=[state.alignment_state for state in cohort.active_states],
+            next_tokens=last_tokens,
+        )
 
-            logits_step = output.logits[:, -1, :]
-            cond = logits_step[0::2, :]
-            uncond = logits_step[1::2, :]
-            cfg_weights = torch.tensor(
-                [state.request.cfg_weight for state in active_states],
-                device=cond.device,
-                dtype=cond.dtype,
-            ).unsqueeze(-1)
-            logits = cond + cfg_weights * (cond - uncond)
+    finished_results: list[tuple[str, Tensor]] = []
+    next_round_states = []
+    for row_index, state in enumerate(cohort.active_states):
+        request = state.request
+        ids_for_proc = state.generated_ids
+        row_logits = logits[row_index : row_index + 1]
 
-            if alignment_controller is not None:
-                last_tokens = [state.generated_ids[0, -1].item() if state.generated_ids.size(1) > 0 else None for state in active_states]
-                logits = alignment_controller.step(
-                    logits,
-                    active_states=[state.alignment_state for state in active_states],
-                    next_tokens=last_tokens,
-                )
+        row_logits = RepetitionPenaltyLogitsProcessor(
+            penalty=float(request.repetition_penalty)
+        )(ids_for_proc, row_logits)
 
-            next_round_states = []
-            next_inputs = []
+        if request.temperature != 1.0:
+            row_logits = row_logits / request.temperature
 
-            for row_index, state in enumerate(active_states):
-                if state.finished:
-                    continue
+        row_logits = MinPLogitsWarper(min_p=request.min_p)(ids_for_proc, row_logits)
+        row_logits = TopPLogitsWarper(top_p=request.top_p)(ids_for_proc, row_logits)
 
-                request = state.request
-                ids_for_proc = state.generated_ids
-                row_logits = logits[row_index : row_index + 1]
+        probs = torch.softmax(row_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        state.predicted_tokens.append(next_token)
+        state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
 
-                row_logits = RepetitionPenaltyLogitsProcessor(
-                    penalty=float(request.repetition_penalty)
-                )(ids_for_proc, row_logits)
+        stop_on_eos = torch.all(next_token.view(-1) == t3.hp.stop_speech_token)
+        hit_limit = len(state.predicted_tokens) >= request.max_new_tokens
+        if stop_on_eos or hit_limit:
+            if stop_on_eos:
+                logger.info("✅ EOS token detected for %s", request.session_id)
+            finished_results.append((request.session_id, _finalize_prediction(t3, state)))
+            continue
 
-                if request.temperature != 1.0:
-                    row_logits = row_logits / request.temperature
+        next_token_embed = t3.speech_emb(next_token)
+        next_token_embed = next_token_embed + t3.speech_pos_emb.get_fixed_embedding(state.decode_step + 1)
+        state.next_inputs_embeds = torch.cat([next_token_embed, next_token_embed], dim=0)
+        state.decode_step += 1
+        next_round_states.append(state)
 
-                row_logits = MinPLogitsWarper(min_p=request.min_p)(ids_for_proc, row_logits)
-                row_logits = TopPLogitsWarper(top_p=request.top_p)(ids_for_proc, row_logits)
-
-                probs = torch.softmax(row_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                state.predicted_tokens.append(next_token)
-                state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
-
-                stop_on_eos = torch.all(next_token.view(-1) == t3.hp.stop_speech_token)
-                hit_limit = len(state.predicted_tokens) >= request.max_new_tokens
-                if stop_on_eos or hit_limit:
-                    state.finished = True
-                    if stop_on_eos:
-                        logger.info("✅ EOS token detected for %s", request.session_id)
-                    continue
-
-                next_token_embed = t3.speech_emb(next_token)
-                next_token_embed = next_token_embed + t3.speech_pos_emb.get_fixed_embedding(state.decode_step + 1)
-                state.next_inputs_embeds = torch.cat([next_token_embed, next_token_embed], dim=0)
-                state.decode_step += 1
-                next_round_states.append(state)
-                next_inputs.append(state.next_inputs_embeds)
-
-            if not next_round_states:
-                break
-
-            batched_past = _cat_past_key_values([state.past_key_values for state in next_round_states])
-            output = patched_model(
-                inputs_embeds=torch.cat(next_inputs, dim=0),
-                past_key_values=batched_past,
-                output_attentions=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            past_splits = _split_past_key_values(output.past_key_values, [2] * len(next_round_states))
-            for state, state_past in zip(next_round_states, past_splits):
-                state.past_key_values = state_past
-            active_states = next_round_states
-
-        request_to_state = {state.request.session_id: state for state in all_states}
-        results: list[Tensor] = []
-        for request in requests:
-            state = request_to_state[request.session_id]
-            if state.predicted_tokens:
-                predicted_tokens = torch.cat(state.predicted_tokens, dim=1)
-            else:
-                predicted_tokens = torch.empty((1, 0), dtype=torch.long, device=t3.device)
-            if os.getenv("CHATTERBOX_TRACE_SHAPES"):
-                shape_logger.info("[models/t3/inference/scheduled_decode.py] inference.output")
-                shape_logger.info("  session_id %s", request.session_id)
-                shape_logger.info(
-                    "  predicted_tokens %s %s %s",
-                    tuple(predicted_tokens.shape),
-                    predicted_tokens.dtype,
-                    predicted_tokens.device,
-                )
-            results.append(predicted_tokens)
-        return results
-
-    finally:
-        if alignment_controller is not None:
-            alignment_controller.close()
+    cohort.active_states = next_round_states
+    return finished_results, not cohort.active_states
