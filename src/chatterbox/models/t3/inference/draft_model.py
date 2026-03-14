@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
+import torch
 from torch import nn
 
 from ..t3 import T3
@@ -13,6 +14,30 @@ class DraftModelMetadata:
     total_layers: int
     layer_selection: str
     layer_indices: tuple[int, ...]
+
+
+def _assert_model_device_consistency(model: T3, device) -> None:
+    expected_device = torch.device(device)
+    mismatches: list[str] = []
+
+    for name, tensor in model.named_parameters():
+        if tensor.device != expected_device:
+            mismatches.append(f"param:{name}={tensor.device}")
+            if len(mismatches) >= 8:
+                break
+
+    if len(mismatches) < 8:
+        for name, tensor in model.named_buffers():
+            if tensor.device != expected_device:
+                mismatches.append(f"buffer:{name}={tensor.device}")
+                if len(mismatches) >= 8:
+                    break
+
+    if mismatches:
+        raise RuntimeError(
+            "draft model has tensors on the wrong device; "
+            f"expected {expected_device}, found {mismatches}"
+        )
 
 
 def select_layer_indices(total_layers: int, num_layers: int, selection: str) -> list[int]:
@@ -70,12 +95,16 @@ def build_layer_subset_draft_model(
         draft.tfmr.embed_tokens = base_t3.tfmr.embed_tokens
     if hasattr(base_t3.tfmr, "norm") and hasattr(draft.tfmr, "norm"):
         draft.tfmr.norm = base_t3.tfmr.norm
+    if hasattr(base_t3.tfmr, "rotary_emb") and hasattr(draft.tfmr, "rotary_emb"):
+        draft.tfmr.rotary_emb = base_t3.tfmr.rotary_emb
 
     draft.tfmr.layers = nn.ModuleList([base_t3.tfmr.layers[index] for index in layer_indices])
     draft.tfmr.config.num_hidden_layers = len(layer_indices)
     draft.cfg = draft.tfmr.config
     draft.dim = draft.cfg.hidden_size
+    draft.to(base_t3.device)
     draft.eval()
+    _assert_model_device_consistency(draft, base_t3.device)
 
     metadata = DraftModelMetadata(
         mode="layer_subset",
