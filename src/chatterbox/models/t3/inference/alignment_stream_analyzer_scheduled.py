@@ -17,7 +17,11 @@ LLAMA_ALIGNED_HEADS = [(12, 15), (13, 11), (9, 2)]
 class ScheduledAlignmentState:
     text_tokens_slice: tuple[int, int]
     eos_idx: int
-    alignment: torch.Tensor
+    text_len: int
+    recent_rows: torch.Tensor
+    early_text_max: torch.Tensor
+    post_complete_tail_mass: torch.Tensor
+    post_complete_prev_text_max_sum: torch.Tensor
     curr_frame_pos: int = 0
     text_position: int = 0
     started: bool = False
@@ -27,47 +31,83 @@ class ScheduledAlignmentState:
     generated_tokens: list[int] = field(default_factory=list)
 
     @classmethod
-    def create(cls, *, text_tokens_slice: tuple[int, int], eos_idx: int):
+    def create(
+        cls,
+        *,
+        text_tokens_slice: tuple[int, int],
+        eos_idx: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ):
         i, j = text_tokens_slice
+        text_len = j - i
+        tail_width = min(3, text_len)
         return cls(
             text_tokens_slice=text_tokens_slice,
             eos_idx=eos_idx,
-            alignment=torch.zeros(0, j - i),
+            text_len=text_len,
+            recent_rows=torch.zeros((0, text_len), device=device, dtype=dtype),
+            early_text_max=torch.zeros((), device=device, dtype=dtype),
+            post_complete_tail_mass=torch.zeros((tail_width,), device=device, dtype=dtype),
+            post_complete_prev_text_max_sum=torch.zeros((), device=device, dtype=dtype),
         )
 
     def step(self, logits: torch.Tensor, aligned_attn: torch.Tensor, next_token=None) -> torch.Tensor:
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
-            attn_chunk = aligned_attn[j:, i:j].clone().cpu()
+            attn_chunk = aligned_attn[j:, i:j]
         else:
-            attn_chunk = aligned_attn[:, i:j].clone().cpu()
+            attn_chunk = aligned_attn[:, i:j]
 
+        attn_chunk = attn_chunk.to(dtype=self.recent_rows.dtype).clone()
         attn_chunk[:, self.curr_frame_pos + 1 :] = 0
 
-        self.alignment = torch.cat((self.alignment, attn_chunk), dim=0)
+        attn_row = attn_chunk[-1].clone()
+        if self.recent_rows.size(0) == 0:
+            self.recent_rows = attn_row.unsqueeze(0)
+        elif self.recent_rows.size(0) == 1:
+            self.recent_rows = torch.cat((self.recent_rows, attn_row.unsqueeze(0)), dim=0)
+        else:
+            self.recent_rows = torch.stack((self.recent_rows[-1], attn_row), dim=0)
 
-        alignment = self.alignment
-        _, text_len = alignment.shape
+        if self.text_len > 0:
+            first_cols = attn_chunk[:, : min(4, self.text_len)]
+            if first_cols.numel() > 0:
+                self.early_text_max = torch.maximum(self.early_text_max, first_cols.max())
 
-        cur_text_posn = attn_chunk[-1].argmax()
+        was_complete = self.complete
+        if was_complete:
+            tail_width = self.post_complete_tail_mass.numel()
+            if tail_width > 0:
+                self.post_complete_tail_mass = self.post_complete_tail_mass + attn_chunk[:, -tail_width:].sum(dim=0)
+            if self.text_len > 5:
+                self.post_complete_prev_text_max_sum = (
+                    self.post_complete_prev_text_max_sum + attn_chunk[:, :-5].max(dim=1).values.sum()
+                )
+
+        cur_text_posn = int(attn_row.argmax().item())
         discontinuity = not (-4 < cur_text_posn - self.text_position < 7)
         if not discontinuity:
             self.text_position = cur_text_posn
 
-        false_start = (not self.started) and (
-            alignment[-2:, -2:].max() > 0.1 or alignment[:, :4].max() < 0.5
-        )
+        late_activation = False
+        if self.text_len > 0 and self.recent_rows.numel() > 0:
+            late_activation = bool((self.recent_rows[:, -min(2, self.text_len) :].max() > 0.1).item())
+        early_signal_missing = bool((self.early_text_max < 0.5).item())
+        false_start = (not self.started) and (late_activation or early_signal_missing)
         self.started = not false_start
         if self.started and self.started_at is None:
-            self.started_at = alignment.size(0)
+            self.started_at = self.curr_frame_pos + 1
 
-        self.complete = self.complete or self.text_position >= text_len - 3
+        self.complete = self.complete or self.text_position >= self.text_len - 3
         if self.complete and self.completed_at is None:
-            self.completed_at = alignment.size(0)
+            self.completed_at = self.curr_frame_pos + 1
 
-        long_tail = self.complete and (alignment[self.completed_at :, -3:].sum(dim=0).max() >= 5)
-        alignment_repetition = self.complete and (
-            alignment[self.completed_at :, :-5].max(dim=1).values.sum() > 5
+        long_tail = self.complete and bool(
+            self.post_complete_tail_mass.numel() > 0 and (self.post_complete_tail_mass.max() >= 5).item()
+        )
+        alignment_repetition = self.complete and bool(
+            self.text_len > 5 and (self.post_complete_prev_text_max_sum > 5).item()
         )
 
         if next_token is not None:
@@ -80,7 +120,7 @@ class ScheduledAlignmentState:
         if token_repetition:
             logger.warning("🚨 Detected 2x repetition of token %s", self.generated_tokens[-1])
 
-        if cur_text_posn < text_len - 3 and text_len > 5:
+        if cur_text_posn < self.text_len - 3 and self.text_len > 5:
             logits[..., self.eos_idx] = -(2**15)
 
         if long_tail or alignment_repetition or token_repetition:
@@ -118,7 +158,7 @@ class ScheduledAlignmentController:
     def _add_attention_spy(self, buffer_idx, layer_idx, head_idx):
         def attention_forward_hook(module, inputs, output):
             if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                step_attention = output[1].cpu()
+                step_attention = output[1].detach()
                 self.last_aligned_attns[buffer_idx] = step_attention[0::2, head_idx]
 
         target_layer = self.tfmr.layers[layer_idx].self_attn

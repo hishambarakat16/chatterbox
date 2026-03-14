@@ -122,6 +122,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
         alignment_state = ScheduledAlignmentState.create(
             text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
             eos_idx=t3.hp.stop_speech_token,
+            device=embeds.device,
         )
 
     return (
