@@ -7,9 +7,12 @@ from pathlib import Path
 
 
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+LATIN_RE = re.compile(r"[A-Za-z]")
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[\.\!\?؟؛…])\s+|[\r\n]+")
 CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[،,:;؛])\s+")
 PLACEHOLDER_RE = re.compile(r"\(…\)|\(\.\.\.\)|\[…\]|\[\.\.\.\]|…|\.\.\.")
+NOISY_SYMBOL_RE = re.compile(r"[@#*_+=<>{}\[\]\\|/~`]")
+FORMATTED_FRAGMENT_RE = re.compile(r"[0-9٠-٩]+[:/-][0-9٠-٩]+|[:/-][0-9٠-٩]+|[0-9٠-٩]+[:/-]")
 
 
 def normalize_text(text: str) -> str:
@@ -18,12 +21,27 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def looks_usable(text: str, min_chars: int, max_chars: int, min_arabic_chars: int) -> bool:
+def looks_usable(
+    text: str,
+    min_chars: int,
+    max_chars: int,
+    min_arabic_chars: int,
+    *,
+    reject_latin: bool,
+    reject_formatted_fragments: bool,
+    reject_noisy_symbols: bool,
+) -> bool:
     if not text:
         return False
     if "$$$" in text:
         return False
     if PLACEHOLDER_RE.search(text):
+        return False
+    if reject_latin and LATIN_RE.search(text):
+        return False
+    if reject_formatted_fragments and FORMATTED_FRAGMENT_RE.search(text):
+        return False
+    if reject_noisy_symbols and NOISY_SYMBOL_RE.search(text):
         return False
     if len(text) < min_chars or len(text) > max_chars:
         return False
@@ -102,6 +120,21 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=180)
     parser.add_argument("--min-arabic-chars", type=int, default=4)
     parser.add_argument(
+        "--reject-latin",
+        action="store_true",
+        help="Drop rows containing Latin letters.",
+    )
+    parser.add_argument(
+        "--reject-formatted-fragments",
+        action="store_true",
+        help="Drop rows containing time/date/code-like fragments such as 3:45 or 2025-01.",
+    )
+    parser.add_argument(
+        "--reject-noisy-symbols",
+        action="store_true",
+        help="Drop rows containing noisy formatting symbols such as @ # [ ] { } _ = + |.",
+    )
+    parser.add_argument(
         "--split-sentences",
         action="store_true",
         help="Split long multi-sentence rows into shorter sentence/clause-sized samples.",
@@ -127,7 +160,15 @@ def main() -> None:
             split_sentences=args.split_sentences,
         )
         for segment_index, normalized in enumerate(segments):
-            if not looks_usable(normalized, args.min_chars, args.max_chars, args.min_arabic_chars):
+            if not looks_usable(
+                normalized,
+                args.min_chars,
+                args.max_chars,
+                args.min_arabic_chars,
+                reject_latin=args.reject_latin,
+                reject_formatted_fragments=args.reject_formatted_fragments,
+                reject_noisy_symbols=args.reject_noisy_symbols,
+            ):
                 continue
             if normalized in seen:
                 continue
