@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import logging
 
 import numpy as np
@@ -31,6 +32,8 @@ from .transformer.upsample_encoder import UpsampleConformerEncoder
 from .flow_matching import CausalConditionalCFM
 from .decoder import ConditionalDecoder
 from .configs import CFM_PARAMS
+
+shape_logger = logging.getLogger("chatterbox.shape")
 
 
 def drop_invalid_tokens(x):
@@ -162,13 +165,22 @@ class S3Token2Mel(torch.nn.Module):
             ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
             ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
 
-        return dict(
+        ref_dict = dict(
             prompt_token=ref_speech_tokens.to(device),
             prompt_token_len=ref_speech_token_lens,
             prompt_feat=ref_mels_24,
             prompt_feat_len=ref_mels_24_len,
             embedding=ref_x_vector,
         )
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/s3gen/s3gen.py] embed_ref")
+            shape_logger.info("  prompt_token %s %s %s", tuple(ref_dict["prompt_token"].shape), ref_dict["prompt_token"].dtype, ref_dict["prompt_token"].device)
+            shape_logger.info("  prompt_token_len %s %s %s", tuple(ref_dict["prompt_token_len"].shape), ref_dict["prompt_token_len"].dtype, ref_dict["prompt_token_len"].device)
+            shape_logger.info("  prompt_feat %s %s %s", tuple(ref_dict["prompt_feat"].shape), ref_dict["prompt_feat"].dtype, ref_dict["prompt_feat"].device)
+            if ref_dict["prompt_feat_len"] is not None:
+                shape_logger.info("  prompt_feat_len %s %s %s", tuple(ref_dict["prompt_feat_len"].shape), ref_dict["prompt_feat_len"].dtype, ref_dict["prompt_feat_len"].device)
+            shape_logger.info("  embedding %s %s %s", tuple(ref_dict["embedding"].shape), ref_dict["embedding"].dtype, ref_dict["embedding"].device)
+        return ref_dict
 
     def forward(
         self,
@@ -217,6 +229,15 @@ class S3Token2Mel(torch.nn.Module):
         if speech_token_lens is None:
             speech_token_lens = torch.LongTensor([st.size(-1) for st in speech_tokens]).to(self.device)
 
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/s3gen/s3gen.py] token2mel.input")
+            shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
+            shape_logger.info("  speech_token_lens %s %s %s", tuple(speech_token_lens.shape), speech_token_lens.dtype, speech_token_lens.device)
+            shape_logger.info("  finalize %s", finalize)
+            shape_logger.info("  n_cfm_timesteps %s", n_cfm_timesteps)
+            shape_logger.info("  ref.prompt_token %s %s %s", tuple(ref_dict["prompt_token"].shape), ref_dict["prompt_token"].dtype, ref_dict["prompt_token"].device)
+            shape_logger.info("  ref.prompt_feat %s %s %s", tuple(ref_dict["prompt_feat"].shape), ref_dict["prompt_feat"].dtype, ref_dict["prompt_feat"].device)
+            shape_logger.info("  ref.embedding %s %s %s", tuple(ref_dict["embedding"].shape), ref_dict["embedding"].dtype, ref_dict["embedding"].device)
         output_mels, _ = self.flow.inference(
             token=speech_tokens,
             token_len=speech_token_lens,
@@ -226,6 +247,9 @@ class S3Token2Mel(torch.nn.Module):
             meanflow=self.meanflow,
             **ref_dict,
         )
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/s3gen/s3gen.py] token2mel.output")
+            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
         return output_mels
 
 
@@ -359,4 +383,8 @@ class S3Token2Wav(S3Token2Mel):
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/s3gen/s3gen.py] inference.output")
+            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
+            shape_logger.info("  output_wavs %s %s %s", tuple(output_wavs.shape), output_wavs.dtype, output_wavs.device)
         return output_wavs, output_sources

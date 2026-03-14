@@ -1,10 +1,10 @@
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 import os
 
 import librosa
 import torch
-import perth
 import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
 from huggingface_hub import snapshot_download
@@ -16,9 +16,11 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+from .watermarking import create_watermarker
 
 
 REPO_ID = "ResembleAI/chatterbox"
+shape_logger = logging.getLogger("chatterbox.shape")
 
 # Supported languages for the multilingual model
 SUPPORTED_LANGUAGES = {
@@ -152,7 +154,7 @@ class ChatterboxMultilingualTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = create_watermarker()
 
     @classmethod
     def get_supported_languages(cls):
@@ -245,6 +247,22 @@ class ChatterboxMultilingualTTS:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        # Debug-only shape prints for state tracing; remove later if no longer needed.
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[mtl_tts.py] prepare_conditionals")
+            shape_logger.info("  wav_fpath %s", wav_fpath)
+            shape_logger.info("  speaker_emb %s %s %s", tuple(t3_cond.speaker_emb.shape), t3_cond.speaker_emb.dtype, t3_cond.speaker_emb.device)
+            if t3_cond.cond_prompt_speech_tokens is not None:
+                shape_logger.info(
+                    "  cond_prompt_speech_tokens %s %s %s",
+                    tuple(t3_cond.cond_prompt_speech_tokens.shape),
+                    t3_cond.cond_prompt_speech_tokens.dtype,
+                    t3_cond.cond_prompt_speech_tokens.device,
+                )
+            shape_logger.info("  emotion_adv %s %s %s", tuple(t3_cond.emotion_adv.shape), t3_cond.emotion_adv.dtype, t3_cond.emotion_adv.device)
+            shape_logger.info("  s3_ref.prompt_token %s %s %s", tuple(s3gen_ref_dict["prompt_token"].shape), s3gen_ref_dict["prompt_token"].dtype, s3gen_ref_dict["prompt_token"].device)
+            shape_logger.info("  s3_ref.prompt_feat %s %s %s", tuple(s3gen_ref_dict["prompt_feat"].shape), s3gen_ref_dict["prompt_feat"].dtype, s3gen_ref_dict["prompt_feat"].device)
+            shape_logger.info("  s3_ref.embedding %s %s %s", tuple(s3gen_ref_dict["embedding"].shape), s3gen_ref_dict["embedding"].dtype, s3gen_ref_dict["embedding"].device)
 
     def generate(
         self,
@@ -258,6 +276,11 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[mtl_tts.py] generate.input")
+            shape_logger.info("  text %r", text)
+            shape_logger.info("  language_id %s", language_id)
+            shape_logger.info("  audio_prompt_path %s", audio_prompt_path)
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
@@ -289,6 +312,9 @@ class ChatterboxMultilingualTTS:
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[mtl_tts.py] generate.text_tokens")
+            shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
@@ -303,10 +329,16 @@ class ChatterboxMultilingualTTS:
             )
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
+            if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+                shape_logger.info("[mtl_tts.py] generate.speech_tokens.raw")
+                shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
             # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
+            if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+                shape_logger.info("[mtl_tts.py] generate.speech_tokens.filtered")
+                shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
@@ -314,4 +346,7 @@ class ChatterboxMultilingualTTS:
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[mtl_tts.py] generate.output")
+            shape_logger.info("  wav %s %s", watermarked_wav.shape, watermarked_wav.dtype)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)

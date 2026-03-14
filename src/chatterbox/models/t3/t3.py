@@ -1,9 +1,11 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
+import os
 from typing import Union, Optional, List
 
 logger = logging.getLogger(__name__)
+shape_logger = logging.getLogger("chatterbox.shape")
 
 from tqdm import tqdm
 import torch
@@ -128,6 +130,13 @@ class T3(nn.Module):
             torch.cat((ce, te, se))
             for ce, te, se in zip(cond_emb, text_emb, speech_emb)
         ])  # (B, length, dim)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/t3.py] prepare_input_embeds")
+            shape_logger.info("  cond_emb %s %s %s", tuple(cond_emb.shape), cond_emb.dtype, cond_emb.device)
+            shape_logger.info("  text_emb %s %s %s", tuple(text_emb.shape), text_emb.dtype, text_emb.device)
+            shape_logger.info("  speech_emb %s %s %s", tuple(speech_emb.shape), speech_emb.dtype, speech_emb.device)
+            shape_logger.info("  embeds %s %s %s", tuple(embeds.shape), embeds.dtype, embeds.device)
+            shape_logger.info("  len_cond %s", len_cond)
         return embeds, len_cond
 
     def forward(
@@ -266,6 +275,12 @@ class T3(nn.Module):
             speech_tokens=initial_speech_tokens,
             cfg_weight=cfg_weight,
         )
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/t3.py] inference.input")
+            shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
+            shape_logger.info("  initial_speech_tokens %s %s %s", tuple(initial_speech_tokens.shape), initial_speech_tokens.dtype, initial_speech_tokens.device)
+            shape_logger.info("  embeds %s %s %s", tuple(embeds.shape), embeds.dtype, embeds.device)
+            shape_logger.info("  len_cond %s", len_cond)
 
         # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
         # Note the llama-specific logic. Other tfmr types can be added later.
@@ -296,6 +311,10 @@ class T3(nn.Module):
             )
             self.patched_model = patched_model
             self.compiled = True
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/t3.py] inference.runtime_state")
+            shape_logger.info("  compiled %s", self.compiled)
+            shape_logger.info("  has_alignment_stream_analyzer %s", self.patched_model.alignment_stream_analyzer is not None)
 
         # # Run normal generate method, which calls our custom extended methods
         # return self.patched_model.generate(
@@ -409,6 +428,9 @@ class T3(nn.Module):
 
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/t3.py] inference.output")
+            shape_logger.info("  predicted_tokens %s %s %s", tuple(predicted_tokens.shape), predicted_tokens.dtype, predicted_tokens.device)
         return predicted_tokens
 
     @torch.inference_mode()
