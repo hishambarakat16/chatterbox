@@ -93,6 +93,32 @@ def _split_past_key_values(past_key_values, chunk_sizes: list[int]):
     return [tuple(layer_list) for layer_list in split]
 
 
+def _log_backend_output_shapes(tag: str, output):
+    if not os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        return
+
+    shape_logger.info("[models/t3/inference/scheduled_decode.py] %s", tag)
+    shape_logger.info(
+        "  logits %s %s %s",
+        tuple(output.logits.shape),
+        output.logits.dtype,
+        output.logits.device,
+    )
+    first_layer = output.past_key_values[0]
+    shape_logger.info(
+        "  past_key_values[0][0] %s %s %s",
+        tuple(first_layer[0].shape),
+        first_layer[0].dtype,
+        first_layer[0].device,
+    )
+    shape_logger.info(
+        "  past_key_values[0][1] %s %s %s",
+        tuple(first_layer[1].shape),
+        first_layer[1].dtype,
+        first_layer[1].device,
+    )
+
+
 def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDecodeState, Tensor]:
     _ensure_bot_eot(request.text_tokens, t3.hp)
     text_tokens = torch.atleast_2d(request.text_tokens).to(dtype=torch.long, device=t3.device)
@@ -113,9 +139,25 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
 
     device = embeds.device
     bos_token = torch.tensor([[t3.hp.start_speech_token]], dtype=torch.long, device=device)
+    bos_pos_embed = t3.speech_pos_emb.get_fixed_embedding(0)
     bos_embed = t3.speech_emb(bos_token)
-    bos_embed = bos_embed + t3.speech_pos_emb.get_fixed_embedding(0)
+    bos_embed = bos_embed + bos_pos_embed
     bos_embed = torch.cat([bos_embed, bos_embed], dim=0)
+    if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        shape_logger.info("[models/t3/inference/scheduled_decode.py] prefill.bos")
+        shape_logger.info("  session_id %s", request.session_id)
+        shape_logger.info(
+            "  bos_pos_embed %s %s %s",
+            tuple(bos_pos_embed.shape),
+            bos_pos_embed.dtype,
+            bos_pos_embed.device,
+        )
+        shape_logger.info(
+            "  bos_embed %s %s %s",
+            tuple(bos_embed.shape),
+            bos_embed.dtype,
+            bos_embed.device,
+        )
 
     alignment_state = None
     if t3.hp.is_multilingual:
@@ -214,11 +256,13 @@ def advance_scheduled_cohort(
             output_hidden_states=True,
             return_dict=True,
         )
+        _log_backend_output_shapes("prefill.output", output)
         past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
         for state, state_past in zip(cohort.active_states, past_splits):
             state.past_key_values = state_past
         cohort.prefill_inputs = None
     else:
+        is_first_cached_step = all(state.decode_step == 0 for state in cohort.active_states)
         next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
         batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
         batched_inputs = torch.cat(next_inputs, dim=0)
@@ -234,6 +278,8 @@ def advance_scheduled_cohort(
             output_hidden_states=True,
             return_dict=True,
         )
+        if is_first_cached_step:
+            _log_backend_output_shapes("decode.output.first_cached_step", output)
         past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
         for state, state_past in zip(cohort.active_states, past_splits):
             state.past_key_values = state_past
@@ -293,7 +339,24 @@ def advance_scheduled_cohort(
             continue
 
         next_token_embed = t3.speech_emb(next_token)
-        next_token_embed = next_token_embed + t3.speech_pos_emb.get_fixed_embedding(state.decode_step + 1)
+        next_token_pos_embed = t3.speech_pos_emb.get_fixed_embedding(state.decode_step + 1)
+        if os.getenv("CHATTERBOX_TRACE_SHAPES") and state.decode_step == 0:
+            shape_logger.info("[models/t3/inference/scheduled_decode.py] decode.next_token_embed")
+            shape_logger.info("  session_id %s", request.session_id)
+            shape_logger.info("  decode_step %s", state.decode_step)
+            shape_logger.info(
+                "  next_token_pos_embed %s %s %s",
+                tuple(next_token_pos_embed.shape),
+                next_token_pos_embed.dtype,
+                next_token_pos_embed.device,
+            )
+            shape_logger.info(
+                "  next_token_embed_base %s %s %s",
+                tuple(next_token_embed.shape),
+                next_token_embed.dtype,
+                next_token_embed.device,
+            )
+        next_token_embed = next_token_embed + next_token_pos_embed
         state.next_inputs_embeds = torch.cat([next_token_embed, next_token_embed], dim=0)
         state.decode_step += 1
         next_round_states.append(state)
