@@ -279,6 +279,13 @@ class T3MedusaHeadModel(nn.Module):
     def trainable_parameters(self) -> Iterable[nn.Parameter]:
         return self.medusa_heads.parameters()
 
+    def forward_medusa_heads(self, hidden_states: Tensor) -> Tensor:
+        logits = []
+        for head in self.medusa_heads:
+            medusa_hidden = head(hidden_states)
+            logits.append(self.t3.speech_head(medusa_hidden))
+        return torch.stack(logits, dim=0)
+
     def forward(
         self,
         *,
@@ -323,11 +330,7 @@ class T3MedusaHeadModel(nn.Module):
             speech_hidden = hidden_states[:, speech_start : speech_start + speech_tokens.size(1)]
             base_logits = self.t3.speech_head(speech_hidden)
 
-        medusa_logits = []
-        for head in self.medusa_heads:
-            medusa_hidden = head(speech_hidden)
-            medusa_logits.append(self.t3.speech_head(medusa_hidden))
-        medusa_logits = torch.stack(medusa_logits, dim=0)
+        medusa_logits = self.forward_medusa_heads(speech_hidden)
 
         if trace_shapes:
             print("[t3_medusa.train] batch")
@@ -443,6 +446,26 @@ def create_t3_medusa_model(
         freeze_base=freeze_base,
     )
     model.to(device)
+    return model
+
+
+def load_medusa_heads_from_checkpoint(
+    *,
+    base_t3: T3,
+    checkpoint_dir: str | Path,
+    freeze_base: bool = True,
+) -> T3MedusaHeadModel:
+    checkpoint_dir = Path(checkpoint_dir)
+    config = json.loads((checkpoint_dir / "t3_medusa_config.json").read_text(encoding="utf-8"))
+    model = T3MedusaHeadModel(
+        base_t3,
+        medusa_num_heads=int(config["medusa_num_heads"]),
+        medusa_num_layers=int(config["medusa_num_layers"]),
+        freeze_base=freeze_base,
+    )
+    state = load_safetensors(checkpoint_dir / "t3_medusa_heads.safetensors")
+    model.medusa_heads.load_state_dict(state, strict=True)
+    model.to(base_t3.device).eval()
     return model
 
 

@@ -15,9 +15,11 @@ from chatterbox.models.t3.inference.draft_model import build_layer_subset_draft_
 from chatterbox.models.t3.inference.scheduled_decode import ScheduledDecodeRequest
 from chatterbox.models.t3.inference.speculative_decode import (
     run_baseline_greedy_decode,
+    run_medusa_speculative_decode,
     run_self_speculative_decode,
     run_speculative_decode_with_draft,
 )
+from chatterbox.models.t3.train import load_medusa_heads_from_checkpoint
 from chatterbox.runtime.session import clone_conditionals
 
 
@@ -184,12 +186,26 @@ def run_timed_baseline(device: str, t3, request: ScheduledDecodeRequest):
     return tokens, elapsed, memory_stats
 
 
-def run_timed_speculative(device: str, target_t3, draft_t3, request: ScheduledDecodeRequest, speculate_k: int):
+def run_timed_speculative(
+    device: str,
+    target_t3,
+    draft_t3,
+    medusa_model,
+    request: ScheduledDecodeRequest,
+    speculate_k: int,
+):
     maybe_sync(device)
     memory_stats = capture_cuda_memory_stats(device)
     reset_cuda_peak_stats(device)
     started = time.perf_counter()
-    if draft_t3 is target_t3:
+    if medusa_model is not None:
+        result = run_medusa_speculative_decode(
+            target_t3,
+            medusa_model,
+            request,
+            speculate_k=speculate_k,
+        )
+    elif draft_t3 is target_t3:
         result = run_self_speculative_decode(
             target_t3,
             request,
@@ -219,9 +235,10 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--speculate-k", type=int, default=4)
-    parser.add_argument("--draft-mode", choices=["self", "layer_subset"], default="self")
+    parser.add_argument("--draft-mode", choices=["self", "layer_subset", "medusa"], default="self")
     parser.add_argument("--draft-layers", type=int, default=12)
     parser.add_argument("--draft-layer-selection", choices=["even", "first", "last"], default="even")
+    parser.add_argument("--medusa-checkpoint-dir")
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--trace-shapes", action="store_true")
@@ -245,12 +262,30 @@ def main():
     )
     draft_t3 = model.worker.t3
     draft_metadata = None
+    medusa_model = None
     if args.draft_mode == "layer_subset":
         draft_t3, draft_metadata = build_layer_subset_draft_model(
             model.worker.t3,
             num_layers=args.draft_layers,
             layer_selection=args.draft_layer_selection,
         )
+    elif args.draft_mode == "medusa":
+        if not args.medusa_checkpoint_dir:
+            raise ValueError("--medusa-checkpoint-dir is required when --draft-mode medusa")
+        medusa_model = load_medusa_heads_from_checkpoint(
+            base_t3=model.worker.t3,
+            checkpoint_dir=args.medusa_checkpoint_dir,
+            freeze_base=True,
+        )
+        draft_metadata = {
+            "medusa_num_heads": medusa_model.medusa_num_heads,
+            "medusa_num_layers": medusa_model.medusa_num_layers,
+            "medusa_checkpoint_dir": args.medusa_checkpoint_dir,
+        }
+
+    proposal_cap = args.speculate_k
+    if medusa_model is not None:
+        proposal_cap = min(args.speculate_k, medusa_model.medusa_num_heads + 1)
 
     total_runs = args.warmup_runs + args.runs
     orders = ["baseline_first" if run_index % 2 == 0 else "speculative_first" for run_index in range(total_runs)]
@@ -273,7 +308,7 @@ def main():
     speculative_full_accept_rounds: list[int] = []
     speculative_zero_accept_rounds: list[int] = []
     speculative_partial_accept_rounds: list[int] = []
-    speculative_match_len_hist_total = [0] * (args.speculate_k + 1)
+    speculative_match_len_hist_total = [0] * (proposal_cap + 1)
     exact_match_all_runs = True
     last_mismatch_index = None
     baseline_tokens = None
@@ -292,6 +327,7 @@ def main():
                 args.device,
                 model.worker.t3,
                 draft_t3,
+                medusa_model,
                 request,
                 args.speculate_k,
             )
@@ -300,6 +336,7 @@ def main():
                 args.device,
                 model.worker.t3,
                 draft_t3,
+                medusa_model,
                 request,
                 args.speculate_k,
             )
@@ -360,7 +397,12 @@ def main():
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         baseline_path = output_dir / "baseline_greedy.wav"
-        speculative_path = output_dir / "speculative_self_draft.wav"
+        if args.draft_mode == "self":
+            speculative_path = output_dir / "speculative_self_draft.wav"
+        elif args.draft_mode == "layer_subset":
+            speculative_path = output_dir / "speculative_layer_subset.wav"
+        else:
+            speculative_path = output_dir / "speculative_medusa.wav"
         baseline_token_count, baseline_samples = render_tokens(model.worker, session, baseline_tokens, baseline_path)
         speculative_token_count, speculative_samples = render_tokens(model.worker, session, speculative_tokens, speculative_path)
         saved_wavs = [str(baseline_path), str(speculative_path)]
@@ -372,14 +414,24 @@ def main():
         }
 
     print("benchmark=t3_speculative_prototype")
-    mode = "self_draft_greedy_cfg_on_alignment_off" if args.draft_mode == "self" else "layer_subset_draft_greedy_cfg_on_alignment_off"
+    if args.draft_mode == "self":
+        mode = "self_draft_greedy_cfg_on_alignment_off"
+    elif args.draft_mode == "layer_subset":
+        mode = "layer_subset_draft_greedy_cfg_on_alignment_off"
+    else:
+        mode = "medusa_draft_greedy_cfg_on_alignment_off"
     print(f"mode={mode}")
     print(f"device={args.device}")
     print(f"load_s={load_s:.4f}")
     print(f"speculate_k={args.speculate_k}")
+    print(f"proposal_cap={proposal_cap}")
     print(f"max_new_tokens={args.max_new_tokens}")
     print(f"draft_mode={args.draft_mode}")
-    if draft_metadata is not None:
+    if isinstance(draft_metadata, dict):
+        print(f"medusa_num_heads={draft_metadata['medusa_num_heads']}")
+        print(f"medusa_num_layers={draft_metadata['medusa_num_layers']}")
+        print(f"medusa_checkpoint_dir={draft_metadata['medusa_checkpoint_dir']}")
+    elif draft_metadata is not None:
         print(f"draft_layers={draft_metadata.num_layers}")
         print(f"draft_total_layers={draft_metadata.total_layers}")
         print(f"draft_layer_selection={draft_metadata.layer_selection}")

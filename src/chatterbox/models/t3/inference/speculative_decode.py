@@ -61,8 +61,9 @@ def _forward_raw_t3(
         output_hidden_states=False,
         return_dict=True,
     )
-    logits = t3.speech_head(tfmr_out.last_hidden_state)
-    return logits, tfmr_out.past_key_values
+    hidden_states = tfmr_out.last_hidden_state
+    logits = t3.speech_head(hidden_states)
+    return logits, tfmr_out.past_key_values, hidden_states
 
 
 def _build_pos_embed_block(t3, *, start_pos: int, num_tokens: int, device) -> Tensor:
@@ -104,6 +105,7 @@ class _PrototypeState:
     generated_ids: Tensor
     past_key_values: object
     next_logits: Tensor
+    next_hidden: Tensor
     decode_step: int = 0
 
 
@@ -114,6 +116,7 @@ class VerifyResult:
     proposed_tokens: int
     correction_token: Tensor | None
     next_logits: Tensor
+    next_hidden: Tensor
     next_past_key_values: object
 
 
@@ -147,12 +150,13 @@ def prefill_prototype_state(t3, request: ScheduledDecodeRequest) -> _PrototypeSt
     inputs_embeds = torch.cat(cohort.prefill_inputs, dim=0)
     assert inputs_embeds.size(0) == 2, tuple(inputs_embeds.shape)
 
-    raw_logits, past_key_values = _forward_raw_t3(
+    raw_logits, past_key_values, hidden_states = _forward_raw_t3(
         t3,
         inputs_embeds=inputs_embeds,
         past_key_values=None,
     )
     next_logits = _cfg_combine(raw_logits[:, -1, :], request.cfg_weight)
+    next_hidden = hidden_states[:, -1:, :]
     assert next_logits.shape[0] == 1, tuple(next_logits.shape)
 
     if _trace_enabled():
@@ -167,6 +171,7 @@ def prefill_prototype_state(t3, request: ScheduledDecodeRequest) -> _PrototypeSt
         generated_ids=state.generated_ids.clone(),
         past_key_values=past_key_values,
         next_logits=next_logits,
+        next_hidden=next_hidden,
         decode_step=0,
     )
 
@@ -190,13 +195,14 @@ def run_baseline_greedy_decode(t3, request: ScheduledDecodeRequest) -> Tensor:
             tokens=next_token,
             start_pos=state.decode_step + 1,
         )
-        raw_logits, next_past = _forward_raw_t3(
+        raw_logits, next_past, next_hidden = _forward_raw_t3(
             t3,
             inputs_embeds=step_inputs,
             past_key_values=state.past_key_values,
         )
         state.next_logits = _cfg_combine(raw_logits[:, -1, :], request.cfg_weight)
         state.past_key_values = next_past
+        state.next_hidden = next_hidden[:, -1:, :]
         state.decode_step += 1
 
     if predicted_tokens:
@@ -228,13 +234,14 @@ def _rebuild_prototype_state(
             tokens=next_token,
             start_pos=state.decode_step + 1,
         )
-        raw_logits, next_past = _forward_raw_t3(
+        raw_logits, next_past, next_hidden = _forward_raw_t3(
             t3,
             inputs_embeds=step_inputs,
             past_key_values=state.past_key_values,
         )
         state.next_logits = _cfg_combine(raw_logits[:, -1, :], request.cfg_weight)
         state.past_key_values = next_past
+        state.next_hidden = next_hidden[:, -1:, :]
         state.decode_step += 1
 
     return state
@@ -271,7 +278,7 @@ def draft_propose_block(
             tokens=next_token,
             start_pos=state.decode_step + block_offset + 1,
         )
-        raw_logits, work_past = _forward_raw_t3(
+        raw_logits, work_past, _ = _forward_raw_t3(
             t3,
             inputs_embeds=step_inputs,
             past_key_values=work_past,
@@ -291,6 +298,46 @@ def draft_propose_block(
 
 
 @torch.inference_mode()
+def medusa_propose_block(
+    medusa_model,
+    *,
+    state: _PrototypeState,
+    speculate_k: int,
+) -> Tensor:
+    assert speculate_k >= 1
+    proposal_cap = min(speculate_k, medusa_model.medusa_num_heads + 1)
+    proposed: list[Tensor] = []
+
+    next_token = state.next_logits.argmax(dim=-1, keepdim=True)
+    proposed.append(next_token)
+    if torch.all(next_token.view(-1) == medusa_model.t3.hp.stop_speech_token) or proposal_cap == 1:
+        return torch.cat(proposed, dim=1)
+
+    medusa_raw_logits = medusa_model.forward_medusa_heads(state.next_hidden)
+    for head_index in range(min(medusa_model.medusa_num_heads, proposal_cap - 1)):
+        head_logits = _cfg_combine(
+            medusa_raw_logits[head_index, :, -1, :],
+            state.request.cfg_weight,
+        )
+        future_token = head_logits.argmax(dim=-1, keepdim=True)
+        proposed.append(future_token)
+        if torch.all(future_token.view(-1) == medusa_model.t3.hp.stop_speech_token):
+            break
+
+    proposed_tokens = torch.cat(proposed, dim=1)
+    if _trace_enabled():
+        shape_logger.info("[models/t3/inference/speculative_decode.py] medusa.proposed")
+        shape_logger.info("  decode_step %s", state.decode_step)
+        shape_logger.info("  speculate_k %s", speculate_k)
+        shape_logger.info("  proposal_cap %s", proposal_cap)
+        shape_logger.info("  next_hidden %s %s %s", tuple(state.next_hidden.shape), state.next_hidden.dtype, state.next_hidden.device)
+        shape_logger.info("  medusa_raw_logits %s %s %s", tuple(medusa_raw_logits.shape), medusa_raw_logits.dtype, medusa_raw_logits.device)
+        shape_logger.info("  proposed_tokens %s %s %s", tuple(proposed_tokens.shape), proposed_tokens.dtype, proposed_tokens.device)
+        shape_logger.info("  proposed_token_ids %s", proposed_tokens.view(-1).tolist())
+    return proposed_tokens
+
+
+@torch.inference_mode()
 def verify_block_greedy(
     t3,
     *,
@@ -306,7 +353,7 @@ def verify_block_greedy(
         tokens=proposed_tokens,
         start_pos=state.decode_step + 1,
     )
-    raw_block_logits, block_past = _forward_raw_t3(
+    raw_block_logits, block_past, block_hidden = _forward_raw_t3(
         t3,
         inputs_embeds=block_inputs,
         past_key_values=state.past_key_values,
@@ -329,6 +376,7 @@ def verify_block_greedy(
     if match_len == proposed_count:
         committed_tokens = proposed_tokens
         next_logits = cfg_block_logits[:, -1, :]
+        next_hidden = block_hidden[:, -1:, :]
         next_past_key_values = block_past
     else:
         correction_token = verify_logits[match_len].argmax(dim=-1, keepdim=True)
@@ -338,13 +386,14 @@ def verify_block_greedy(
             tokens=committed_tokens,
             start_pos=state.decode_step + 1,
         )
-        raw_replay_logits, next_past_key_values = _forward_raw_t3(
+        raw_replay_logits, next_past_key_values, replay_hidden = _forward_raw_t3(
             t3,
             inputs_embeds=replay_inputs,
             past_key_values=state.past_key_values,
         )
         replay_cfg_logits = _cfg_combine(raw_replay_logits, state.request.cfg_weight)
         next_logits = replay_cfg_logits[:, -1, :]
+        next_hidden = replay_hidden[:, -1:, :]
         assert _kv_seq_len(next_past_key_values) == _kv_seq_len(state.past_key_values) + committed_tokens.size(1)
 
     if _trace_enabled():
@@ -366,6 +415,7 @@ def verify_block_greedy(
         proposed_tokens=proposed_count,
         correction_token=correction_token,
         next_logits=next_logits,
+        next_hidden=next_hidden,
         next_past_key_values=next_past_key_values,
     )
 
@@ -412,6 +462,7 @@ def run_speculative_decode_with_draft(
         target_state.generated_ids = torch.cat([target_state.generated_ids, committed_tokens], dim=1)
         target_state.past_key_values = verify.next_past_key_values
         target_state.next_logits = verify.next_logits
+        target_state.next_hidden = verify.next_hidden
         target_state.decode_step += committed_tokens.size(1)
 
         accepted_tokens = verify.accepted_draft_tokens
@@ -460,6 +511,87 @@ def run_speculative_decode_with_draft(
         correction_tokens_total=correction_tokens_total,
         rebuild_count=rebuild_count,
         rebuild_tokens_total=rebuild_tokens_total,
+        full_accept_rounds=full_accept_rounds,
+        zero_accept_rounds=zero_accept_rounds,
+        partial_accept_rounds=partial_accept_rounds,
+        match_len_hist=tuple(match_len_hist),
+    )
+
+
+@torch.inference_mode()
+def run_medusa_speculative_decode(
+    target_t3,
+    medusa_model,
+    request: ScheduledDecodeRequest,
+    *,
+    speculate_k: int,
+) -> SpeculativePrototypeResult:
+    assert speculate_k >= 1
+    _reset_trace_counters()
+    target_state = prefill_prototype_state(target_t3, request)
+    predicted_tokens: list[Tensor] = []
+    rounds = 0
+    proposed_tokens_total = 0
+    accepted_draft_tokens_total = 0
+    correction_tokens_total = 0
+    proposal_cap = min(speculate_k, medusa_model.medusa_num_heads + 1)
+    match_len_hist = [0] * (proposal_cap + 1)
+    full_accept_rounds = 0
+    zero_accept_rounds = 0
+    partial_accept_rounds = 0
+
+    while sum(token.size(1) for token in predicted_tokens) < request.max_new_tokens:
+        remaining = request.max_new_tokens - sum(token.size(1) for token in predicted_tokens)
+        proposed_tokens = medusa_propose_block(
+            medusa_model,
+            state=target_state,
+            speculate_k=min(proposal_cap, remaining),
+        )
+        verify = verify_block_greedy(
+            target_t3,
+            state=target_state,
+            proposed_tokens=proposed_tokens,
+        )
+
+        committed_tokens = verify.committed_tokens
+        predicted_tokens.append(committed_tokens)
+        target_state.generated_ids = torch.cat([target_state.generated_ids, committed_tokens], dim=1)
+        target_state.past_key_values = verify.next_past_key_values
+        target_state.next_logits = verify.next_logits
+        target_state.next_hidden = verify.next_hidden
+        target_state.decode_step += committed_tokens.size(1)
+
+        accepted_tokens = verify.accepted_draft_tokens
+        match_len_hist[accepted_tokens] += 1
+        if verify.correction_token is None and accepted_tokens == verify.proposed_tokens:
+            full_accept_rounds += 1
+        elif accepted_tokens == 0:
+            zero_accept_rounds += 1
+        else:
+            partial_accept_rounds += 1
+
+        rounds += 1
+        proposed_tokens_total += verify.proposed_tokens
+        accepted_draft_tokens_total += verify.accepted_draft_tokens
+        if verify.correction_token is not None:
+            correction_tokens_total += 1
+
+        if torch.any(committed_tokens == target_t3.hp.stop_speech_token):
+            break
+
+    if predicted_tokens:
+        speech_tokens = torch.cat(predicted_tokens, dim=1)
+    else:
+        speech_tokens = torch.empty((1, 0), dtype=torch.long, device=target_t3.device)
+
+    return SpeculativePrototypeResult(
+        speech_tokens=speech_tokens,
+        rounds=rounds,
+        proposed_tokens_total=proposed_tokens_total,
+        accepted_draft_tokens_total=accepted_draft_tokens_total,
+        correction_tokens_total=correction_tokens_total,
+        rebuild_count=0,
+        rebuild_tokens_total=0,
         full_accept_rounds=full_accept_rounds,
         zero_accept_rounds=zero_accept_rounds,
         partial_accept_rounds=partial_accept_rounds,
