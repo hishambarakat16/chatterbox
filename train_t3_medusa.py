@@ -13,6 +13,8 @@ from chatterbox.models.t3.train import (
     T3MedusaDistillDataset,
     collate_t3_medusa_batch,
     create_t3_medusa_model,
+    describe_conditionals_file,
+    describe_distill_record,
     save_medusa_checkpoint,
 )
 
@@ -111,6 +113,17 @@ def main() -> None:
     if len(dataset) == 0:
         raise ValueError("Dataset is empty after filtering")
 
+    if args.trace_shapes:
+        first_record = dataset[0]
+        print(f"dataset_first_record={json.dumps(describe_distill_record(first_record), ensure_ascii=False)}")
+        print(
+            "dataset_first_conditionals="
+            + json.dumps(
+                describe_conditionals_file(first_record.conditionals_path),
+                ensure_ascii=False,
+            )
+        )
+
     eval_size = 0
     if args.eval_ratio > 0 and len(dataset) >= 50:
         eval_size = max(1, int(len(dataset) * args.eval_ratio))
@@ -127,6 +140,32 @@ def main() -> None:
         freeze_base=True,
     )
     collate_fn = lambda rows: collate_t3_medusa_batch(rows, model.t3.hp)
+    if args.trace_shapes:
+        preview_rows = [dataset[i] for i in range(min(args.batch_size, len(dataset)))]
+        preview_batch = collate_fn(preview_rows)
+        print(
+            "collate_preview="
+            + json.dumps(
+                {
+                    "text_tokens": list(preview_batch["text_tokens"].shape),
+                    "text_token_lens": preview_batch["text_token_lens"].tolist(),
+                    "speech_tokens": list(preview_batch["speech_tokens"].shape),
+                    "speech_token_lens": preview_batch["speech_token_lens"].tolist(),
+                    "t3_cond": {
+                        key: (
+                            None
+                            if value is None
+                            else {
+                                "shape": list(value.shape),
+                                "dtype": str(value.dtype),
+                            }
+                        )
+                        for key, value in preview_batch["t3_cond"].__dict__.items()
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,

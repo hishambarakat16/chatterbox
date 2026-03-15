@@ -73,6 +73,20 @@ def _stack_cond_field(values: list[Tensor | None], field_name: str) -> Tensor | 
     return torch.stack(normalized, dim=0)
 
 
+def _describe_value(value):
+    if torch.is_tensor(value):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, dict):
+        return {key: _describe_value(inner) for key, inner in value.items()}
+    if value is None:
+        return None
+    return type(value).__name__
+
+
 def stack_t3_conds(conds: list[T3Cond]) -> T3Cond:
     return T3Cond(
         speaker_emb=_stack_cond_field([cond.speaker_emb for cond in conds], "speaker_emb"),
@@ -168,6 +182,32 @@ class T3MedusaDistillDataset(Dataset):
 
     def __getitem__(self, index: int) -> DistillRecord:
         return self.records[index]
+
+
+def describe_conditionals_file(path: str | Path) -> dict:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    summary = {
+        "path": str(path),
+        "payload_type": type(payload).__name__,
+    }
+    if isinstance(payload, dict):
+        summary["top_level_keys"] = sorted(payload.keys())
+        if "t3" in payload:
+            summary["t3"] = _describe_value(payload["t3"])
+        if "gen" in payload:
+            summary["gen"] = _describe_value(payload["gen"])
+    return summary
+
+
+def describe_distill_record(record: DistillRecord) -> dict:
+    return {
+        "sample_id": record.sample_id,
+        "text_preview": record.text[:120],
+        "num_text_tokens": record.num_text_tokens,
+        "num_speech_tokens": record.num_speech_tokens,
+        "teacher_max_new_tokens": record.teacher_max_new_tokens,
+        "conditionals_path": str(record.conditionals_path),
+    }
 
 
 def collate_t3_medusa_batch(records: list[DistillRecord], hp: T3Config):
