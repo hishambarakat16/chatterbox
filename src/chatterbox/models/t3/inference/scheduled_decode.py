@@ -320,14 +320,18 @@ def advance_scheduled_cohort(
             penalty=float(request.repetition_penalty)
         )(ids_for_proc, row_logits)
 
-        if request.temperature != 1.0:
+        use_greedy = float(request.temperature) <= 0.0
+        if not use_greedy and request.temperature != 1.0:
             row_logits = row_logits / request.temperature
 
-        row_logits = MinPLogitsWarper(min_p=request.min_p)(ids_for_proc, row_logits)
-        row_logits = TopPLogitsWarper(top_p=request.top_p)(ids_for_proc, row_logits)
+        if use_greedy:
+            next_token = row_logits.argmax(dim=-1, keepdim=True)
+        else:
+            row_logits = MinPLogitsWarper(min_p=request.min_p)(ids_for_proc, row_logits)
+            row_logits = TopPLogitsWarper(top_p=request.top_p)(ids_for_proc, row_logits)
 
-        probs = torch.softmax(row_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+            probs = torch.softmax(row_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
         state.predicted_tokens.append(next_token)
         state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
         if len(state.predicted_tokens) == 1:

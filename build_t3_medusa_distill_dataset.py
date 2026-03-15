@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import multiprocessing as mp
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -25,35 +27,46 @@ def load_model(device: str, checkpoint_dir: str | None):
     return ChatterboxMultilingualScheduledTTS.from_pretrained(device)
 
 
+@dataclass
+class PreparedRecord:
+    ordinal: int
+    sample_id: str
+    text: str
+    normalized_text: str
+    text_tokens_single: torch.Tensor
+    request: ScheduledDecodeRequest
+    source_wav_path: str
+    source_duration: str
+
+
+def build_base_session(model: ChatterboxMultilingualScheduledTTS, args: argparse.Namespace):
+    return model.create_session(
+        audio_prompt_path=args.audio_prompt_path,
+        language_id=args.language_id,
+        cfg_weight=args.cfg_weight,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        min_p=args.min_p,
+        top_p=args.top_p,
+        max_new_tokens=args.max_new_tokens,
+        session_id="medusa_distill_prompt",
+    )
+
+
 def build_single_request(
     model: ChatterboxMultilingualScheduledTTS,
     *,
+    base_session,
     text: str,
     language_id: str,
-    audio_prompt_path: str,
-    max_new_tokens: int,
-    cfg_weight: float,
-    temperature: float,
-    repetition_penalty: float,
-    min_p: float,
-    top_p: float,
+    session_id: str,
 ):
     worker = model.worker
     if language_id.lower() not in SUPPORTED_LANGUAGES:
         supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
         raise ValueError(f"Unsupported language_id '{language_id}'. Supported languages: {supported_langs}")
 
-    session = model.create_session(
-        audio_prompt_path=audio_prompt_path,
-        language_id=language_id,
-        cfg_weight=cfg_weight,
-        temperature=temperature,
-        repetition_penalty=repetition_penalty,
-        min_p=min_p,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-    )
-    options = session.options
+    options = base_session.options
 
     normalized_text = punc_norm(text)
     text_tokens_single = worker.tokenizer.text_to_tokens(
@@ -64,19 +77,19 @@ def build_single_request(
     text_tokens_single = F.pad(text_tokens_single, (0, 1), value=worker.t3.hp.stop_text_token)
 
     text_tokens_cfg = torch.cat([text_tokens_single, text_tokens_single], dim=0)
-    conds = clone_conditionals(session.conditionals).to(worker.device)
+    conds = clone_conditionals(base_session.conditionals).to(worker.device)
     request = ScheduledDecodeRequest(
-        session_id="medusa_distill",
+        session_id=session_id,
         t3_cond=conds.t3,
         text_tokens=text_tokens_cfg,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=options.max_new_tokens,
         temperature=options.temperature,
         top_p=options.top_p,
         min_p=options.min_p,
         repetition_penalty=options.repetition_penalty,
         cfg_weight=options.cfg_weight,
     )
-    return request, session, normalized_text, text_tokens_single
+    return request, normalized_text, text_tokens_single
 
 
 def shard_jsonl_path(output_dir: Path, num_shards: int, shard_index: int) -> Path:
@@ -118,6 +131,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument(
+        "--decode-impl",
+        choices=("scheduled", "greedy"),
+        default="scheduled",
+        help="Use the shared scheduled T3 path or the legacy one-request greedy loop.",
+    )
+    parser.add_argument(
+        "--scheduler-inflight",
+        type=int,
+        default=4,
+        help="Per-process in-flight T3 requests when --decode-impl=scheduled.",
+    )
+    parser.add_argument(
+        "--scheduler-batching-window-ms",
+        type=float,
+        default=10.0,
+        help="Scheduler batching window for scheduled dataset generation.",
+    )
+    parser.add_argument(
+        "--disable-batch-key-sort",
+        action="store_true",
+        help="Disable sorting manifest rows by scheduled batch key before decode.",
+    )
+    parser.add_argument(
         "--mp-workers",
         type=int,
         default=1,
@@ -149,8 +185,260 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--shard-index must be in [0, --num-shards)")
     if args.mp_workers < 1:
         raise ValueError("--mp-workers must be >= 1")
+    if args.scheduler_inflight < 1:
+        raise ValueError("--scheduler-inflight must be >= 1")
     if args.mp_workers > 1 and (args.num_shards != 1 or args.shard_index != 0):
         raise ValueError("Use either --mp-workers or manual --num-shards/--shard-index, not both together")
+
+
+def _prompt_len_from_session(base_session) -> int:
+    prompt = getattr(base_session.conditionals.t3, "cond_prompt_speech_tokens", None)
+    return 0 if prompt is None else int(prompt.shape[-1])
+
+
+def _preview_batch_key(
+    model: ChatterboxMultilingualScheduledTTS,
+    *,
+    text: str,
+    language_id: str,
+    prompt_len: int,
+    cache: dict[tuple[str, str], tuple[int, int]],
+) -> tuple[int, int]:
+    normalized_text = punc_norm(text)
+    cache_key = (language_id.lower(), normalized_text)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    text_tokens = model.worker.tokenizer.text_to_tokens(
+        normalized_text,
+        language_id=language_id.lower(),
+    )
+    batch_key = (int(text_tokens.numel()) + 2, prompt_len)
+    cache[cache_key] = batch_key
+    return batch_key
+
+
+def sort_records_for_scheduled(
+    model: ChatterboxMultilingualScheduledTTS,
+    *,
+    base_session,
+    records: list[tuple[int, dict]],
+    language_id: str,
+) -> list[tuple[int, dict]]:
+    prompt_len = _prompt_len_from_session(base_session)
+    preview_cache: dict[tuple[str, str], tuple[int, int]] = {}
+    return sorted(
+        records,
+        key=lambda item: _preview_batch_key(
+            model,
+            text=item[1]["text"],
+            language_id=language_id,
+            prompt_len=prompt_len,
+            cache=preview_cache,
+        ),
+    )
+
+
+def prepare_record(
+    model: ChatterboxMultilingualScheduledTTS,
+    *,
+    base_session,
+    row: dict,
+    ordinal: int,
+    shard_index: int,
+    num_shards: int,
+    language_id: str,
+) -> PreparedRecord:
+    text = row["text"]
+    sample_id = row.get("sample_id") or f"sample_{ordinal:06d}"
+    session_id = f"medusa_distill_s{shard_index:02d}_of_{num_shards:02d}_{ordinal:07d}_{sample_id}"
+    request, normalized_text, text_tokens_single = build_single_request(
+        model,
+        base_session=base_session,
+        text=text,
+        language_id=language_id,
+        session_id=session_id,
+    )
+    return PreparedRecord(
+        ordinal=ordinal,
+        sample_id=sample_id,
+        text=text,
+        normalized_text=normalized_text,
+        text_tokens_single=text_tokens_single,
+        request=request,
+        source_wav_path=row.get("source_wav_path", ""),
+        source_duration=row.get("duration", ""),
+    )
+
+
+def build_output_record(
+    prepared: PreparedRecord,
+    *,
+    teacher_tokens: torch.Tensor,
+    args: argparse.Namespace,
+    conds_path_written: Path,
+) -> dict:
+    text_tokens_single = prepared.text_tokens_single.to("cpu")
+    return {
+        "sample_id": prepared.sample_id,
+        "text": prepared.text,
+        "normalized_text": prepared.normalized_text,
+        "language_id": args.language_id,
+        "audio_prompt_path": str(Path(args.audio_prompt_path).resolve()),
+        "conditionals_path": str(conds_path_written.resolve()),
+        "text_tokens": text_tokens_single.tolist(),
+        "speech_tokens": teacher_tokens.tolist(),
+        "num_text_tokens": int(text_tokens_single.numel()),
+        "num_speech_tokens": int(teacher_tokens.numel()),
+        "teacher_decode": {
+            "impl": args.decode_impl,
+            "cfg_weight": args.cfg_weight,
+            "temperature": args.temperature,
+            "repetition_penalty": args.repetition_penalty,
+            "min_p": args.min_p,
+            "top_p": args.top_p,
+            "max_new_tokens": args.max_new_tokens,
+            "scheduler_inflight": args.scheduler_inflight,
+            "scheduler_batching_window_ms": args.scheduler_batching_window_ms,
+        },
+        "source_wav_path": prepared.source_wav_path,
+        "source_duration": prepared.source_duration,
+    }
+
+
+def _maybe_set_progress(progress_bar, *, written: int, failures: int):
+    if tqdm is not None:
+        progress_bar.set_postfix(written=written, failures=failures)
+
+
+def _decode_scheduled_tokens(model: ChatterboxMultilingualScheduledTTS, request: ScheduledDecodeRequest) -> torch.Tensor:
+    teacher_tokens, _ = model.worker.t3_scheduler.submit(request)
+    return drop_invalid_tokens(teacher_tokens[0]).to("cpu")
+
+
+def run_records_greedy(
+    *,
+    model: ChatterboxMultilingualScheduledTTS,
+    base_session,
+    records: list[tuple[int, dict]],
+    args: argparse.Namespace,
+    sink,
+    progress_bar,
+    output_dir: Path,
+    conds_path_written: Path,
+) -> tuple[int, int]:
+    written = 0
+    failures = 0
+    log_prefix = f"[shard {args.shard_index}/{args.num_shards}] " if args.num_shards > 1 else ""
+    for ordinal, row in records:
+        sample_id = row.get("sample_id") or f"sample_{ordinal:06d}"
+        try:
+            prepared = prepare_record(
+                model,
+                base_session=base_session,
+                row=row,
+                ordinal=ordinal,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
+                language_id=args.language_id,
+            )
+            teacher_tokens = run_baseline_greedy_decode(model.worker.t3, prepared.request)
+            teacher_tokens = drop_invalid_tokens(teacher_tokens[0]).to("cpu")
+            record = build_output_record(
+                prepared,
+                teacher_tokens=teacher_tokens,
+                args=args,
+                conds_path_written=conds_path_written,
+            )
+            sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+            written += 1
+        except Exception as exc:  # pragma: no cover - dataset generation should continue on bad rows
+            failures += 1
+            print(f"{log_prefix}failed sample_id={sample_id}: {exc}")
+        if tqdm is not None:
+            progress_bar.update(1)
+            _maybe_set_progress(progress_bar, written=written, failures=failures)
+        elif written % max(args.save_every, 1) == 0:
+            print(f"{log_prefix}written={written} failures={failures}")
+    return written, failures
+
+
+def run_records_scheduled(
+    *,
+    model: ChatterboxMultilingualScheduledTTS,
+    base_session,
+    records: list[tuple[int, dict]],
+    args: argparse.Namespace,
+    sink,
+    progress_bar,
+    output_dir: Path,
+    conds_path_written: Path,
+) -> tuple[int, int]:
+    written = 0
+    failures = 0
+    log_prefix = f"[shard {args.shard_index}/{args.num_shards}] " if args.num_shards > 1 else ""
+    records_iter = iter(records)
+    pending: dict[object, PreparedRecord] = {}
+
+    def submit_next(executor: ThreadPoolExecutor) -> bool:
+        nonlocal failures
+        while len(pending) < args.scheduler_inflight:
+            try:
+                ordinal, row = next(records_iter)
+            except StopIteration:
+                return False
+
+            sample_id = row.get("sample_id") or f"sample_{ordinal:06d}"
+            try:
+                prepared = prepare_record(
+                    model,
+                    base_session=base_session,
+                    row=row,
+                    ordinal=ordinal,
+                    shard_index=args.shard_index,
+                    num_shards=args.num_shards,
+                    language_id=args.language_id,
+                )
+                future = executor.submit(_decode_scheduled_tokens, model, prepared.request)
+                pending[future] = prepared
+            except Exception as exc:
+                failures += 1
+                print(f"{log_prefix}failed sample_id={sample_id}: {exc}")
+                if tqdm is not None:
+                    progress_bar.update(1)
+                    _maybe_set_progress(progress_bar, written=written, failures=failures)
+        return True
+
+    with ThreadPoolExecutor(max_workers=args.scheduler_inflight, thread_name_prefix="medusa_distill_sched") as executor:
+        submit_next(executor)
+        while pending:
+            done, _ = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                prepared = pending.pop(future)
+                try:
+                    teacher_tokens = future.result()
+                    record = build_output_record(
+                        prepared,
+                        teacher_tokens=teacher_tokens,
+                        args=args,
+                        conds_path_written=conds_path_written,
+                    )
+                    sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    written += 1
+                except Exception as exc:
+                    failures += 1
+                    print(f"{log_prefix}failed sample_id={prepared.sample_id}: {exc}")
+
+                if tqdm is not None:
+                    progress_bar.update(1)
+                    _maybe_set_progress(progress_bar, written=written, failures=failures)
+                elif written % max(args.save_every, 1) == 0:
+                    print(f"{log_prefix}written={written} failures={failures}")
+
+            submit_next(executor)
+
+    return written, failures
 
 
 def run_shard(args: argparse.Namespace) -> int:
@@ -161,11 +449,26 @@ def run_shard(args: argparse.Namespace) -> int:
     jsonl_path = shard_jsonl_path(output_dir, args.num_shards, args.shard_index)
 
     model = load_model(args.device, args.checkpoint_dir)
-    records = load_records(args.manifest_csv, args.limit, args.num_shards, args.shard_index)
+    if hasattr(model.worker, "t3_scheduler"):
+        model.worker.t3_scheduler.batching_window_ms = float(args.scheduler_batching_window_ms)
 
-    written = 0
-    failures = 0
-    conds_path_written = None
+    base_session = build_base_session(model, args)
+    records = load_records(args.manifest_csv, args.limit, args.num_shards, args.shard_index)
+    indexed_records = list(enumerate(records))
+    if args.decode_impl == "scheduled" and not args.disable_batch_key_sort:
+        indexed_records = sort_records_for_scheduled(
+            model,
+            base_session=base_session,
+            records=indexed_records,
+            language_id=args.language_id,
+        )
+
+    conds_path_written = save_conditionals_once(
+        base_session,
+        output_dir,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+    )
     log_prefix = f"[shard {args.shard_index}/{args.num_shards}] " if args.num_shards > 1 else ""
     progress_desc = (
         f"shard {args.shard_index + 1}/{args.num_shards}"
@@ -183,79 +486,43 @@ def run_shard(args: argparse.Namespace) -> int:
             leave=True,
         )
         if tqdm is not None
-        else records
+        else indexed_records
     )
     with jsonl_path.open("w", encoding="utf-8") as sink:
-        for index, row in enumerate(progress_bar):
-            text = row["text"]
-            sample_id = row.get("sample_id") or f"sample_{index:06d}"
-            try:
-                request, session, normalized_text, text_tokens_single = build_single_request(
-                    model,
-                    text=text,
-                    language_id=args.language_id,
-                    audio_prompt_path=args.audio_prompt_path,
-                    max_new_tokens=args.max_new_tokens,
-                    cfg_weight=args.cfg_weight,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    min_p=args.min_p,
-                    top_p=args.top_p,
-                )
-                if conds_path_written is None:
-                    conds_path_written = save_conditionals_once(
-                        session,
-                        output_dir,
-                        num_shards=args.num_shards,
-                        shard_index=args.shard_index,
-                    )
-
-                teacher_tokens = run_baseline_greedy_decode(model.worker.t3, request)
-                teacher_tokens = drop_invalid_tokens(teacher_tokens[0]).to("cpu")
-                text_tokens_single = text_tokens_single.to("cpu")
-
-                record = {
-                    "sample_id": sample_id,
-                    "text": text,
-                    "normalized_text": normalized_text,
-                    "language_id": args.language_id,
-                    "audio_prompt_path": str(Path(args.audio_prompt_path).resolve()),
-                    "conditionals_path": str(conds_path_written.resolve()),
-                    "text_tokens": text_tokens_single.tolist(),
-                    "speech_tokens": teacher_tokens.tolist(),
-                    "num_text_tokens": int(text_tokens_single.numel()),
-                    "num_speech_tokens": int(teacher_tokens.numel()),
-                    "teacher_decode": {
-                        "cfg_weight": args.cfg_weight,
-                        "temperature": args.temperature,
-                        "repetition_penalty": args.repetition_penalty,
-                        "min_p": args.min_p,
-                        "top_p": args.top_p,
-                        "max_new_tokens": args.max_new_tokens,
-                    },
-                    "source_wav_path": row.get("source_wav_path", ""),
-                    "source_duration": row.get("duration", ""),
-                }
-                sink.write(json.dumps(record, ensure_ascii=False) + "\n")
-                written += 1
-                if tqdm is not None:
-                    progress_bar.set_postfix(written=written, failures=failures)
-                elif written % max(args.save_every, 1) == 0:
-                    print(f"{log_prefix}written={written} failures={failures}")
-            except Exception as exc:  # pragma: no cover - dataset generation should continue on bad rows
-                failures += 1
-                if tqdm is not None:
-                    progress_bar.set_postfix(written=written, failures=failures)
-                print(f"{log_prefix}failed sample_id={sample_id}: {exc}")
+        if args.decode_impl == "scheduled":
+            written, failures = run_records_scheduled(
+                model=model,
+                base_session=base_session,
+                records=indexed_records,
+                args=args,
+                sink=sink,
+                progress_bar=progress_bar,
+                output_dir=output_dir,
+                conds_path_written=conds_path_written,
+            )
+        else:
+            written, failures = run_records_greedy(
+                model=model,
+                base_session=base_session,
+                records=indexed_records,
+                args=args,
+                sink=sink,
+                progress_bar=progress_bar,
+                output_dir=output_dir,
+                conds_path_written=conds_path_written,
+            )
 
     if tqdm is not None:
         progress_bar.close()
 
     print(f"{log_prefix}output_dir={output_dir}")
     print(f"{log_prefix}jsonl_path={jsonl_path}")
+    print(f"{log_prefix}decode_impl={args.decode_impl}")
+    print(f"{log_prefix}scheduler_inflight={args.scheduler_inflight}")
+    print(f"{log_prefix}scheduler_batching_window_ms={args.scheduler_batching_window_ms}")
     print(f"{log_prefix}num_shards={args.num_shards}")
     print(f"{log_prefix}shard_index={args.shard_index}")
-    print(f"{log_prefix}records_assigned={len(records)}")
+    print(f"{log_prefix}records_assigned={len(indexed_records)}")
     print(f"{log_prefix}written={written}")
     print(f"{log_prefix}failures={failures}")
     if conds_path_written is not None:
