@@ -26,9 +26,19 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
     - S3 remains unchanged for now
     """
 
-    def __init__(self, *args, batching_window_ms: float = 5.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        batching_window_ms: float = 5.0,
+        enable_alignment_controller: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.t3_scheduler = T3DecodeScheduler(self.t3, batching_window_ms=batching_window_ms)
+        self.t3_scheduler = T3DecodeScheduler(
+            self.t3,
+            batching_window_ms=batching_window_ms,
+            enable_alignment_controller=enable_alignment_controller,
+        )
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         request_start = time.perf_counter()

@@ -27,7 +27,13 @@ def get_cuda_device(device: str):
     return torch.device(device if ":" in device else "cuda:0")
 
 
-def load_model(impl: str, device: str, checkpoint_dir: str | None):
+def load_model(
+    impl: str,
+    device: str,
+    checkpoint_dir: str | None,
+    *,
+    enable_alignment_controller: bool = False,
+):
     if impl == "baseline":
         model_cls = ChatterboxMultilingualTTS
     elif impl == "streaming":
@@ -37,7 +43,18 @@ def load_model(impl: str, device: str, checkpoint_dir: str | None):
     else:
         model_cls = ChatterboxMultilingualScheduledTTS
     if checkpoint_dir:
+        if impl == "scheduled":
+            return model_cls.from_local(
+                checkpoint_dir,
+                device,
+                enable_alignment_controller=enable_alignment_controller,
+            )
         return model_cls.from_local(checkpoint_dir, device)
+    if impl == "scheduled":
+        return model_cls.from_pretrained(
+            device,
+            enable_alignment_controller=enable_alignment_controller,
+        )
     return model_cls.from_pretrained(device)
 
 
@@ -246,6 +263,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
+    parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--trace-shapes", action="store_true")
     parser.add_argument("--output-dir")
     args = parser.parse_args()
@@ -253,7 +271,12 @@ def main():
     configure_shape_logging(args.trace_shapes)
 
     load_start = time.perf_counter()
-    model = load_model(args.impl, args.device, args.checkpoint_dir)
+    model = load_model(
+        args.impl,
+        args.device,
+        args.checkpoint_dir,
+        enable_alignment_controller=args.enable_alignment_controller,
+    )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
 

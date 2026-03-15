@@ -22,10 +22,22 @@ def maybe_sync(device: str):
         torch.cuda.synchronize()
 
 
-def load_model(device: str, checkpoint_dir: str | None):
+def load_model(
+    device: str,
+    checkpoint_dir: str | None,
+    *,
+    enable_alignment_controller: bool = False,
+):
     if checkpoint_dir:
-        return ChatterboxMultilingualScheduledTTS.from_local(checkpoint_dir, device)
-    return ChatterboxMultilingualScheduledTTS.from_pretrained(device)
+        return ChatterboxMultilingualScheduledTTS.from_local(
+            checkpoint_dir,
+            device,
+            enable_alignment_controller=enable_alignment_controller,
+        )
+    return ChatterboxMultilingualScheduledTTS.from_pretrained(
+        device,
+        enable_alignment_controller=enable_alignment_controller,
+    )
 
 
 def percent_change(old: float, new: float) -> float:
@@ -207,6 +219,7 @@ def main():
     parser.add_argument("--audio-prompt-path")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--checkpoint-dir")
+    parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--decode-steps", type=int, default=64)
     parser.add_argument("--warmup-runs", type=int, default=1)
@@ -214,7 +227,11 @@ def main():
     args = parser.parse_args()
 
     load_start = time.perf_counter()
-    model = load_model(args.device, args.checkpoint_dir)
+    model = load_model(
+        args.device,
+        args.checkpoint_dir,
+        enable_alignment_controller=args.enable_alignment_controller,
+    )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
 

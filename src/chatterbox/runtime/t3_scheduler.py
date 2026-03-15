@@ -46,14 +46,23 @@ class T3DecodeScheduler:
     older cohorts are still decoding.
     """
 
-    def __init__(self, t3, *, batching_window_ms: float = 5.0):
+    def __init__(
+        self,
+        t3,
+        *,
+        batching_window_ms: float = 5.0,
+        enable_alignment_controller: bool = False,
+    ):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
         self.condition = threading.Condition()
         self.pending: list[_PendingScheduledRequest] = []
         self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
         self.stopped = False
-        self.patched_model, self.alignment_controller = build_scheduled_runtime_components(self.t3)
+        self.patched_model, self.alignment_controller = build_scheduled_runtime_components(
+            self.t3,
+            enable_alignment_controller=enable_alignment_controller,
+        )
         self.worker = threading.Thread(
             target=self._run_loop,
             name="chatterbox-t3-scheduler",

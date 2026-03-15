@@ -177,7 +177,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
     )
 
 
-def build_scheduled_runtime_components(t3):
+def build_scheduled_runtime_components(t3, *, enable_alignment_controller: bool = False):
     patched_model = T3HuggingfaceBackend(
         config=t3.cfg,
         llama=t3.tfmr,
@@ -185,7 +185,9 @@ def build_scheduled_runtime_components(t3):
         speech_head=t3.speech_head,
         alignment_stream_analyzer=None,
     )
-    alignment_controller = ScheduledAlignmentController(t3.tfmr) if t3.hp.is_multilingual else None
+    alignment_controller = None
+    if enable_alignment_controller and t3.hp.is_multilingual:
+        alignment_controller = ScheduledAlignmentController(t3.tfmr)
     return patched_model, alignment_controller
 
 

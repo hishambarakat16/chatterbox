@@ -21,10 +21,22 @@ from chatterbox.models.t3.inference.speculative_decode import run_baseline_greed
 from chatterbox.runtime.session import clone_conditionals, clone_t3_cond
 
 
-def load_model(device: str, checkpoint_dir: str | None):
+def load_model(
+    device: str,
+    checkpoint_dir: str | None,
+    *,
+    enable_alignment_controller: bool = False,
+):
     if checkpoint_dir:
-        return ChatterboxMultilingualScheduledTTS.from_local(checkpoint_dir, device)
-    return ChatterboxMultilingualScheduledTTS.from_pretrained(device)
+        return ChatterboxMultilingualScheduledTTS.from_local(
+            checkpoint_dir,
+            device,
+            enable_alignment_controller=enable_alignment_controller,
+        )
+    return ChatterboxMultilingualScheduledTTS.from_pretrained(
+        device,
+        enable_alignment_controller=enable_alignment_controller,
+    )
 
 
 @dataclass
@@ -476,14 +488,13 @@ def run_shard(args: argparse.Namespace) -> int:
         shard_index=args.shard_index,
     )
 
-    model = load_model(args.device, args.checkpoint_dir)
+    model = load_model(
+        args.device,
+        args.checkpoint_dir,
+        enable_alignment_controller=args.enable_alignment_controller,
+    )
     if hasattr(model.worker, "t3_scheduler"):
         model.worker.t3_scheduler.batching_window_ms = float(args.scheduler_batching_window_ms)
-        if args.decode_impl == "scheduled" and not args.enable_alignment_controller:
-            alignment_controller = model.worker.t3_scheduler.alignment_controller
-            if alignment_controller is not None:
-                alignment_controller.close()
-                model.worker.t3_scheduler.alignment_controller = None
 
     base_session = build_base_session(model, args)
     records = load_records(args.manifest_csv, args.offset, args.limit, args.num_shards, args.shard_index)

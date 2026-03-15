@@ -26,7 +26,13 @@ class ChatterboxMultilingualScheduledTTS:
         return SUPPORTED_LANGUAGES.copy()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> "ChatterboxMultilingualScheduledTTS":
+    def from_local(
+        cls,
+        ckpt_dir,
+        device,
+        *,
+        enable_alignment_controller: bool = False,
+    ) -> "ChatterboxMultilingualScheduledTTS":
         ckpt_dir = Path(ckpt_dir)
 
         if device in ["cpu", "mps"]:
@@ -62,11 +68,17 @@ class ChatterboxMultilingualScheduledTTS:
             tokenizer=tokenizer,
             device=device,
             default_conds=default_conds,
+            enable_alignment_controller=enable_alignment_controller,
         )
         return cls(worker)
 
     @classmethod
-    def from_pretrained(cls, device: torch.device) -> "ChatterboxMultilingualScheduledTTS":
+    def from_pretrained(
+        cls,
+        device: torch.device,
+        *,
+        enable_alignment_controller: bool = False,
+    ) -> "ChatterboxMultilingualScheduledTTS":
         if device == "mps" and not torch.backends.mps.is_available():
             device = "cpu"
 
@@ -86,7 +98,11 @@ class ChatterboxMultilingualScheduledTTS:
                 token=os.getenv("HF_TOKEN"),
             )
         )
-        return cls.from_local(ckpt_dir, device)
+        return cls.from_local(
+            ckpt_dir,
+            device,
+            enable_alignment_controller=enable_alignment_controller,
+        )
 
     def create_session(
         self,
