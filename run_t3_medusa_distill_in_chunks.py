@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mp-workers", type=int, default=1)
     parser.add_argument("--scheduler-inflight", type=int, default=4)
     parser.add_argument("--scheduler-batching-window-ms", type=float, default=10.0)
+    parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--disable-batch-key-sort", action="store_true")
     parser.add_argument("--resume-existing", action="store_true")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
@@ -125,6 +126,8 @@ def main() -> None:
         ]
         if args.checkpoint_dir:
             cmd.extend(["--checkpoint-dir", args.checkpoint_dir])
+        if args.enable_alignment_controller:
+            cmd.append("--enable-alignment-controller")
         if args.disable_batch_key_sort:
             cmd.append("--disable-batch-key-sort")
 
@@ -141,6 +144,7 @@ def main() -> None:
     print(f"completed_chunks={chunk_index}")
     print(f"output_dir={output_dir}")
     print(f"decode_impl={args.decode_impl}")
+    print(f"alignment_controller_enabled={args.enable_alignment_controller}")
 
 
 if __name__ == "__main__":

@@ -161,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scheduler batching window for scheduled dataset generation.",
     )
     parser.add_argument(
+        "--enable-alignment-controller",
+        action="store_true",
+        help="Keep the scheduled alignment controller enabled during dataset generation.",
+    )
+    parser.add_argument(
         "--disable-batch-key-sort",
         action="store_true",
         help="Disable sorting manifest rows by scheduled batch key before decode.",
@@ -310,6 +315,7 @@ def build_output_record(
         "num_speech_tokens": int(teacher_tokens.numel()),
         "teacher_decode": {
             "impl": args.decode_impl,
+            "alignment_controller_enabled": args.enable_alignment_controller,
             "cfg_weight": args.cfg_weight,
             "temperature": args.temperature,
             "repetition_penalty": args.repetition_penalty,
@@ -473,6 +479,11 @@ def run_shard(args: argparse.Namespace) -> int:
     model = load_model(args.device, args.checkpoint_dir)
     if hasattr(model.worker, "t3_scheduler"):
         model.worker.t3_scheduler.batching_window_ms = float(args.scheduler_batching_window_ms)
+        if args.decode_impl == "scheduled" and not args.enable_alignment_controller:
+            alignment_controller = model.worker.t3_scheduler.alignment_controller
+            if alignment_controller is not None:
+                alignment_controller.close()
+                model.worker.t3_scheduler.alignment_controller = None
 
     base_session = build_base_session(model, args)
     records = load_records(args.manifest_csv, args.offset, args.limit, args.num_shards, args.shard_index)
@@ -540,6 +551,7 @@ def run_shard(args: argparse.Namespace) -> int:
     print(f"{log_prefix}output_dir={output_dir}")
     print(f"{log_prefix}jsonl_path={jsonl_path}")
     print(f"{log_prefix}decode_impl={args.decode_impl}")
+    print(f"{log_prefix}alignment_controller_enabled={args.enable_alignment_controller}")
     print(f"{log_prefix}offset={args.offset}")
     print(f"{log_prefix}limit={args.limit}")
     print(f"{log_prefix}jsonl_stem={args.jsonl_stem}")
