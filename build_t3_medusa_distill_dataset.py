@@ -18,7 +18,7 @@ from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
 from chatterbox.models.s3tokenizer import drop_invalid_tokens
 from chatterbox.models.t3.inference.scheduled_decode import ScheduledDecodeRequest
 from chatterbox.models.t3.inference.speculative_decode import run_baseline_greedy_decode
-from chatterbox.runtime.session import clone_conditionals
+from chatterbox.runtime.session import clone_conditionals, clone_t3_cond
 
 
 def load_model(device: str, checkpoint_dir: str | None):
@@ -77,10 +77,10 @@ def build_single_request(
     text_tokens_single = F.pad(text_tokens_single, (0, 1), value=worker.t3.hp.stop_text_token)
 
     text_tokens_cfg = torch.cat([text_tokens_single, text_tokens_single], dim=0)
-    conds = clone_conditionals(base_session.conditionals).to(worker.device)
+    t3_cond = clone_t3_cond(base_session.conditionals.t3).to(device=worker.device)
     request = ScheduledDecodeRequest(
         session_id=session_id,
-        t3_cond=conds.t3,
+        t3_cond=t3_cond,
         text_tokens=text_tokens_cfg,
         max_new_tokens=options.max_new_tokens,
         temperature=options.temperature,
@@ -92,10 +92,16 @@ def build_single_request(
     return request, normalized_text, text_tokens_single
 
 
-def shard_jsonl_path(output_dir: Path, num_shards: int, shard_index: int) -> Path:
+def shard_jsonl_path(
+    output_dir: Path,
+    *,
+    jsonl_stem: str,
+    num_shards: int,
+    shard_index: int,
+) -> Path:
     if num_shards == 1:
-        return output_dir / "samples.jsonl"
-    return output_dir / f"samples.shard_{shard_index:02d}_of_{num_shards:02d}.jsonl"
+        return output_dir / f"{jsonl_stem}.jsonl"
+    return output_dir / f"{jsonl_stem}.shard_{shard_index:02d}_of_{num_shards:02d}.jsonl"
 
 
 def save_conditionals_once(session, output_dir: Path, *, num_shards: int, shard_index: int) -> Path:
@@ -126,8 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument(
+        "--jsonl-stem",
+        default="samples",
+        help="Output file stem. Useful for chunked runs that restart the builder process.",
+    )
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument(
@@ -162,12 +174,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_records(manifest_csv: str, limit: int, num_shards: int, shard_index: int):
+def load_records(manifest_csv: str, offset: int, limit: int, num_shards: int, shard_index: int):
     records = []
     with Path(manifest_csv).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             records.append(row)
+
+    if offset > 0:
+        records = records[offset:]
 
     if limit > 0:
         records = records[:limit]
@@ -183,6 +198,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-shards must be >= 1")
     if args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError("--shard-index must be in [0, --num-shards)")
+    if args.offset < 0:
+        raise ValueError("--offset must be >= 0")
     if args.mp_workers < 1:
         raise ValueError("--mp-workers must be >= 1")
     if args.scheduler_inflight < 1:
@@ -446,14 +463,19 @@ def run_shard(args: argparse.Namespace) -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = shard_jsonl_path(output_dir, args.num_shards, args.shard_index)
+    jsonl_path = shard_jsonl_path(
+        output_dir,
+        jsonl_stem=args.jsonl_stem,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+    )
 
     model = load_model(args.device, args.checkpoint_dir)
     if hasattr(model.worker, "t3_scheduler"):
         model.worker.t3_scheduler.batching_window_ms = float(args.scheduler_batching_window_ms)
 
     base_session = build_base_session(model, args)
-    records = load_records(args.manifest_csv, args.limit, args.num_shards, args.shard_index)
+    records = load_records(args.manifest_csv, args.offset, args.limit, args.num_shards, args.shard_index)
     indexed_records = list(enumerate(records))
     if args.decode_impl == "scheduled" and not args.disable_batch_key_sort:
         indexed_records = sort_records_for_scheduled(
@@ -518,6 +540,9 @@ def run_shard(args: argparse.Namespace) -> int:
     print(f"{log_prefix}output_dir={output_dir}")
     print(f"{log_prefix}jsonl_path={jsonl_path}")
     print(f"{log_prefix}decode_impl={args.decode_impl}")
+    print(f"{log_prefix}offset={args.offset}")
+    print(f"{log_prefix}limit={args.limit}")
+    print(f"{log_prefix}jsonl_stem={args.jsonl_stem}")
     print(f"{log_prefix}scheduler_inflight={args.scheduler_inflight}")
     print(f"{log_prefix}scheduler_batching_window_ms={args.scheduler_batching_window_ms}")
     print(f"{log_prefix}num_shards={args.num_shards}")
