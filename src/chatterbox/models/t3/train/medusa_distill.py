@@ -17,7 +17,7 @@ from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
-from chatterbox.mtl_tts import REPO_ID
+from chatterbox.mtl_tts import Conditionals, REPO_ID
 from chatterbox.models.t3.modules.cond_enc import T3Cond
 from chatterbox.models.t3.modules.t3_config import T3Config
 from chatterbox.models.t3.t3 import T3
@@ -46,7 +46,10 @@ def _resolve_conditionals_path(raw_path: str, dataset_dir: Path) -> Path:
 
 @lru_cache(maxsize=64)
 def _load_t3_cond_cached(path: str) -> T3Cond:
-    return T3Cond.load(path, map_location="cpu")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(payload, dict) and "t3" in payload and "gen" in payload:
+        return Conditionals.load(path, map_location="cpu").t3
+    return T3Cond(**payload)
 
 
 def _normalize_cond_tensor(tensor: Tensor) -> Tensor:
