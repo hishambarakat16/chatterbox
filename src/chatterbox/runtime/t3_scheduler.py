@@ -132,9 +132,19 @@ class T3DecodeScheduler:
             grouped.setdefault(item.decode_request.batch_key(), []).append(item)
 
         for batch_key, items in grouped.items():
+            active_cohorts_at_admit = len(self.active_cohorts)
             decode_requests = [item.decode_request for item in items]
             cohort_state = prepare_scheduled_cohort(self.t3, decode_requests)
             pending_by_session = {item.decode_request.session_id: item for item in items}
+            cohort_size = len(items)
+            for item in items:
+                item.metrics.update({
+                    "t3_batch_text_len": float(batch_key[0]),
+                    "t3_batch_prompt_len": float(batch_key[1]),
+                    "t3_admission_cohort_size": float(cohort_size),
+                    "t3_active_cohorts_at_admit": float(active_cohorts_at_admit),
+                    "t3_admission_singleton": 1.0 if cohort_size == 1 else 0.0,
+                })
             self.active_cohorts.append(
                 _ActiveScheduledCohort(
                     cohort_state=cohort_state,
@@ -178,12 +188,12 @@ class T3DecodeScheduler:
         for finished in advance_result.finished_results:
             item = cohort.pending_by_session.pop(finished.session_id)
             item.completed_at = time.perf_counter()
-            item.metrics = {
+            item.metrics.update({
                 "t3_wait_s": 0.0 if item.first_started_at is None else item.first_started_at - item.submitted_at,
                 "t3_first_token_s": 0.0 if item.first_token_at is None else item.first_token_at - item.submitted_at,
                 "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
                 "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
-            }
+            })
             item.metrics.update(finished.decode_metrics)
             item.result = finished.speech_tokens
             item.done.set()
