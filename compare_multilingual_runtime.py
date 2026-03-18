@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import logging
 import os
 import time
@@ -69,6 +70,16 @@ def configure_shape_logging(enabled: bool):
         logger.addHandler(handler)
 
 
+def _call_with_supported_kwargs(fn, **kwargs):
+    signature = inspect.signature(fn)
+    accepted = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+    return fn(**accepted)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare multilingual Chatterbox runtime variants.")
     parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled"], required=True)
@@ -111,9 +122,10 @@ def main():
             audio_prompt_path=args.audio_prompt_path,
             language_id=args.language_id,
         )
-        generate_fn = lambda: model.generate_with_session(
-            session,
-            args.text,
+        generate_fn = lambda: _call_with_supported_kwargs(
+            model.generate_with_session,
+            session=session,
+            text=args.text,
             cfg_weight=args.cfg_weight,
             temperature=args.temperature,
             repetition_penalty=args.repetition_penalty,
@@ -122,7 +134,8 @@ def main():
             max_new_tokens=args.max_new_tokens,
         )
     else:
-        generate_fn = lambda: model.generate(
+        generate_fn = lambda: _call_with_supported_kwargs(
+            model.generate,
             text=args.text,
             language_id=args.language_id,
             audio_prompt_path=args.audio_prompt_path,

@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import logging
 import os
 import statistics
@@ -132,6 +133,16 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def _call_with_supported_kwargs(fn, **kwargs):
+    signature = inspect.signature(fn)
+    accepted = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+    return fn(**accepted)
+
+
 def build_request(
     session_or_none,
     model,
@@ -148,9 +159,10 @@ def build_request(
     max_new_tokens: int,
 ):
     if impl in {"streaming", "concurrent", "scheduled"}:
-        return lambda: model.generate_with_session(
-            session_or_none,
-            text,
+        return lambda: _call_with_supported_kwargs(
+            model.generate_with_session,
+            session=session_or_none,
+            text=text,
             cfg_weight=cfg_weight,
             temperature=temperature,
             repetition_penalty=repetition_penalty,
@@ -158,7 +170,8 @@ def build_request(
             top_p=top_p,
             max_new_tokens=max_new_tokens,
         )
-    return lambda: model.generate(
+    return lambda: _call_with_supported_kwargs(
+        model.generate,
         text=text,
         language_id=language_id,
         audio_prompt_path=audio_prompt_path,
