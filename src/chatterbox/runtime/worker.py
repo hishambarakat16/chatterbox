@@ -21,10 +21,6 @@ from .types import GenerationOptions
 shape_logger = logging.getLogger("chatterbox.shape")
 
 
-def _trace_s3_enabled() -> bool:
-    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"))
-
-
 class ChatterboxMultilingualStreamingWorker:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
@@ -76,7 +72,7 @@ class ChatterboxMultilingualStreamingWorker:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         conds = Conditionals(t3_cond, s3gen_ref_dict)
-        if _trace_s3_enabled():
+        if os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"):
             shape_logger.info("[runtime/worker.py] build_conditionals_from_wav")
             shape_logger.info("  wav_fpath %s", wav_fpath)
             shape_logger.info("  speaker_emb %s %s %s", tuple(t3_cond.speaker_emb.shape), t3_cond.speaker_emb.dtype, t3_cond.speaker_emb.device)
@@ -177,16 +173,8 @@ class ChatterboxMultilingualStreamingWorker:
             )
             profile["t3_s"] = time.perf_counter() - t3_start
             speech_tokens = speech_tokens[0]
-            if _trace_s3_enabled():
-                shape_logger.info("[runtime/worker.py] generate.speech_tokens.raw")
-                shape_logger.info("  session_id %s", session.session_id)
-                shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
-            if _trace_s3_enabled():
-                shape_logger.info("[runtime/worker.py] generate.speech_tokens.filtered")
-                shape_logger.info("  session_id %s", session.session_id)
-                shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
 
             s3_start = time.perf_counter()
             wav, _ = self.s3gen.inference(
