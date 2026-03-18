@@ -1,5 +1,7 @@
 import argparse
 import json
+import shlex
+import shutil
 import statistics
 import subprocess
 import time
@@ -116,7 +118,11 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     latencies = [float(item["latency_s"]) for item in ok]
     first_tokens = [request_metric(item, "t3_first_token_s") for item in ok]
     audio_ready = [request_metric(item, "audio_ready_s") for item in ok]
+    t3_wait = [request_metric(item, "t3_wait_s") for item in ok]
+    t3_active = [request_metric(item, "t3_active_s") for item in ok]
     t3_total = [request_metric(item, "t3_s") for item in ok]
+    t3_acceptance = [request_metric(item, "t3_acceptance_rate") for item in ok if "t3_acceptance_rate" in item["profile"]]
+    t3_rounds = [request_metric(item, "t3_rounds") for item in ok if "t3_rounds" in item["profile"]]
     s3_total = [request_metric(item, "s3_s") for item in ok]
     s3_token2mel = [request_metric(item, "s3_token2mel_s") for item in ok]
     s3_hift = [request_metric(item, "s3_hift_s") for item in ok]
@@ -141,7 +147,11 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
         "mean_audio_ready_s": round(mean_or_zero(audio_ready), 4),
         "p95_audio_ready_s": round(percentile(audio_ready, 0.95), 4) if audio_ready else 0.0,
         "audio_ready_std_s": round(pstdev_or_zero(audio_ready), 4),
+        "mean_t3_wait_s": round(mean_or_zero(t3_wait), 4),
+        "mean_t3_active_s": round(mean_or_zero(t3_active), 4),
         "mean_t3_s": round(mean_or_zero(t3_total), 4),
+        "mean_t3_acceptance_rate": round(mean_or_zero(t3_acceptance), 4),
+        "mean_t3_rounds": round(mean_or_zero(t3_rounds), 4),
         "mean_s3_s": round(mean_or_zero(s3_total), 4),
         "mean_s3_token2mel_s": round(mean_or_zero(s3_token2mel), 4),
         "mean_s3_hift_s": round(mean_or_zero(s3_hift), 4),
@@ -234,11 +244,12 @@ def write_markdown_report(path: Path, report: dict):
     lines.append("")
     lines.append("## Stage Means")
     lines.append("")
-    lines.append("| Concurrency | Mean `T3` | Mean `S3` | Mean `S3 token2mel` | Mean `S3 HiFT` |")
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("| Concurrency | Mean `T3 wait` | Mean `T3 active` | Mean `T3 total` | Mean Hydra acceptance | Mean `S3` | Mean `S3 token2mel` | Mean `S3 HiFT` |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for summary in report["levels"]:
         lines.append(
-            f"| `c{summary['concurrency']}` | `{summary['mean_t3_s']:.4f}s` | `{summary['mean_s3_s']:.4f}s` | "
+            f"| `c{summary['concurrency']}` | `{summary['mean_t3_wait_s']:.4f}s` | `{summary['mean_t3_active_s']:.4f}s` | "
+            f"`{summary['mean_t3_s']:.4f}s` | `{summary['mean_t3_acceptance_rate']:.4f}` | `{summary['mean_s3_s']:.4f}s` | "
             f"`{summary['mean_s3_token2mel_s']:.4f}s` | `{summary['mean_s3_hift_s']:.4f}s` |"
         )
     lines.append("")
@@ -257,13 +268,39 @@ def write_markdown_report(path: Path, report: dict):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def play_saved_audio(play_command: str, saved_audio: list[dict]):
+def resolve_play_command(play_command: str | None) -> tuple[str | None, str | None]:
+    if not play_command:
+        return None, None
+    if play_command == "auto":
+        candidates = [
+            "ffplay -nodisp -autoexit -loglevel error {path}",
+            "mpv --no-terminal --really-quiet {path}",
+            "paplay {path}",
+            "aplay {path}",
+        ]
+        for candidate in candidates:
+            executable = shlex.split(candidate)[0]
+            if shutil.which(executable):
+                return candidate, None
+        return None, "No supported audio player found in PATH (`ffplay`, `mpv`, `paplay`, `aplay`)."
+
+    executable = shlex.split(play_command)[0]
+    if shutil.which(executable) is None:
+        return None, f"Playback command not found in PATH: `{executable}`."
+    return play_command, None
+
+
+def play_saved_audio(play_command: str, saved_audio: list[dict]) -> list[str]:
+    errors = []
     for item in saved_audio:
         wav_path = item.get("wav_path")
         if not wav_path:
             continue
         command = play_command.format(path=wav_path, text=item.get("text", ""))
-        subprocess.run(command, shell=True, check=False)
+        result = subprocess.run(shlex.split(command), check=False)
+        if result.returncode != 0:
+            errors.append(f"`{command}` exited with code {result.returncode}")
+    return errors
 
 
 def sanitize_level_summaries(level_summaries: list[dict]) -> list[dict]:
@@ -471,12 +508,22 @@ def main():
     summary_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     write_markdown_report(markdown_path, serializable)
 
+    playback_errors = []
+    resolved_play_command = None
     if args.play_command:
-        play_saved_audio(args.play_command, saved_audio)
+        resolved_play_command, playback_error = resolve_play_command(args.play_command)
+        if playback_error is not None:
+            playback_errors.append(playback_error)
+        elif resolved_play_command is not None:
+            playback_errors.extend(play_saved_audio(resolved_play_command, saved_audio))
 
     print(f"summary_json={summary_path}")
     print(f"summary_md={markdown_path}")
     print(f"saved_audio={saved_audio}")
+    if resolved_play_command is not None:
+        print(f"play_command={resolved_play_command}")
+    if playback_errors:
+        print(f"playback_errors={playback_errors}")
 
 
 if __name__ == "__main__":
