@@ -52,6 +52,8 @@ class T3DecodeScheduler:
         *,
         batching_window_ms: float = 5.0,
         enable_alignment_controller: bool = False,
+        hydra_model=None,
+        hydra_speculate_k: int = 3,
     ):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
@@ -59,6 +61,10 @@ class T3DecodeScheduler:
         self.pending: list[_PendingScheduledRequest] = []
         self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
         self.stopped = False
+        self.hydra_model = hydra_model
+        self.hydra_speculate_k = hydra_speculate_k
+        if self.hydra_model is not None and enable_alignment_controller:
+            raise ValueError("Hydra scheduled runtime does not support the alignment controller")
         self.patched_model, self.alignment_controller = build_scheduled_runtime_components(
             self.t3,
             enable_alignment_controller=enable_alignment_controller,
@@ -150,20 +156,22 @@ class T3DecodeScheduler:
             if item.first_started_at is None:
                 item.first_started_at = step_started_at
 
-        finished_results, first_token_session_ids, cohort_complete = advance_scheduled_cohort(
+        advance_result = advance_scheduled_cohort(
             self.t3,
             cohort.cohort_state,
             patched_model=self.patched_model,
             alignment_controller=self.alignment_controller,
+            hydra_model=self.hydra_model,
+            hydra_speculate_k=self.hydra_speculate_k,
         )
         first_token_recorded_at = time.perf_counter()
-        for session_id in first_token_session_ids:
+        for session_id in advance_result.first_token_session_ids:
             item = cohort.pending_by_session.get(session_id)
             if item is not None and item.first_token_at is None:
                 item.first_token_at = first_token_recorded_at
 
-        for session_id, result in finished_results:
-            item = cohort.pending_by_session.pop(session_id)
+        for finished in advance_result.finished_results:
+            item = cohort.pending_by_session.pop(finished.session_id)
             item.completed_at = time.perf_counter()
             item.metrics = {
                 "t3_wait_s": 0.0 if item.first_started_at is None else item.first_started_at - item.submitted_at,
@@ -171,11 +179,35 @@ class T3DecodeScheduler:
                 "t3_active_s": 0.0 if item.first_started_at is None or item.completed_at is None else item.completed_at - item.first_started_at,
                 "t3_s": 0.0 if item.completed_at is None else item.completed_at - item.submitted_at,
             }
-            item.result = result
+            item.metrics.update(finished.decode_metrics)
+            item.result = finished.speech_tokens
             item.done.set()
 
-        if not cohort_complete:
-            self.active_cohorts.append(cohort)
+        for successor in advance_result.successor_cohorts:
+            successor_pending = {
+                state.request.session_id: cohort.pending_by_session[state.request.session_id]
+                for state in successor.active_states
+            }
+            self.active_cohorts.append(
+                _ActiveScheduledCohort(
+                    cohort_state=successor,
+                    pending_by_session=successor_pending,
+                )
+            )
+
+        if shape_logger.isEnabledFor(logging.INFO) and len(advance_result.successor_cohorts) > 1:
+            shape_logger.info("[runtime/t3_scheduler.py] split_cohort")
+            shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
+            shape_logger.info(
+                "  successor_sizes %s",
+                [len(successor.active_states) for successor in advance_result.successor_cohorts],
+            )
+            shape_logger.info(
+                "  successor_decode_steps %s",
+                [successor.active_states[0].decode_step for successor in advance_result.successor_cohorts],
+            )
+
+        if advance_result.successor_cohorts:
             return
 
         if shape_logger.isEnabledFor(logging.INFO):

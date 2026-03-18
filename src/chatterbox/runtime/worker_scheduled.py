@@ -31,6 +31,8 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         *args,
         batching_window_ms: float = 5.0,
         enable_alignment_controller: bool = False,
+        hydra_model=None,
+        hydra_speculate_k: int = 3,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -38,6 +40,8 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             self.t3,
             batching_window_ms=batching_window_ms,
             enable_alignment_controller=enable_alignment_controller,
+            hydra_model=hydra_model,
+            hydra_speculate_k=hydra_speculate_k,
         )
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
@@ -54,6 +58,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         }
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
         language_id = active_options.language_id
+        t3_temperature = 0.0 if self.t3_scheduler.hydra_model is not None else active_options.temperature
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
             shape_logger.info("[runtime/worker_scheduled.py] generate.input")
             shape_logger.info("  session_id %s", session.session_id)
@@ -93,7 +98,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             t3_cond=active_conds.t3,
             text_tokens=text_tokens,
             max_new_tokens=active_options.max_new_tokens,
-            temperature=active_options.temperature,
+            temperature=t3_temperature,
             top_p=active_options.top_p,
             min_p=active_options.min_p,
             repetition_penalty=active_options.repetition_penalty,

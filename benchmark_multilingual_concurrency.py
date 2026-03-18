@@ -33,6 +33,8 @@ def load_model(
     checkpoint_dir: str | None,
     *,
     enable_alignment_controller: bool = False,
+    hydra_checkpoint_dir: str | None = None,
+    hydra_speculate_k: int = 3,
 ):
     if impl == "baseline":
         model_cls = ChatterboxMultilingualTTS
@@ -48,12 +50,16 @@ def load_model(
                 checkpoint_dir,
                 device,
                 enable_alignment_controller=enable_alignment_controller,
+                hydra_checkpoint_dir=hydra_checkpoint_dir,
+                hydra_speculate_k=hydra_speculate_k,
             )
         return model_cls.from_local(checkpoint_dir, device)
     if impl == "scheduled":
         return model_cls.from_pretrained(
             device,
             enable_alignment_controller=enable_alignment_controller,
+            hydra_checkpoint_dir=hydra_checkpoint_dir,
+            hydra_speculate_k=hydra_speculate_k,
         )
     return model_cls.from_pretrained(device)
 
@@ -126,13 +132,42 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def build_request(session_or_none, model, impl: str, text: str, language_id: str, audio_prompt_path: str | None):
+def build_request(
+    session_or_none,
+    model,
+    impl: str,
+    text: str,
+    language_id: str,
+    audio_prompt_path: str | None,
+    *,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+    max_new_tokens: int,
+):
     if impl in {"streaming", "concurrent", "scheduled"}:
-        return lambda: model.generate_with_session(session_or_none, text)
+        return lambda: model.generate_with_session(
+            session_or_none,
+            text,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+        )
     return lambda: model.generate(
         text=text,
         language_id=language_id,
         audio_prompt_path=audio_prompt_path,
+        cfg_weight=cfg_weight,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        min_p=min_p,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
     )
 
 
@@ -157,6 +192,12 @@ def run_concurrency_level(
     audio_prompt_path: str | None,
     device: str,
     output_dir: str | None,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+    max_new_tokens: int,
 ):
     vram_state = begin_vram_measurement(device)
 
@@ -167,6 +208,12 @@ def run_concurrency_level(
                 model.create_session(
                     audio_prompt_path=audio_prompt_path,
                     language_id=language_id,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
                 )
             )
     else:
@@ -176,7 +223,20 @@ def run_concurrency_level(
     results = [None] * concurrency
 
     def worker(index: int):
-        fn = build_request(sessions[index], model, impl, text, language_id, audio_prompt_path)
+        fn = build_request(
+            sessions[index],
+            model,
+            impl,
+            text,
+            language_id,
+            audio_prompt_path,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+        )
         barrier.wait()
         started = time.perf_counter()
         error = None
@@ -264,6 +324,14 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
     parser.add_argument("--enable-alignment-controller", action="store_true")
+    parser.add_argument("--hydra-checkpoint-dir")
+    parser.add_argument("--hydra-speculate-k", type=int, default=3)
+    parser.add_argument("--cfg-weight", type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--repetition-penalty", type=float, default=2.0)
+    parser.add_argument("--min-p", type=float, default=0.05)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-new-tokens", type=int, default=1000)
     parser.add_argument("--trace-shapes", action="store_true")
     parser.add_argument("--output-dir")
     args = parser.parse_args()
@@ -276,6 +344,8 @@ def main():
         args.device,
         args.checkpoint_dir,
         enable_alignment_controller=args.enable_alignment_controller,
+        hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+        hydra_speculate_k=args.hydra_speculate_k,
     )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
@@ -283,6 +353,15 @@ def main():
     print(f"impl={args.impl}")
     print(f"device={args.device}")
     print(f"load_s={load_s:.4f}")
+    if args.impl == "scheduled":
+        print(f"hydra_checkpoint_dir={args.hydra_checkpoint_dir}")
+        print(f"hydra_speculate_k={args.hydra_speculate_k}")
+    print(f"cfg_weight={args.cfg_weight}")
+    print(f"temperature={args.temperature}")
+    print(f"repetition_penalty={args.repetition_penalty}")
+    print(f"min_p={args.min_p}")
+    print(f"top_p={args.top_p}")
+    print(f"max_new_tokens={args.max_new_tokens}")
 
     for concurrency in args.concurrency_levels:
         summary = run_concurrency_level(
@@ -294,6 +373,12 @@ def main():
             audio_prompt_path=args.audio_prompt_path,
             device=args.device,
             output_dir=args.output_dir,
+            cfg_weight=args.cfg_weight,
+            temperature=args.temperature,
+            repetition_penalty=args.repetition_penalty,
+            min_p=args.min_p,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
         )
         print(f"concurrency={summary['concurrency']}")
         print(f"wall_s={summary['wall_s']:.4f}")

@@ -48,6 +48,15 @@ class _ActiveDecodeState:
     past_key_values: object = None
     decode_step: int = 0
     next_inputs_embeds: Tensor | None = None
+    next_logits: Tensor | None = None
+    next_hidden: Tensor | None = None
+    rounds: int = 0
+    proposed_tokens_total: int = 0
+    accepted_draft_tokens_total: int = 0
+    correction_tokens_total: int = 0
+    full_accept_rounds: int = 0
+    zero_accept_rounds: int = 0
+    partial_accept_rounds: int = 0
 
 
 @dataclass
@@ -55,6 +64,20 @@ class ScheduledDecodeCohort:
     batch_key: tuple[int, int]
     active_states: list[_ActiveDecodeState]
     prefill_inputs: list[Tensor] | None
+
+
+@dataclass
+class ScheduledFinishedResult:
+    session_id: str
+    speech_tokens: Tensor
+    decode_metrics: dict[str, float]
+
+
+@dataclass
+class ScheduledAdvanceResult:
+    finished_results: list[ScheduledFinishedResult]
+    first_token_session_ids: list[str]
+    successor_cohorts: list[ScheduledDecodeCohort]
 
 
 def _ensure_bot_eot(text_tokens: Tensor, hp):
@@ -117,6 +140,62 @@ def _log_backend_output_shapes(tag: str, output):
         first_layer[1].dtype,
         first_layer[1].device,
     )
+
+
+def _cfg_combine_rows(raw_logits: Tensor, cfg_weights: Tensor) -> Tensor:
+    cond = raw_logits[0::2]
+    uncond = raw_logits[1::2]
+    view_shape = [cfg_weights.size(0)] + [1] * (cond.dim() - 1)
+    weights = cfg_weights.to(device=cond.device, dtype=cond.dtype).view(*view_shape)
+    return cond + weights * (cond - uncond)
+
+
+def _build_cfg_step_inputs_batch(t3, *, tokens: Tensor, start_pos: int) -> Tensor:
+    assert tokens.dim() == 2, f"expected (B, K) tokens, got {tuple(tokens.shape)}"
+    base_embed = t3.speech_emb(tokens)
+    pos_embeds = [
+        t3.speech_pos_emb.get_fixed_embedding(start_pos + offset).to(device=base_embed.device)
+        for offset in range(tokens.size(1))
+    ]
+    pos_block = torch.cat(pos_embeds, dim=1)
+    single = base_embed + pos_block
+    return torch.cat([single, single], dim=0)
+
+
+def _build_successor_cohorts(
+    cohort: ScheduledDecodeCohort,
+    next_round_states: list[_ActiveDecodeState],
+) -> list[ScheduledDecodeCohort]:
+    if not next_round_states:
+        return []
+
+    grouped: dict[int, list[_ActiveDecodeState]] = {}
+    for state in next_round_states:
+        grouped.setdefault(state.decode_step, []).append(state)
+
+    return [
+        ScheduledDecodeCohort(
+            batch_key=cohort.batch_key,
+            active_states=states,
+            prefill_inputs=None,
+        )
+        for _, states in sorted(grouped.items(), key=lambda item: item[0])
+    ]
+
+
+def _speculative_metrics_from_state(state: _ActiveDecodeState) -> dict[str, float]:
+    if state.proposed_tokens_total <= 0:
+        return {}
+    return {
+        "t3_rounds": float(state.rounds),
+        "t3_proposed_tokens_total": float(state.proposed_tokens_total),
+        "t3_accepted_draft_tokens_total": float(state.accepted_draft_tokens_total),
+        "t3_correction_tokens_total": float(state.correction_tokens_total),
+        "t3_acceptance_rate": float(state.accepted_draft_tokens_total) / float(state.proposed_tokens_total),
+        "t3_full_accept_rounds": float(state.full_accept_rounds),
+        "t3_zero_accept_rounds": float(state.zero_accept_rounds),
+        "t3_partial_accept_rounds": float(state.partial_accept_rounds),
+    }
 
 
 def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDecodeState, Tensor]:
@@ -232,41 +311,67 @@ def _finalize_prediction(t3, state: _ActiveDecodeState) -> Tensor:
 
 
 @torch.inference_mode()
-def advance_scheduled_cohort(
+def _hydrate_prefill_state(
+    t3,
+    cohort: ScheduledDecodeCohort,
+    *,
+    patched_model,
+    output_attentions: bool,
+):
+    inputs_embeds = torch.cat(cohort.prefill_inputs, dim=0)
+    if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        shape_logger.info("[models/t3/inference/scheduled_decode.py] prefill.batch")
+        shape_logger.info("  requests %s", len(cohort.active_states))
+        shape_logger.info("  inputs_embeds %s %s %s", tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device)
+    output = patched_model(
+        inputs_embeds=inputs_embeds,
+        past_key_values=None,
+        use_cache=True,
+        output_attentions=output_attentions,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    _log_backend_output_shapes("prefill.output", output)
+
+    past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
+    hidden_states = output.hidden_states[-1][:, -1:, :]
+    cfg_weights = torch.tensor(
+        [state.request.cfg_weight for state in cohort.active_states],
+        device=output.logits.device,
+        dtype=output.logits.dtype,
+    )
+    next_logits = _cfg_combine_rows(output.logits[:, -1, :], cfg_weights)
+
+    for row_index, (state, state_past) in enumerate(zip(cohort.active_states, past_splits)):
+        state.past_key_values = state_past
+        state.next_logits = next_logits[row_index : row_index + 1]
+        state.next_hidden = hidden_states[row_index * 2 : (row_index + 1) * 2]
+
+    cohort.prefill_inputs = None
+
+
+@torch.inference_mode()
+def _advance_scheduled_cohort_greedy(
     t3,
     cohort: ScheduledDecodeCohort,
     *,
     patched_model,
     alignment_controller,
-) -> tuple[list[tuple[str, Tensor]], list[str], bool]:
+) -> ScheduledAdvanceResult:
     if not cohort.active_states:
-        return [], [], True
+        return ScheduledAdvanceResult([], [], [])
 
     output_attentions = alignment_controller is not None
 
     if cohort.prefill_inputs is not None:
-        inputs_embeds = torch.cat(cohort.prefill_inputs, dim=0)
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
-            shape_logger.info("[models/t3/inference/scheduled_decode.py] prefill.batch")
-            shape_logger.info("  requests %s", len(cohort.active_states))
-            shape_logger.info("  inputs_embeds %s %s %s", tuple(inputs_embeds.shape), inputs_embeds.dtype, inputs_embeds.device)
-        output = patched_model(
-            inputs_embeds=inputs_embeds,
-            past_key_values=None,
-            use_cache=True,
+        _hydrate_prefill_state(
+            t3,
+            cohort,
+            patched_model=patched_model,
             output_attentions=output_attentions,
-            output_hidden_states=True,
-            return_dict=True,
         )
-        _log_backend_output_shapes("prefill.output", output)
-        past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
-        for state, state_past in zip(cohort.active_states, past_splits):
-            state.past_key_values = state_past
-        cohort.prefill_inputs = None
+        logits = torch.cat([state.next_logits for state in cohort.active_states], dim=0)
     else:
-        # `decode_step` is incremented at the end of the prefill round after we
-        # sample the first token and prepare the first cached-step input embed.
-        # So the first cached transformer call arrives with `decode_step == 1`.
         is_first_cached_step = all(state.decode_step == 1 for state in cohort.active_states)
         next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
         batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
@@ -288,16 +393,12 @@ def advance_scheduled_cohort(
         past_splits = _split_past_key_values(output.past_key_values, [2] * len(cohort.active_states))
         for state, state_past in zip(cohort.active_states, past_splits):
             state.past_key_values = state_past
-
-    logits_step = output.logits[:, -1, :]
-    cond = logits_step[0::2, :]
-    uncond = logits_step[1::2, :]
-    cfg_weights = torch.tensor(
-        [state.request.cfg_weight for state in cohort.active_states],
-        device=cond.device,
-        dtype=cond.dtype,
-    ).unsqueeze(-1)
-    logits = cond + cfg_weights * (cond - uncond)
+        cfg_weights = torch.tensor(
+            [state.request.cfg_weight for state in cohort.active_states],
+            device=output.logits.device,
+            dtype=output.logits.dtype,
+        )
+        logits = _cfg_combine_rows(output.logits[:, -1, :], cfg_weights)
 
     if alignment_controller is not None:
         last_tokens = [
@@ -310,9 +411,9 @@ def advance_scheduled_cohort(
             next_tokens=last_tokens,
         )
 
-    finished_results: list[tuple[str, Tensor]] = []
+    finished_results: list[ScheduledFinishedResult] = []
     first_token_session_ids: list[str] = []
-    next_round_states = []
+    next_round_states: list[_ActiveDecodeState] = []
     for row_index, state in enumerate(cohort.active_states):
         request = state.request
         ids_for_proc = state.generated_ids
@@ -331,9 +432,9 @@ def advance_scheduled_cohort(
         else:
             row_logits = MinPLogitsWarper(min_p=request.min_p)(ids_for_proc, row_logits)
             row_logits = TopPLogitsWarper(top_p=request.top_p)(ids_for_proc, row_logits)
-
             probs = torch.softmax(row_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+
         state.predicted_tokens.append(next_token)
         state.generated_ids = torch.cat([state.generated_ids, next_token], dim=1)
         if len(state.predicted_tokens) == 1:
@@ -344,7 +445,13 @@ def advance_scheduled_cohort(
         if stop_on_eos or hit_limit:
             if stop_on_eos:
                 logger.info("✅ EOS token detected for %s", request.session_id)
-            finished_results.append((request.session_id, _finalize_prediction(t3, state)))
+            finished_results.append(
+                ScheduledFinishedResult(
+                    session_id=request.session_id,
+                    speech_tokens=_finalize_prediction(t3, state),
+                    decode_metrics={},
+                )
+            )
             continue
 
         next_token_embed = t3.speech_emb(next_token)
@@ -370,5 +477,317 @@ def advance_scheduled_cohort(
         state.decode_step += 1
         next_round_states.append(state)
 
-    cohort.active_states = next_round_states
-    return finished_results, first_token_session_ids, not cohort.active_states
+    return ScheduledAdvanceResult(
+        finished_results=finished_results,
+        first_token_session_ids=first_token_session_ids,
+        successor_cohorts=_build_successor_cohorts(cohort, next_round_states),
+    )
+
+
+@dataclass
+class _ScheduledVerifyRow:
+    state: _ActiveDecodeState
+    committed_tokens: Tensor
+    accepted_draft_tokens: int
+    proposed_tokens: int
+    correction_token: Tensor | None
+    next_logits: Tensor | None = None
+    next_hidden: Tensor | None = None
+    next_past_key_values: object = None
+
+
+@torch.inference_mode()
+def _hydra_propose_tokens(
+    t3,
+    hydra_model,
+    *,
+    state: _ActiveDecodeState,
+    speculate_k: int,
+) -> Tensor:
+    assert state.next_logits is not None
+    assert state.next_hidden is not None
+
+    proposal_cap = min(speculate_k, hydra_model.hydra_num_heads + 1)
+    proposed: list[Tensor] = []
+
+    next_token = state.next_logits.argmax(dim=-1, keepdim=True)
+    proposed.append(next_token)
+    if torch.all(next_token.view(-1) == t3.hp.stop_speech_token) or proposal_cap == 1:
+        return torch.cat(proposed, dim=1)
+
+    base_hidden = state.next_hidden[0:1]
+    for head_index in range(min(hydra_model.hydra_num_heads, proposal_cap - 1)):
+        context_tokens = torch.cat(proposed, dim=1)
+        context_embeds = t3.speech_emb(context_tokens)
+        head_inputs = [base_hidden]
+        for token_offset in range(head_index + 1):
+            head_inputs.append(context_embeds[:, token_offset : token_offset + 1, :])
+        head_input = torch.cat(head_inputs, dim=-1)
+        hidden = hydra_model.hydra_heads[head_index](head_input)
+        raw_logits = hydra_model.hydra_lm_heads[head_index](hidden)
+        future_token = raw_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        proposed.append(future_token)
+        if torch.all(future_token.view(-1) == t3.hp.stop_speech_token):
+            break
+
+    return torch.cat(proposed, dim=1)
+
+
+@torch.inference_mode()
+def _verify_block_greedy_batched(
+    t3,
+    states: list[_ActiveDecodeState],
+    proposed_tokens: Tensor,
+    *,
+    patched_model,
+) -> list[_ScheduledVerifyRow]:
+    assert states
+    assert proposed_tokens.dim() == 2
+    assert proposed_tokens.size(0) == len(states)
+    proposed_count = int(proposed_tokens.size(1))
+    assert proposed_count >= 1
+
+    block_inputs = _build_cfg_step_inputs_batch(
+        t3,
+        tokens=proposed_tokens,
+        start_pos=states[0].decode_step + 1,
+    )
+    output = patched_model(
+        inputs_embeds=block_inputs,
+        past_key_values=_cat_past_key_values([state.past_key_values for state in states]),
+        use_cache=True,
+        output_attentions=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    block_hidden = output.hidden_states[-1]
+    block_past_splits = _split_past_key_values(output.past_key_values, [2] * len(states))
+    cfg_weights = torch.tensor(
+        [state.request.cfg_weight for state in states],
+        device=output.logits.device,
+        dtype=output.logits.dtype,
+    )
+    cfg_block_logits = _cfg_combine_rows(output.logits, cfg_weights)
+    if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        shape_logger.info("[models/t3/inference/scheduled_decode.py] hydra.verify.batch")
+        shape_logger.info("  requests %s", len(states))
+        shape_logger.info("  proposed_tokens %s %s %s", tuple(proposed_tokens.shape), proposed_tokens.dtype, proposed_tokens.device)
+        shape_logger.info("  block_inputs %s %s %s", tuple(block_inputs.shape), block_inputs.dtype, block_inputs.device)
+        shape_logger.info("  cfg_block_logits %s %s %s", tuple(cfg_block_logits.shape), cfg_block_logits.dtype, cfg_block_logits.device)
+
+    verify_rows: list[_ScheduledVerifyRow] = []
+    replay_groups: dict[int, list[int]] = {}
+    for row_index, state in enumerate(states):
+        verify_logits = [state.next_logits] + [
+            cfg_block_logits[row_index : row_index + 1, index, :]
+            for index in range(proposed_count - 1)
+        ]
+        match_len = 0
+        for index in range(proposed_count):
+            predicted_token = verify_logits[index].argmax(dim=-1, keepdim=True)
+            if torch.equal(predicted_token, proposed_tokens[row_index : row_index + 1, index : index + 1]):
+                match_len += 1
+                continue
+            break
+
+        if match_len == proposed_count:
+            verify_rows.append(
+                _ScheduledVerifyRow(
+                    state=state,
+                    committed_tokens=proposed_tokens[row_index : row_index + 1],
+                    accepted_draft_tokens=match_len,
+                    proposed_tokens=proposed_count,
+                    correction_token=None,
+                    next_logits=cfg_block_logits[row_index : row_index + 1, -1, :],
+                    next_hidden=block_hidden[row_index * 2 : (row_index + 1) * 2, -1:, :],
+                    next_past_key_values=block_past_splits[row_index],
+                )
+            )
+            continue
+
+        correction_token = verify_logits[match_len].argmax(dim=-1, keepdim=True)
+        committed_tokens = torch.cat(
+            [proposed_tokens[row_index : row_index + 1, :match_len], correction_token],
+            dim=1,
+        )
+        verify_rows.append(
+            _ScheduledVerifyRow(
+                state=state,
+                committed_tokens=committed_tokens,
+                accepted_draft_tokens=match_len,
+                proposed_tokens=proposed_count,
+                correction_token=correction_token,
+            )
+        )
+        replay_groups.setdefault(committed_tokens.size(1), []).append(len(verify_rows) - 1)
+
+    for committed_len, verify_indices in replay_groups.items():
+        group_rows = [verify_rows[index] for index in verify_indices]
+        group_states = [row.state for row in group_rows]
+        committed_batch = torch.cat([row.committed_tokens for row in group_rows], dim=0)
+        replay_inputs = _build_cfg_step_inputs_batch(
+            t3,
+            tokens=committed_batch,
+            start_pos=group_states[0].decode_step + 1,
+        )
+        replay_output = patched_model(
+            inputs_embeds=replay_inputs,
+            past_key_values=_cat_past_key_values([state.past_key_values for state in group_states]),
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        replay_hidden = replay_output.hidden_states[-1]
+        replay_past_splits = _split_past_key_values(replay_output.past_key_values, [2] * len(group_states))
+        replay_cfg_weights = torch.tensor(
+            [state.request.cfg_weight for state in group_states],
+            device=replay_output.logits.device,
+            dtype=replay_output.logits.dtype,
+        )
+        replay_cfg_logits = _cfg_combine_rows(replay_output.logits, replay_cfg_weights)
+
+        for local_index, verify_row in enumerate(group_rows):
+            verify_row.next_logits = replay_cfg_logits[local_index : local_index + 1, -1, :]
+            verify_row.next_hidden = replay_hidden[local_index * 2 : (local_index + 1) * 2, -1:, :]
+            verify_row.next_past_key_values = replay_past_splits[local_index]
+
+    return verify_rows
+
+
+@torch.inference_mode()
+def _advance_scheduled_cohort_hydra(
+    t3,
+    cohort: ScheduledDecodeCohort,
+    *,
+    patched_model,
+    hydra_model,
+    hydra_speculate_k: int,
+) -> ScheduledAdvanceResult:
+    if not cohort.active_states:
+        return ScheduledAdvanceResult([], [], [])
+
+    if cohort.prefill_inputs is not None:
+        _hydrate_prefill_state(
+            t3,
+            cohort,
+            patched_model=patched_model,
+            output_attentions=False,
+        )
+
+    proposal_groups: dict[int, list[tuple[_ActiveDecodeState, Tensor]]] = {}
+    for state in cohort.active_states:
+        remaining = state.request.max_new_tokens - sum(token.size(1) for token in state.predicted_tokens)
+        if remaining <= 0:
+            proposed = torch.empty((1, 0), dtype=torch.long, device=t3.device)
+        else:
+            proposed = _hydra_propose_tokens(
+                t3,
+                hydra_model,
+                state=state,
+                speculate_k=min(hydra_speculate_k, remaining),
+            )
+        proposal_groups.setdefault(int(proposed.size(1)), []).append((state, proposed))
+
+    finished_results: list[ScheduledFinishedResult] = []
+    first_token_session_ids: list[str] = []
+    next_round_states: list[_ActiveDecodeState] = []
+
+    for proposed_count, grouped in sorted(proposal_groups.items(), key=lambda item: item[0]):
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/inference/scheduled_decode.py] hydra.proposal_group")
+            shape_logger.info("  proposal_count %s", proposed_count)
+            shape_logger.info("  requests %s", len(grouped))
+        if proposed_count <= 0:
+            for state, _ in grouped:
+                finished_results.append(
+                    ScheduledFinishedResult(
+                        session_id=state.request.session_id,
+                        speech_tokens=_finalize_prediction(t3, state),
+                        decode_metrics=_speculative_metrics_from_state(state),
+                    )
+                )
+            continue
+
+        group_states = [item[0] for item in grouped]
+        proposed_batch = torch.cat([item[1] for item in grouped], dim=0)
+        verify_rows = _verify_block_greedy_batched(
+            t3,
+            group_states,
+            proposed_batch,
+            patched_model=patched_model,
+        )
+
+        for verify_row in verify_rows:
+            state = verify_row.state
+            had_no_tokens = not state.predicted_tokens
+            committed_tokens = verify_row.committed_tokens
+            state.predicted_tokens.append(committed_tokens)
+            state.generated_ids = torch.cat([state.generated_ids, committed_tokens], dim=1)
+            state.past_key_values = verify_row.next_past_key_values
+            state.next_logits = verify_row.next_logits
+            state.next_hidden = verify_row.next_hidden
+            state.decode_step += committed_tokens.size(1)
+
+            state.rounds += 1
+            state.proposed_tokens_total += verify_row.proposed_tokens
+            state.accepted_draft_tokens_total += verify_row.accepted_draft_tokens
+            if verify_row.correction_token is None and verify_row.accepted_draft_tokens == verify_row.proposed_tokens:
+                state.full_accept_rounds += 1
+            elif verify_row.accepted_draft_tokens == 0:
+                state.zero_accept_rounds += 1
+            else:
+                state.partial_accept_rounds += 1
+            if verify_row.correction_token is not None:
+                state.correction_tokens_total += 1
+
+            if had_no_tokens and committed_tokens.numel() > 0:
+                first_token_session_ids.append(state.request.session_id)
+
+            stop_on_eos = torch.any(committed_tokens == t3.hp.stop_speech_token)
+            hit_limit = sum(token.size(1) for token in state.predicted_tokens) >= state.request.max_new_tokens
+            if stop_on_eos or hit_limit:
+                finished_results.append(
+                    ScheduledFinishedResult(
+                        session_id=state.request.session_id,
+                        speech_tokens=_finalize_prediction(t3, state),
+                        decode_metrics=_speculative_metrics_from_state(state),
+                    )
+                )
+                continue
+
+            next_round_states.append(state)
+
+    return ScheduledAdvanceResult(
+        finished_results=finished_results,
+        first_token_session_ids=first_token_session_ids,
+        successor_cohorts=_build_successor_cohorts(cohort, next_round_states),
+    )
+
+
+@torch.inference_mode()
+def advance_scheduled_cohort(
+    t3,
+    cohort: ScheduledDecodeCohort,
+    *,
+    patched_model,
+    alignment_controller,
+    hydra_model=None,
+    hydra_speculate_k: int = 3,
+) -> ScheduledAdvanceResult:
+    if hydra_model is not None:
+        if alignment_controller is not None:
+            raise ValueError("Hydra scheduled decode does not support the alignment controller")
+        return _advance_scheduled_cohort_hydra(
+            t3,
+            cohort,
+            patched_model=patched_model,
+            hydra_model=hydra_model,
+            hydra_speculate_k=hydra_speculate_k,
+        )
+    return _advance_scheduled_cohort_greedy(
+        t3,
+        cohort,
+        patched_model=patched_model,
+        alignment_controller=alignment_controller,
+    )

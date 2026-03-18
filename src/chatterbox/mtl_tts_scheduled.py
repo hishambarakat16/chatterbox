@@ -8,6 +8,7 @@ from safetensors.torch import load_file as load_safetensors
 from .models.s3gen import S3Gen
 from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
+from .models.t3.train import load_hydra_heads_from_checkpoint
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .mtl_tts import Conditionals, REPO_ID, SUPPORTED_LANGUAGES
@@ -32,6 +33,8 @@ class ChatterboxMultilingualScheduledTTS:
         device,
         *,
         enable_alignment_controller: bool = False,
+        hydra_checkpoint_dir: str | None = None,
+        hydra_speculate_k: int = 3,
     ) -> "ChatterboxMultilingualScheduledTTS":
         ckpt_dir = Path(ckpt_dir)
 
@@ -61,6 +64,14 @@ class ChatterboxMultilingualScheduledTTS:
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             default_conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
+        hydra_model = None
+        if hydra_checkpoint_dir:
+            hydra_model = load_hydra_heads_from_checkpoint(
+                base_t3=t3,
+                checkpoint_dir=hydra_checkpoint_dir,
+                freeze_base=True,
+            )
+
         worker = ChatterboxMultilingualScheduledWorker(
             t3=t3,
             s3gen=s3gen,
@@ -69,6 +80,8 @@ class ChatterboxMultilingualScheduledTTS:
             device=device,
             default_conds=default_conds,
             enable_alignment_controller=enable_alignment_controller,
+            hydra_model=hydra_model,
+            hydra_speculate_k=hydra_speculate_k,
         )
         return cls(worker)
 
@@ -78,6 +91,8 @@ class ChatterboxMultilingualScheduledTTS:
         device: torch.device,
         *,
         enable_alignment_controller: bool = False,
+        hydra_checkpoint_dir: str | None = None,
+        hydra_speculate_k: int = 3,
     ) -> "ChatterboxMultilingualScheduledTTS":
         if device == "mps" and not torch.backends.mps.is_available():
             device = "cpu"
@@ -102,6 +117,8 @@ class ChatterboxMultilingualScheduledTTS:
             ckpt_dir,
             device,
             enable_alignment_controller=enable_alignment_controller,
+            hydra_checkpoint_dir=hydra_checkpoint_dir,
+            hydra_speculate_k=hydra_speculate_k,
         )
 
     def create_session(
