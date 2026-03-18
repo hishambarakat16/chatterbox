@@ -31,7 +31,8 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         request_start = time.perf_counter()
-        profile = {
+        profile = dict(getattr(session, "profile", {}) or {})
+        profile.update({
             "text_prep_s": 0.0,
             "t3_first_token_s": 0.0,
             "t3_wait_s": 0.0,
@@ -40,7 +41,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
             "s3_s": 0.0,
             "audio_ready_s": 0.0,
             "watermark_s": 0.0,
-        }
+        })
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
         language_id = active_options.language_id
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -117,6 +118,7 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
                 speech_tokens=speech_tokens,
                 ref_dict=active_conds.gen,
             )
+            profile.update(self.s3gen.get_last_profile() or {})
             profile["s3_s"] = time.perf_counter() - s3_start
             profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()

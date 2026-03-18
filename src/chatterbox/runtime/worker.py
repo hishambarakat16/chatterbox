@@ -21,6 +21,11 @@ from .types import GenerationOptions
 shape_logger = logging.getLogger("chatterbox.shape")
 
 
+def _maybe_sync(device: str):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 class ChatterboxMultilingualStreamingWorker:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
@@ -50,12 +55,14 @@ class ChatterboxMultilingualStreamingWorker:
     def get_last_profile(self) -> dict:
         return getattr(self._profile_local, "last_profile", {})
 
-    def build_conditionals_from_wav(self, wav_fpath: str, exaggeration: float) -> Conditionals:
+    def build_conditionals_from_wav(self, wav_fpath: str, exaggeration: float) -> tuple[Conditionals, dict]:
+        conditioning_start = time.perf_counter()
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+        session_profile = dict(self.s3gen.get_last_profile() or {})
 
         t3_cond_prompt_tokens = None
         if plen := self.t3.hp.speech_cond_prompt_len:
@@ -71,7 +78,9 @@ class ChatterboxMultilingualStreamingWorker:
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
+        _maybe_sync(self.device)
         conds = Conditionals(t3_cond, s3gen_ref_dict)
+        session_profile["session_conditioning_s"] = time.perf_counter() - conditioning_start
         if os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"):
             shape_logger.info("[runtime/worker.py] build_conditionals_from_wav")
             shape_logger.info("  wav_fpath %s", wav_fpath)
@@ -87,7 +96,7 @@ class ChatterboxMultilingualStreamingWorker:
             shape_logger.info("  s3_ref.prompt_token %s %s %s", tuple(s3gen_ref_dict["prompt_token"].shape), s3gen_ref_dict["prompt_token"].dtype, s3gen_ref_dict["prompt_token"].device)
             shape_logger.info("  s3_ref.prompt_feat %s %s %s", tuple(s3gen_ref_dict["prompt_feat"].shape), s3gen_ref_dict["prompt_feat"].dtype, s3gen_ref_dict["prompt_feat"].device)
             shape_logger.info("  s3_ref.embedding %s %s %s", tuple(s3gen_ref_dict["embedding"].shape), s3gen_ref_dict["embedding"].dtype, s3gen_ref_dict["embedding"].device)
-        return conds
+        return conds, session_profile
 
     def create_session(
         self,
@@ -97,16 +106,17 @@ class ChatterboxMultilingualStreamingWorker:
         session_id: str | None = None,
     ) -> StreamingSession:
         options = options or GenerationOptions()
+        session_profile = {}
 
         if audio_prompt_path:
-            conds = self.build_conditionals_from_wav(audio_prompt_path, options.exaggeration)
+            conds, session_profile = self.build_conditionals_from_wav(audio_prompt_path, options.exaggeration)
         else:
             if self.default_conds is None:
                 raise AssertionError("Please provide `audio_prompt_path` or load a checkpoint with builtin conds.")
             conds = clone_conditionals(self.default_conds)
             conds = apply_exaggeration(conds, options.exaggeration, self.device)
 
-        session = StreamingSession(conditionals=conds, options=options)
+        session = StreamingSession(conditionals=conds, options=options, profile=session_profile)
         if session_id is not None:
             session.session_id = session_id
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -117,13 +127,14 @@ class ChatterboxMultilingualStreamingWorker:
 
     def generate(self, *, session: StreamingSession, text: str, options: GenerationOptions | None = None) -> torch.Tensor:
         request_start = time.perf_counter()
-        profile = {
+        profile = dict(getattr(session, "profile", {}) or {})
+        profile.update({
             "text_prep_s": 0.0,
             "t3_s": 0.0,
             "s3_s": 0.0,
             "audio_ready_s": 0.0,
             "watermark_s": 0.0,
-        }
+        })
         active_options = session.options if options is None else session.options.merged(**options.__dict__)
         language_id = active_options.language_id
         if os.getenv("CHATTERBOX_TRACE_SHAPES"):
@@ -181,6 +192,7 @@ class ChatterboxMultilingualStreamingWorker:
                 speech_tokens=speech_tokens,
                 ref_dict=active_conds.gen,
             )
+            profile.update(self.s3gen.get_last_profile() or {})
             profile["s3_s"] = time.perf_counter() - s3_start
             profile["audio_ready_s"] = time.perf_counter() - request_start
             wav = wav.squeeze(0).detach().cpu().numpy()

@@ -14,6 +14,8 @@
 
 import os
 import logging
+import threading
+import time
 
 import numpy as np
 import torch
@@ -45,6 +47,14 @@ def _should_trace_event(name: str) -> bool:
     occurrence = _TRACE_COUNTS.get(name, 0) + 1
     _TRACE_COUNTS[name] = occurrence
     return occurrence == 1
+
+
+def _maybe_sync(device):
+    device_type = getattr(device, "type", None)
+    if device_type is None and isinstance(device, str):
+        device_type = "cuda" if device.startswith("cuda") else None
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 def drop_invalid_tokens(x):
@@ -118,6 +128,13 @@ class S3Token2Mel(torch.nn.Module):
         )
 
         self.resamplers = {}
+        self._profile_local = threading.local()
+
+    def _set_last_profile(self, profile: dict):
+        self._profile_local.last_profile = profile
+
+    def get_last_profile(self) -> dict:
+        return getattr(self._profile_local, "last_profile", {})
 
     @property
     def device(self):
@@ -137,6 +154,8 @@ class S3Token2Mel(torch.nn.Module):
         ref_fade_out=True,
     ):
         device = self.device if device == "auto" else device
+        profile = {}
+        embed_start = time.perf_counter()
         if isinstance(ref_wav, np.ndarray):
             ref_wav = torch.from_numpy(ref_wav).float()
 
@@ -149,32 +168,43 @@ class S3Token2Mel(torch.nn.Module):
         if ref_wav.size(1) > 10 * ref_sr:
             print("WARNING: s3gen received ref longer than 10s")
 
+        mel_start = time.perf_counter()
         ref_wav_24 = ref_wav
         if ref_sr != S3GEN_SR:
             ref_wav_24 = get_resampler(ref_sr, S3GEN_SR, device)(ref_wav)
         ref_wav_24 = ref_wav_24.to(device=device, dtype=self.dtype)
 
         ref_mels_24 = self.mel_extractor(ref_wav_24).transpose(1, 2).to(dtype=self.dtype)
+        _maybe_sync(device)
+        profile["s3_ref_mel_s"] = time.perf_counter() - mel_start
         ref_mels_24_len = None
 
         # Resample to 16kHz
+        speaker_start = time.perf_counter()
         ref_wav_16 = ref_wav
         if ref_sr != S3_SR:
             ref_wav_16 = get_resampler(ref_sr, S3_SR, device)(ref_wav)
 
         # Speaker embedding
         ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=self.dtype))
+        _maybe_sync(device)
+        profile["s3_ref_speaker_s"] = time.perf_counter() - speaker_start
 
         # Tokenize 16khz reference
+        tokenize_start = time.perf_counter()
         ref_speech_tokens, ref_speech_token_lens = self.tokenizer(ref_wav_16.float())
+        _maybe_sync(device)
+        profile["s3_ref_tokenize_s"] = time.perf_counter() - tokenize_start
 
         # Make sure mel_len = 2 * stoken_len (happens when the input is not padded to multiple of 40ms)
+        align_start = time.perf_counter()
         if ref_mels_24.shape[1] != 2 * ref_speech_tokens.shape[1]:
             logging.warning(
                 "Reference mel length is not equal to 2 * reference token length.\n"
             )
             ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
             ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
+        profile["s3_ref_align_s"] = time.perf_counter() - align_start
 
         ref_dict = dict(
             prompt_token=ref_speech_tokens.to(device),
@@ -183,6 +213,9 @@ class S3Token2Mel(torch.nn.Module):
             prompt_feat_len=ref_mels_24_len,
             embedding=ref_x_vector,
         )
+        _maybe_sync(device)
+        profile["s3_ref_embed_s"] = time.perf_counter() - embed_start
+        self._set_last_profile(profile)
         if _trace_s3_enabled():
             shape_logger.info("[models/s3gen/s3gen.py] embed_ref")
             shape_logger.info("  prompt_token %s %s %s", tuple(ref_dict["prompt_token"].shape), ref_dict["prompt_token"].dtype, ref_dict["prompt_token"].device)
@@ -225,14 +258,22 @@ class S3Token2Mel(torch.nn.Module):
         assert (ref_wav is None) ^ (ref_dict is None), f"Must provide exactly one of ref_wav or ref_dict (got {ref_wav} and {ref_dict})"
 
         if ref_dict is None:
+            ref_prepare_start = time.perf_counter()
             ref_dict = self.embed_ref(ref_wav, ref_sr)
+            profile = dict(self.get_last_profile() or {})
+            _maybe_sync(self.device)
+            profile["s3_ref_prepare_s"] = time.perf_counter() - ref_prepare_start
         else:
+            profile = {}
             # type/device casting (all values will be numpy if it's from a prod API call)
+            ref_prepare_start = time.perf_counter()
             for rk in list(ref_dict):
                 if isinstance(ref_dict[rk], np.ndarray):
                     ref_dict[rk] = torch.from_numpy(ref_dict[rk])
                 if torch.is_tensor(ref_dict[rk]):
                     ref_dict[rk] = ref_dict[rk].to(device=self.device, dtype=self.dtype)
+            _maybe_sync(self.device)
+            profile["s3_ref_prepare_s"] = time.perf_counter() - ref_prepare_start
 
         speech_tokens = torch.atleast_2d(speech_tokens)
 
@@ -249,6 +290,7 @@ class S3Token2Mel(torch.nn.Module):
             shape_logger.info("  ref.prompt_token %s %s %s", tuple(ref_dict["prompt_token"].shape), ref_dict["prompt_token"].dtype, ref_dict["prompt_token"].device)
             shape_logger.info("  ref.prompt_feat %s %s %s", tuple(ref_dict["prompt_feat"].shape), ref_dict["prompt_feat"].dtype, ref_dict["prompt_feat"].device)
             shape_logger.info("  ref.embedding %s %s %s", tuple(ref_dict["embedding"].shape), ref_dict["embedding"].dtype, ref_dict["embedding"].device)
+        token2mel_start = time.perf_counter()
         output_mels, _ = self.flow.inference(
             token=speech_tokens,
             token_len=speech_token_lens,
@@ -258,6 +300,9 @@ class S3Token2Mel(torch.nn.Module):
             meanflow=self.meanflow,
             **ref_dict,
         )
+        _maybe_sync(self.device)
+        profile["s3_token2mel_s"] = time.perf_counter() - token2mel_start
+        self._set_last_profile(profile)
         if _trace_s3_enabled() and _should_trace_event("token2mel.output"):
             shape_logger.info("[models/s3gen/s3gen.py] token2mel.output")
             shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
@@ -357,13 +402,18 @@ class S3Token2Wav(S3Token2Mel):
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
+        profile = {}
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(device=self.device, dtype=self.dtype)
         if _trace_s3_enabled() and _should_trace_event("hift.input"):
             shape_logger.info("[models/s3gen/s3gen.py] hift.input")
             shape_logger.info("  speech_feat %s %s %s", tuple(speech_feat.shape), speech_feat.dtype, speech_feat.device)
             shape_logger.info("  cache_source %s %s %s", tuple(cache_source.shape), cache_source.dtype, cache_source.device)
+        hift_start = time.perf_counter()
         output_wavs, output_sources = self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        _maybe_sync(self.device)
+        profile["s3_hift_s"] = time.perf_counter() - hift_start
+        self._set_last_profile(profile)
         if _trace_s3_enabled() and _should_trace_event("hift.output"):
             shape_logger.info("[models/s3gen/s3gen.py] hift.output")
             shape_logger.info("  output_wavs %s %s %s", tuple(output_wavs.shape), output_wavs.dtype, output_wavs.device)
@@ -389,6 +439,7 @@ class S3Token2Wav(S3Token2Mel):
         # if drop_invalid_tokens:
         #     speech_tokens, speech_token_lens = drop_invalid(speech_tokens, pad=S3_QUIET_PAD)
 
+        inference_start = time.perf_counter()
         output_mels = self.flow_inference(
             speech_tokens,
             speech_token_lens=speech_token_lens,
@@ -398,11 +449,18 @@ class S3Token2Wav(S3Token2Mel):
             n_cfm_timesteps=n_cfm_timesteps,
             finalize=True,
         )
+        profile = dict(self.get_last_profile() or {})
         output_mels = output_mels.to(dtype=self.dtype) # FIXME (fp16 mode) is this still needed?
         output_wavs, output_sources = self.hift_inference(output_mels, None)
+        profile.update(self.get_last_profile() or {})
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
+        trim_start = time.perf_counter()
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+        _maybe_sync(self.device)
+        profile["s3_trim_s"] = time.perf_counter() - trim_start
+        profile["s3_inference_internal_s"] = time.perf_counter() - inference_start
+        self._set_last_profile(profile)
 
         if _trace_s3_enabled() and _should_trace_event("inference.output"):
             shape_logger.info("[models/s3gen/s3gen.py] inference.output")

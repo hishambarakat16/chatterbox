@@ -45,6 +45,7 @@ class StreamingSession:
     options: GenerationOptions = field(default_factory=GenerationOptions)
     session_id: str = field(default_factory=lambda: uuid4().hex)
     caches: StreamingCaches = field(default_factory=StreamingCaches)
+    profile: dict = field(default_factory=dict)
 
     def clone_conditionals(self) -> Conditionals:
         return clone_conditionals(self.conditionals)
