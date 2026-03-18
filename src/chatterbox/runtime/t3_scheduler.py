@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -15,6 +16,10 @@ from ..models.t3.inference.scheduled_decode import (
 
 
 shape_logger = logging.getLogger("chatterbox.shape")
+
+
+def _trace_t3_enabled() -> bool:
+    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
 
 
 @dataclass
@@ -137,7 +142,7 @@ class T3DecodeScheduler:
                 )
             )
 
-            if shape_logger.isEnabledFor(logging.INFO):
+            if _trace_t3_enabled():
                 shape_logger.info("[runtime/t3_scheduler.py] run_cohort")
                 shape_logger.info("  requests %s", len(decode_requests))
                 shape_logger.info("  batch_key %s", batch_key)
@@ -145,7 +150,7 @@ class T3DecodeScheduler:
                 shape_logger.info("  active_cohorts %s", len(self.active_cohorts))
 
     def _process_one_step(self, cohort: _ActiveScheduledCohort):
-        if shape_logger.isEnabledFor(logging.INFO):
+        if _trace_t3_enabled():
             shape_logger.info("[runtime/t3_scheduler.py] step_cohort")
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info("  active_requests %s", len(cohort.cohort_state.active_states))
@@ -195,7 +200,7 @@ class T3DecodeScheduler:
                 )
             )
 
-        if shape_logger.isEnabledFor(logging.INFO) and len(advance_result.successor_cohorts) > 1:
+        if _trace_t3_enabled() and len(advance_result.successor_cohorts) > 1:
             shape_logger.info("[runtime/t3_scheduler.py] split_cohort")
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info(
@@ -210,7 +215,7 @@ class T3DecodeScheduler:
         if advance_result.successor_cohorts:
             return
 
-        if shape_logger.isEnabledFor(logging.INFO):
+        if _trace_t3_enabled():
             shape_logger.info("[runtime/t3_scheduler.py] complete_cohort")
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info("  remaining_active_cohorts %s", len(self.active_cohorts))
