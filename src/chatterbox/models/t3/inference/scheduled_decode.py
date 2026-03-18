@@ -150,6 +150,29 @@ def _cfg_combine_rows(raw_logits: Tensor, cfg_weights: Tensor) -> Tensor:
     return cond + weights * (cond - uncond)
 
 
+def _kv_seq_len(past_key_values) -> int:
+    return int(past_key_values[0][0].shape[2])
+
+
+def _forward_raw_t3_batched(
+    t3,
+    *,
+    inputs_embeds: Tensor,
+    past_key_values=None,
+):
+    tfmr_out = t3.tfmr(
+        inputs_embeds=inputs_embeds,
+        past_key_values=past_key_values,
+        use_cache=True,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    hidden_states = tfmr_out.last_hidden_state
+    logits = t3.speech_head(hidden_states)
+    return logits, tfmr_out.past_key_values, hidden_states
+
+
 def _build_cfg_step_inputs_batch(t3, *, tokens: Tensor, start_pos: int) -> Tensor:
     assert tokens.dim() == 2, f"expected (B, K) tokens, got {tuple(tokens.shape)}"
     base_embed = t3.speech_emb(tokens)
@@ -552,28 +575,33 @@ def _verify_block_greedy_batched(
         tokens=proposed_tokens,
         start_pos=states[0].decode_step + 1,
     )
-    output = patched_model(
+    raw_block_logits, block_past, block_hidden = _forward_raw_t3_batched(
+        t3,
         inputs_embeds=block_inputs,
         past_key_values=_cat_past_key_values([state.past_key_values for state in states]),
-        use_cache=True,
-        output_attentions=False,
-        output_hidden_states=True,
-        return_dict=True,
     )
-    block_hidden = output.hidden_states[-1]
-    block_past_splits = _split_past_key_values(output.past_key_values, [2] * len(states))
+    block_past_splits = _split_past_key_values(block_past, [2] * len(states))
     cfg_weights = torch.tensor(
         [state.request.cfg_weight for state in states],
-        device=output.logits.device,
-        dtype=output.logits.dtype,
+        device=raw_block_logits.device,
+        dtype=raw_block_logits.dtype,
     )
-    cfg_block_logits = _cfg_combine_rows(output.logits, cfg_weights)
+    cfg_block_logits = _cfg_combine_rows(raw_block_logits, cfg_weights)
     if os.getenv("CHATTERBOX_TRACE_SHAPES"):
         shape_logger.info("[models/t3/inference/scheduled_decode.py] hydra.verify.batch")
         shape_logger.info("  requests %s", len(states))
         shape_logger.info("  proposed_tokens %s %s %s", tuple(proposed_tokens.shape), proposed_tokens.dtype, proposed_tokens.device)
         shape_logger.info("  block_inputs %s %s %s", tuple(block_inputs.shape), block_inputs.dtype, block_inputs.device)
+        shape_logger.info("  raw_block_logits %s %s %s", tuple(raw_block_logits.shape), raw_block_logits.dtype, raw_block_logits.device)
         shape_logger.info("  cfg_block_logits %s %s %s", tuple(cfg_block_logits.shape), cfg_block_logits.dtype, cfg_block_logits.device)
+        shape_logger.info("  block_kv_seq_len %s", _kv_seq_len(block_past))
+
+    expected_block_len = _kv_seq_len(states[0].past_key_values) + proposed_count
+    if _kv_seq_len(block_past) != expected_block_len:
+        raise RuntimeError(
+            f"Hydra scheduled verify KV length mismatch: got {_kv_seq_len(block_past)}, "
+            f"expected {expected_block_len}"
+        )
 
     verify_rows: list[_ScheduledVerifyRow] = []
     replay_groups: dict[int, list[int]] = {}
@@ -630,22 +658,25 @@ def _verify_block_greedy_batched(
             tokens=committed_batch,
             start_pos=group_states[0].decode_step + 1,
         )
-        replay_output = patched_model(
+        raw_replay_logits, replay_past, replay_hidden = _forward_raw_t3_batched(
+            t3,
             inputs_embeds=replay_inputs,
             past_key_values=_cat_past_key_values([state.past_key_values for state in group_states]),
-            use_cache=True,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
         )
-        replay_hidden = replay_output.hidden_states[-1]
-        replay_past_splits = _split_past_key_values(replay_output.past_key_values, [2] * len(group_states))
+        replay_past_splits = _split_past_key_values(replay_past, [2] * len(group_states))
         replay_cfg_weights = torch.tensor(
             [state.request.cfg_weight for state in group_states],
-            device=replay_output.logits.device,
-            dtype=replay_output.logits.dtype,
+            device=raw_replay_logits.device,
+            dtype=raw_replay_logits.dtype,
         )
-        replay_cfg_logits = _cfg_combine_rows(replay_output.logits, replay_cfg_weights)
+        replay_cfg_logits = _cfg_combine_rows(raw_replay_logits, replay_cfg_weights)
+
+        expected_replay_len = _kv_seq_len(group_states[0].past_key_values) + committed_len
+        if _kv_seq_len(replay_past) != expected_replay_len:
+            raise RuntimeError(
+                f"Hydra scheduled replay KV length mismatch: got {_kv_seq_len(replay_past)}, "
+                f"expected {expected_replay_len}"
+            )
 
         for local_index, verify_row in enumerate(group_rows):
             verify_row.next_logits = replay_cfg_logits[local_index : local_index + 1, -1, :]
