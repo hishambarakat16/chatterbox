@@ -10,6 +10,7 @@ import torchaudio as ta
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
 from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
+from chatterbox.mtl_tts_scheduled_turbo_s3 import ChatterboxMultilingualScheduledTurboS3TTS
 from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
 
 
@@ -26,6 +27,7 @@ def load_model(
     enable_alignment_controller: bool = False,
     hydra_checkpoint_dir: str | None = None,
     hydra_speculate_k: int = 3,
+    turbo_s3_checkpoint_dir: str | None = None,
 ):
     if impl == "baseline":
         model_cls = ChatterboxMultilingualTTS
@@ -33,6 +35,8 @@ def load_model(
         model_cls = ChatterboxMultilingualStreamingTTS
     elif impl == "concurrent":
         model_cls = ChatterboxMultilingualConcurrentTTS
+    elif impl == "scheduled_turbo_s3":
+        model_cls = ChatterboxMultilingualScheduledTurboS3TTS
     else:
         model_cls = ChatterboxMultilingualScheduledTTS
     if checkpoint_dir:
@@ -44,10 +48,27 @@ def load_model(
                 hydra_checkpoint_dir=hydra_checkpoint_dir,
                 hydra_speculate_k=hydra_speculate_k,
             )
+        if impl == "scheduled_turbo_s3":
+            return model_cls.from_local(
+                checkpoint_dir,
+                device,
+                turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
+                enable_alignment_controller=enable_alignment_controller,
+                hydra_checkpoint_dir=hydra_checkpoint_dir,
+                hydra_speculate_k=hydra_speculate_k,
+            )
         return model_cls.from_local(checkpoint_dir, device)
     if impl == "scheduled":
         return model_cls.from_pretrained(
             device,
+            enable_alignment_controller=enable_alignment_controller,
+            hydra_checkpoint_dir=hydra_checkpoint_dir,
+            hydra_speculate_k=hydra_speculate_k,
+        )
+    if impl == "scheduled_turbo_s3":
+        return model_cls.from_pretrained(
+            device,
+            turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             enable_alignment_controller=enable_alignment_controller,
             hydra_checkpoint_dir=hydra_checkpoint_dir,
             hydra_speculate_k=hydra_speculate_k,
@@ -82,7 +103,7 @@ def _call_with_supported_kwargs(fn, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare multilingual Chatterbox runtime variants.")
-    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled"], required=True)
+    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled", "scheduled_turbo_s3"], required=True)
     parser.add_argument("--text", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--audio-prompt-path")
@@ -91,6 +112,7 @@ def main():
     parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--hydra-checkpoint-dir")
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
+    parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--repetition-penalty", type=float, default=2.0)
@@ -113,11 +135,12 @@ def main():
         enable_alignment_controller=args.enable_alignment_controller,
         hydra_checkpoint_dir=args.hydra_checkpoint_dir,
         hydra_speculate_k=args.hydra_speculate_k,
+        turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
     )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
 
-    if args.impl in {"streaming", "concurrent", "scheduled"}:
+    if args.impl in {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3"}:
         session = model.create_session(
             audio_prompt_path=args.audio_prompt_path,
             language_id=args.language_id,
@@ -162,9 +185,11 @@ def main():
     print(f"impl={args.impl}")
     print(f"device={args.device}")
     print(f"load_s={load_s:.4f}")
-    if args.impl == "scheduled":
+    if args.impl in {"scheduled", "scheduled_turbo_s3"}:
         print(f"hydra_checkpoint_dir={args.hydra_checkpoint_dir}")
         print(f"hydra_speculate_k={args.hydra_speculate_k}")
+    if args.impl == "scheduled_turbo_s3":
+        print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
     print(f"cfg_weight={args.cfg_weight}")
     print(f"temperature={args.temperature}")
     print(f"repetition_penalty={args.repetition_penalty}")
