@@ -247,9 +247,6 @@ class S3Token2Mel(torch.nn.Module):
             meanflow=self.meanflow,
             **ref_dict,
         )
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
-            shape_logger.info("[models/s3gen/s3gen.py] token2mel.output")
-            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
         return output_mels
 
 
@@ -383,8 +380,4 @@ class S3Token2Wav(S3Token2Mel):
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
 
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
-            shape_logger.info("[models/s3gen/s3gen.py] inference.output")
-            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
-            shape_logger.info("  output_wavs %s %s %s", tuple(output_wavs.shape), output_wavs.dtype, output_wavs.device)
         return output_wavs, output_sources

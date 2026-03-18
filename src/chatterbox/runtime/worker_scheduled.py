@@ -113,8 +113,10 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
                 shape_logger.info("[runtime/worker_scheduled.py] generate.speech_tokens.raw")
                 shape_logger.info("  session_id %s", session.session_id)
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
+            filter_started = time.perf_counter()
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
+            profile["t3_filter_s"] = time.perf_counter() - filter_started
             if os.getenv("CHATTERBOX_TRACE_SHAPES"):
                 shape_logger.info("[runtime/worker_scheduled.py] generate.speech_tokens.filtered")
                 shape_logger.info("  session_id %s", session.session_id)
@@ -132,10 +134,6 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
             profile["watermark_s"] = time.perf_counter() - watermark_start
         self._set_last_profile(profile)
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
-            shape_logger.info("[runtime/worker_scheduled.py] generate.output")
-            shape_logger.info("  session_id %s", session.session_id)
-            shape_logger.info("  wav %s %s", watermarked_wav.shape, watermarked_wav.dtype)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
     def _apply_exaggeration_copy(self, conds, exaggeration: float):
