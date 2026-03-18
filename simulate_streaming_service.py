@@ -135,12 +135,15 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     t3_active_cohorts_at_admit = [request_metric(item, "t3_active_cohorts_at_admit") for item in ok if "t3_active_cohorts_at_admit" in item["profile"]]
     t3_text_lens = [int(request_metric(item, "t3_batch_text_len")) for item in ok if "t3_batch_text_len" in item["profile"]]
     t3_prompt_lens = [int(request_metric(item, "t3_batch_prompt_len")) for item in ok if "t3_batch_prompt_len" in item["profile"]]
+    t3_group_text_lens = [int(request_metric(item, "t3_group_text_len")) for item in ok if "t3_group_text_len" in item["profile"]]
+    t3_group_prompt_lens = [int(request_metric(item, "t3_group_prompt_len")) for item in ok if "t3_group_prompt_len" in item["profile"]]
     s3_total = [request_metric(item, "s3_s") for item in ok]
     s3_token2mel = [request_metric(item, "s3_token2mel_s") for item in ok]
     s3_hift = [request_metric(item, "s3_hift_s") for item in ok]
     num_samples = [int(item["num_samples"]) for item in ok if item["num_samples"] is not None]
     total_audio_s = sum(num_samples) / 24000.0 if num_samples else 0.0
     batch_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_text_lens, t3_prompt_lens)])
+    group_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_group_text_lens, t3_group_prompt_lens)])
     admission_cohort_hist = histogram(t3_cohort_sizes)
     singleton_fraction = 0.0 if not t3_cohort_sizes else (sum(1 for size in t3_cohort_sizes if size == 1) / len(t3_cohort_sizes))
 
@@ -170,6 +173,7 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
         "mean_t3_active_cohorts_at_admit": round(mean_or_zero(t3_active_cohorts_at_admit), 4),
         "admission_cohort_size_hist": admission_cohort_hist,
         "batch_key_hist": batch_key_hist,
+        "group_key_hist": group_key_hist,
         "singleton_request_fraction": round(float(singleton_fraction), 4),
         "mean_s3_s": round(mean_or_zero(s3_total), 4),
         "mean_s3_token2mel_s": round(mean_or_zero(s3_token2mel), 4),
@@ -240,6 +244,8 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `device`: `{report['device']}`")
     lines.append(f"- `language_id`: `{report['language_id']}`")
     lines.append(f"- `stagger_ms`: `{report['stagger_ms']}`")
+    lines.append(f"- `batching_window_ms`: `{report['batching_window_ms']}`")
+    lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
     lines.append(f"- `rounds_per_level`: `{report['rounds_per_level']}`")
     lines.append(f"- `warmup_runs`: `{report['warmup_runs']}`")
     lines.append("")
@@ -274,12 +280,13 @@ def write_markdown_report(path: Path, report: dict):
     lines.append("")
     lines.append("## Admission Forensics")
     lines.append("")
-    lines.append("| Concurrency | Mean active cohorts at admit | Singleton request fraction | Admission cohort size hist | Batch key hist |")
-    lines.append("|---|---:|---:|---|---|")
+    lines.append("| Concurrency | Mean active cohorts at admit | Singleton request fraction | Admission cohort size hist | Request key hist | Group key hist |")
+    lines.append("|---|---:|---:|---|---|---|")
     for summary in report["levels"]:
         lines.append(
             f"| `c{summary['concurrency']}` | `{summary['mean_t3_active_cohorts_at_admit']:.4f}` | "
-            f"`{summary['singleton_request_fraction']:.4f}` | `{summary['admission_cohort_size_hist']}` | `{summary['batch_key_hist']}` |"
+            f"`{summary['singleton_request_fraction']:.4f}` | `{summary['admission_cohort_size_hist']}` | "
+            f"`{summary['batch_key_hist']}` | `{summary['group_key_hist']}` |"
         )
     lines.append("")
     if report["saved_audio"]:
@@ -357,6 +364,8 @@ def main():
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--enable-alignment-controller", action="store_true")
+    parser.add_argument("--batching-window-ms", type=float, default=5.0)
+    parser.add_argument("--text-bucket-width", type=int, default=1)
     parser.add_argument("--audio-prompt-path", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--sentences-file")
@@ -387,6 +396,8 @@ def main():
         args.impl,
         args.device,
         args.checkpoint_dir,
+        batching_window_ms=args.batching_window_ms,
+        text_bucket_width=args.text_bucket_width,
         enable_alignment_controller=args.enable_alignment_controller,
         hydra_checkpoint_dir=args.hydra_checkpoint_dir,
         hydra_speculate_k=args.hydra_speculate_k,
@@ -400,6 +411,8 @@ def main():
     print(f"load_s={load_s:.4f}")
     print(f"warmup_runs={args.warmup_runs}")
     print(f"stagger_ms={args.stagger_ms}")
+    print(f"batching_window_ms={args.batching_window_ms}")
+    print(f"text_bucket_width={args.text_bucket_width}")
     print(f"rounds_per_level={args.rounds_per_level}")
     print(f"save_mode={args.save_mode}")
 
@@ -513,6 +526,7 @@ def main():
         print(f"singleton_request_fraction={summary['singleton_request_fraction']}")
         print(f"admission_cohort_size_hist={summary['admission_cohort_size_hist']}")
         print(f"batch_key_hist={summary['batch_key_hist']}")
+        print(f"group_key_hist={summary['group_key_hist']}")
         print(f"mean_s3_s={summary['mean_s3_s']}")
         print(f"mean_s3_token2mel_s={summary['mean_s3_token2mel_s']}")
         print(f"errors={summary['errors']}")
@@ -529,6 +543,7 @@ def main():
                     f"'arrival_offset_s': {item['arrival_offset_s']}, "
                     f"'text': {item['text']!r}, "
                     f"'batch_key': ({int(profile.get('t3_batch_text_len', 0))}, {int(profile.get('t3_batch_prompt_len', 0))}), "
+                    f"'group_key': ({int(profile.get('t3_group_text_len', 0))}, {int(profile.get('t3_group_prompt_len', 0))}), "
                     f"'admission_cohort_size': {int(profile.get('t3_admission_cohort_size', 0))}, "
                     f"'active_cohorts_at_admit': {float(profile.get('t3_active_cohorts_at_admit', 0.0)):.4f}, "
                     f"'t3_wait_s': {float(profile.get('t3_wait_s', 0.0)):.4f}, "
@@ -556,6 +571,8 @@ def main():
         "warmup_text": warmup_text,
         "rounds_per_level": args.rounds_per_level,
         "stagger_ms": args.stagger_ms,
+        "batching_window_ms": args.batching_window_ms,
+        "text_bucket_width": args.text_bucket_width,
         "save_mode": args.save_mode,
         "levels": sanitize_level_summaries(level_summaries),
         "saved_audio": saved_audio,

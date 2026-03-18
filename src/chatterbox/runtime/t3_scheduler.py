@@ -56,12 +56,14 @@ class T3DecodeScheduler:
         t3,
         *,
         batching_window_ms: float = 5.0,
+        text_bucket_width: int = 1,
         enable_alignment_controller: bool = False,
         hydra_model=None,
         hydra_speculate_k: int = 3,
     ):
         self.t3 = t3
         self.batching_window_ms = batching_window_ms
+        self.text_bucket_width = max(1, int(text_bucket_width))
         self.condition = threading.Condition()
         self.pending: list[_PendingScheduledRequest] = []
         self.active_cohorts: deque[_ActiveScheduledCohort] = deque()
@@ -123,24 +125,71 @@ class T3DecodeScheduler:
             self.pending = []
             return pending
 
+    def _group_pending_items(
+        self,
+        pending_items: list[_PendingScheduledRequest],
+    ) -> list[tuple[tuple[int, int], list[_PendingScheduledRequest]]]:
+        if not pending_items:
+            return []
+
+        grouped_by_prompt: dict[int, list[_PendingScheduledRequest]] = {}
+        for item in pending_items:
+            _, prompt_len = item.decode_request.batch_key()
+            grouped_by_prompt.setdefault(prompt_len, []).append(item)
+
+        grouped: list[tuple[tuple[int, int], list[_PendingScheduledRequest]]] = []
+        for prompt_len, items in sorted(grouped_by_prompt.items(), key=lambda item: item[0]):
+            ordered = sorted(items, key=lambda item: item.decode_request.batch_key()[0])
+            current_items: list[_PendingScheduledRequest] = []
+            current_min = 0
+            current_max = 0
+            for item in ordered:
+                text_len, _ = item.decode_request.batch_key()
+                if not current_items:
+                    current_items = [item]
+                    current_min = text_len
+                    current_max = text_len
+                    continue
+
+                next_min = min(current_min, text_len)
+                next_max = max(current_max, text_len)
+                if (next_max - next_min) >= self.text_bucket_width:
+                    grouped.append(((current_max, prompt_len), current_items))
+                    current_items = [item]
+                    current_min = text_len
+                    current_max = text_len
+                    continue
+
+                current_items.append(item)
+                current_min = next_min
+                current_max = next_max
+
+            if current_items:
+                grouped.append(((current_max, prompt_len), current_items))
+
+        return grouped
+
     def _activate_pending(self, pending_items: list[_PendingScheduledRequest]):
         if not pending_items:
             return
 
-        grouped: dict[tuple[int, int], list[_PendingScheduledRequest]] = {}
-        for item in pending_items:
-            grouped.setdefault(item.decode_request.batch_key(), []).append(item)
-
-        for batch_key, items in grouped.items():
+        for group_key, items in self._group_pending_items(pending_items):
             active_cohorts_at_admit = len(self.active_cohorts)
             decode_requests = [item.decode_request for item in items]
-            cohort_state = prepare_scheduled_cohort(self.t3, decode_requests)
+            cohort_state = prepare_scheduled_cohort(
+                self.t3,
+                decode_requests,
+                padded_text_len=group_key[0],
+            )
             pending_by_session = {item.decode_request.session_id: item for item in items}
             cohort_size = len(items)
             for item in items:
+                request_batch_key = item.decode_request.batch_key()
                 item.metrics.update({
-                    "t3_batch_text_len": float(batch_key[0]),
-                    "t3_batch_prompt_len": float(batch_key[1]),
+                    "t3_batch_text_len": float(request_batch_key[0]),
+                    "t3_batch_prompt_len": float(request_batch_key[1]),
+                    "t3_group_text_len": float(group_key[0]),
+                    "t3_group_prompt_len": float(group_key[1]),
                     "t3_admission_cohort_size": float(cohort_size),
                     "t3_active_cohorts_at_admit": float(active_cohorts_at_admit),
                     "t3_admission_singleton": 1.0 if cohort_size == 1 else 0.0,
@@ -155,7 +204,7 @@ class T3DecodeScheduler:
             if _trace_t3_enabled():
                 shape_logger.info("[runtime/t3_scheduler.py] run_cohort")
                 shape_logger.info("  requests %s", len(decode_requests))
-                shape_logger.info("  batch_key %s", batch_key)
+                shape_logger.info("  batch_key %s", group_key)
                 shape_logger.info("  sessions %s", [request.session_id for request in decode_requests])
                 shape_logger.info("  active_cohorts %s", len(self.active_cohorts))
 

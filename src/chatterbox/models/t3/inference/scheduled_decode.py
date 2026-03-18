@@ -247,10 +247,29 @@ def _speculative_metrics_from_state(state: _ActiveDecodeState) -> dict[str, floa
     return metrics
 
 
-def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDecodeState, Tensor]:
+def _pad_text_tokens(t3, text_tokens: Tensor, padded_len: int) -> Tensor:
+    if int(text_tokens.shape[-1]) >= padded_len:
+        return text_tokens
+    pad_len = padded_len - int(text_tokens.shape[-1])
+    return torch.nn.functional.pad(
+        text_tokens,
+        (0, pad_len),
+        value=t3.hp.stop_text_token,
+    )
+
+
+def _build_initial_state(
+    t3,
+    request: ScheduledDecodeRequest,
+    *,
+    padded_text_len: int | None = None,
+) -> tuple[_ActiveDecodeState, Tensor]:
     build_started = time.perf_counter()
     _ensure_bot_eot(request.text_tokens, t3.hp)
     text_tokens = torch.atleast_2d(request.text_tokens).to(dtype=torch.long, device=t3.device)
+    true_text_len = int(text_tokens.shape[-1])
+    if padded_text_len is not None:
+        text_tokens = _pad_text_tokens(t3, text_tokens, padded_text_len)
     initial_speech_tokens = t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
 
     embeds, len_cond = t3.prepare_input_embeds(
@@ -291,7 +310,7 @@ def _build_initial_state(t3, request: ScheduledDecodeRequest) -> tuple[_ActiveDe
     alignment_state = None
     if t3.hp.is_multilingual:
         alignment_state = ScheduledAlignmentState.create(
-            text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+            text_tokens_slice=(len_cond, len_cond + true_text_len),
             eos_idx=t3.hp.stop_speech_token,
             device=embeds.device,
         )
@@ -319,23 +338,35 @@ def build_scheduled_runtime_components(t3, *, enable_alignment_controller: bool 
     return patched_model, alignment_controller
 
 
-def prepare_scheduled_cohort(t3, requests: list[ScheduledDecodeRequest]) -> ScheduledDecodeCohort:
+def prepare_scheduled_cohort(
+    t3,
+    requests: list[ScheduledDecodeRequest],
+    *,
+    padded_text_len: int | None = None,
+) -> ScheduledDecodeCohort:
     if not requests:
         raise ValueError("scheduled cohort requires at least one request")
 
-    batch_keys = {request.batch_key() for request in requests}
-    if len(batch_keys) != 1:
-        raise ValueError("scheduled cohort currently requires matching text/prompt lengths")
+    prompt_lens = {request.batch_key()[1] for request in requests}
+    if len(prompt_lens) != 1:
+        raise ValueError("scheduled cohort currently requires matching prompt lengths")
+
+    if padded_text_len is None:
+        padded_text_len = max(request.batch_key()[0] for request in requests)
 
     active_states: list[_ActiveDecodeState] = []
     prefill_inputs = []
     for request in requests:
-        state, inputs_embeds = _build_initial_state(t3, request)
+        state, inputs_embeds = _build_initial_state(
+            t3,
+            request,
+            padded_text_len=padded_text_len,
+        )
         active_states.append(state)
         prefill_inputs.append(inputs_embeds)
 
     return ScheduledDecodeCohort(
-        batch_key=requests[0].batch_key(),
+        batch_key=(padded_text_len, next(iter(prompt_lens))),
         active_states=active_states,
         prefill_inputs=prefill_inputs,
     )

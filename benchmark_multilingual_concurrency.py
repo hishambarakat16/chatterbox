@@ -34,6 +34,8 @@ def load_model(
     device: str,
     checkpoint_dir: str | None,
     *,
+    batching_window_ms: float = 5.0,
+    text_bucket_width: int = 1,
     enable_alignment_controller: bool = False,
     hydra_checkpoint_dir: str | None = None,
     hydra_speculate_k: int = 3,
@@ -54,6 +56,8 @@ def load_model(
             return model_cls.from_local(
                 checkpoint_dir,
                 device,
+                batching_window_ms=batching_window_ms,
+                text_bucket_width=text_bucket_width,
                 enable_alignment_controller=enable_alignment_controller,
                 hydra_checkpoint_dir=hydra_checkpoint_dir,
                 hydra_speculate_k=hydra_speculate_k,
@@ -63,6 +67,8 @@ def load_model(
                 checkpoint_dir,
                 device,
                 turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
+                batching_window_ms=batching_window_ms,
+                text_bucket_width=text_bucket_width,
                 enable_alignment_controller=enable_alignment_controller,
                 hydra_checkpoint_dir=hydra_checkpoint_dir,
                 hydra_speculate_k=hydra_speculate_k,
@@ -71,6 +77,8 @@ def load_model(
     if impl == "scheduled":
         return model_cls.from_pretrained(
             device,
+            batching_window_ms=batching_window_ms,
+            text_bucket_width=text_bucket_width,
             enable_alignment_controller=enable_alignment_controller,
             hydra_checkpoint_dir=hydra_checkpoint_dir,
             hydra_speculate_k=hydra_speculate_k,
@@ -79,6 +87,8 @@ def load_model(
         return model_cls.from_pretrained(
             device,
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
+            batching_window_ms=batching_window_ms,
+            text_bucket_width=text_bucket_width,
             enable_alignment_controller=enable_alignment_controller,
             hydra_checkpoint_dir=hydra_checkpoint_dir,
             hydra_speculate_k=hydra_speculate_k,
@@ -368,6 +378,8 @@ def main():
     parser.add_argument("--checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
     parser.add_argument("--enable-alignment-controller", action="store_true")
+    parser.add_argument("--batching-window-ms", type=float, default=5.0)
+    parser.add_argument("--text-bucket-width", type=int, default=1)
     parser.add_argument("--hydra-checkpoint-dir")
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
     parser.add_argument("--turbo-s3-checkpoint-dir")
@@ -389,6 +401,8 @@ def main():
         args.impl,
         args.device,
         args.checkpoint_dir,
+        batching_window_ms=args.batching_window_ms,
+        text_bucket_width=args.text_bucket_width,
         enable_alignment_controller=args.enable_alignment_controller,
         hydra_checkpoint_dir=args.hydra_checkpoint_dir,
         hydra_speculate_k=args.hydra_speculate_k,
@@ -403,6 +417,8 @@ def main():
     if args.impl in {"scheduled", "scheduled_turbo_s3"}:
         print(f"hydra_checkpoint_dir={args.hydra_checkpoint_dir}")
         print(f"hydra_speculate_k={args.hydra_speculate_k}")
+        print(f"batching_window_ms={args.batching_window_ms}")
+        print(f"text_bucket_width={args.text_bucket_width}")
     if args.impl == "scheduled_turbo_s3":
         print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
     print(f"cfg_weight={args.cfg_weight}")

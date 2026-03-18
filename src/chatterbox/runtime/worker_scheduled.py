@@ -30,6 +30,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         self,
         *args,
         batching_window_ms: float = 5.0,
+        text_bucket_width: int = 1,
         enable_alignment_controller: bool = False,
         hydra_model=None,
         hydra_speculate_k: int = 3,
@@ -39,6 +40,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
         self.t3_scheduler = T3DecodeScheduler(
             self.t3,
             batching_window_ms=batching_window_ms,
+            text_bucket_width=text_bucket_width,
             enable_alignment_controller=enable_alignment_controller,
             hydra_model=hydra_model,
             hydra_speculate_k=hydra_speculate_k,
