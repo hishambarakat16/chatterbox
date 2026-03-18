@@ -55,6 +55,21 @@ class ChatterboxMultilingualStreamingWorker:
     def get_last_profile(self) -> dict:
         return getattr(self._profile_local, "last_profile", {})
 
+    def _default_s3_profile(self) -> dict:
+        return {
+            "session_conditioning_s": 0.0,
+            "s3_ref_mel_s": 0.0,
+            "s3_ref_speaker_s": 0.0,
+            "s3_ref_tokenize_s": 0.0,
+            "s3_ref_align_s": 0.0,
+            "s3_ref_embed_s": 0.0,
+            "s3_ref_prepare_s": 0.0,
+            "s3_token2mel_s": 0.0,
+            "s3_hift_s": 0.0,
+            "s3_trim_s": 0.0,
+            "s3_inference_internal_s": 0.0,
+        }
+
     def build_conditionals_from_wav(self, wav_fpath: str, exaggeration: float) -> tuple[Conditionals, dict]:
         conditioning_start = time.perf_counter()
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
@@ -128,6 +143,8 @@ class ChatterboxMultilingualStreamingWorker:
     def generate(self, *, session: StreamingSession, text: str, options: GenerationOptions | None = None) -> torch.Tensor:
         request_start = time.perf_counter()
         profile = dict(getattr(session, "profile", {}) or {})
+        profile.update(self._default_s3_profile())
+        profile.update(getattr(session, "profile", {}) or {})
         profile.update({
             "text_prep_s": 0.0,
             "t3_s": 0.0,

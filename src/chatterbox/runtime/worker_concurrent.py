@@ -32,6 +32,8 @@ class ChatterboxMultilingualConcurrentWorker(ChatterboxMultilingualStreamingWork
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         request_start = time.perf_counter()
         profile = dict(getattr(session, "profile", {}) or {})
+        profile.update(self._default_s3_profile())
+        profile.update(getattr(session, "profile", {}) or {})
         profile.update({
             "text_prep_s": 0.0,
             "t3_first_token_s": 0.0,
