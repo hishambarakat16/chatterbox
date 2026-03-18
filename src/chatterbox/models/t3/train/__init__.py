@@ -9,6 +9,16 @@ from .medusa_distill import (
     load_multilingual_t3,
     save_medusa_checkpoint,
 )
+from .hydra_distill import (
+    T3HydraDistillDataset,
+    T3HydraHeadModel,
+    collate_t3_hydra_batch,
+    create_t3_hydra_model,
+    describe_hydra_hidden_file,
+    describe_hydra_record,
+    load_hydra_heads_from_checkpoint,
+    save_hydra_checkpoint,
+)
 
 __all__ = [
     "T3MedusaDistillDataset",
@@ -20,4 +30,12 @@ __all__ = [
     "load_medusa_heads_from_checkpoint",
     "load_multilingual_t3",
     "save_medusa_checkpoint",
+    "T3HydraDistillDataset",
+    "T3HydraHeadModel",
+    "collate_t3_hydra_batch",
+    "create_t3_hydra_model",
+    "describe_hydra_hidden_file",
+    "describe_hydra_record",
+    "load_hydra_heads_from_checkpoint",
+    "save_hydra_checkpoint",
 ]
