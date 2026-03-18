@@ -567,6 +567,10 @@ def load_hydra_heads_from_checkpoint(
     with (checkpoint_dir / "t3_hydra_config.json").open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
+    model_device = getattr(base_t3, "device", None)
+    if model_device is None:
+        model_device = next(base_t3.parameters()).device
+
     model = T3HydraHeadModel(
         base_t3,
         hydra_num_heads=int(config["hydra_num_heads"]),
@@ -574,7 +578,7 @@ def load_hydra_heads_from_checkpoint(
         freeze_base=freeze_base,
         grounded_heads=bool(config.get("grounded_heads", True)),
         dropout_rate=float(config.get("dropout_rate", 0.0)),
-    )
+    ).to(model_device)
     state_dict = load_safetensors(checkpoint_dir / "t3_hydra_heads.safetensors")
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if unexpected:
@@ -583,4 +587,5 @@ def load_hydra_heads_from_checkpoint(
     remaining_missing = [key for key in missing if key not in allowed_missing]
     if remaining_missing:
         raise ValueError(f"Missing Hydra checkpoint keys: {remaining_missing}")
+    model.eval()
     return model
