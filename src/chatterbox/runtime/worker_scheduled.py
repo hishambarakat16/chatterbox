@@ -15,6 +15,10 @@ from .worker import ChatterboxMultilingualStreamingWorker
 shape_logger = logging.getLogger("chatterbox.shape")
 
 
+def _trace_s3_enabled() -> bool:
+    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"))
+
+
 class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorker):
     """
     Scheduler-driven T3 worker.
@@ -109,7 +113,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             speech_tokens, scheduler_metrics = self.t3_scheduler.submit(decode_request)
             profile.update(scheduler_metrics)
             speech_tokens = speech_tokens[0]
-            if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            if _trace_s3_enabled():
                 shape_logger.info("[runtime/worker_scheduled.py] generate.speech_tokens.raw")
                 shape_logger.info("  session_id %s", session.session_id)
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
@@ -117,7 +121,7 @@ class ChatterboxMultilingualScheduledWorker(ChatterboxMultilingualStreamingWorke
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
             profile["t3_filter_s"] = time.perf_counter() - filter_started
-            if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            if _trace_s3_enabled():
                 shape_logger.info("[runtime/worker_scheduled.py] generate.speech_tokens.filtered")
                 shape_logger.info("  session_id %s", session.session_id)
                 shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)

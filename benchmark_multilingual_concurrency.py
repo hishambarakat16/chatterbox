@@ -65,12 +65,22 @@ def load_model(
     return model_cls.from_pretrained(device)
 
 
-def configure_shape_logging(enabled: bool):
-    if not enabled:
+def configure_shape_logging(enabled: bool, *, trace_s3_shapes: bool = False):
+    if not enabled and not trace_s3_shapes:
         os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
+        os.environ.pop("CHATTERBOX_TRACE_S3_SHAPES", None)
         return
 
-    os.environ["CHATTERBOX_TRACE_SHAPES"] = "1"
+    if enabled:
+        os.environ["CHATTERBOX_TRACE_SHAPES"] = "1"
+    else:
+        os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
+
+    if trace_s3_shapes:
+        os.environ["CHATTERBOX_TRACE_S3_SHAPES"] = "1"
+    else:
+        os.environ.pop("CHATTERBOX_TRACE_S3_SHAPES", None)
+
     logger = logging.getLogger("chatterbox.shape")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -346,10 +356,11 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=1000)
     parser.add_argument("--trace-shapes", action="store_true")
+    parser.add_argument("--trace-s3-shapes", action="store_true")
     parser.add_argument("--output-dir")
     args = parser.parse_args()
 
-    configure_shape_logging(args.trace_shapes)
+    configure_shape_logging(args.trace_shapes, trace_s3_shapes=args.trace_s3_shapes)
 
     load_start = time.perf_counter()
     model = load_model(

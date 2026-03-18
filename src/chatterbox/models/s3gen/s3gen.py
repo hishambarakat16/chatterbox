@@ -34,6 +34,17 @@ from .decoder import ConditionalDecoder
 from .configs import CFM_PARAMS
 
 shape_logger = logging.getLogger("chatterbox.shape")
+_TRACE_COUNTS: dict[str, int] = {}
+
+
+def _trace_s3_enabled() -> bool:
+    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"))
+
+
+def _should_trace_event(name: str) -> bool:
+    occurrence = _TRACE_COUNTS.get(name, 0) + 1
+    _TRACE_COUNTS[name] = occurrence
+    return occurrence == 1
 
 
 def drop_invalid_tokens(x):
@@ -172,7 +183,7 @@ class S3Token2Mel(torch.nn.Module):
             prompt_feat_len=ref_mels_24_len,
             embedding=ref_x_vector,
         )
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        if _trace_s3_enabled():
             shape_logger.info("[models/s3gen/s3gen.py] embed_ref")
             shape_logger.info("  prompt_token %s %s %s", tuple(ref_dict["prompt_token"].shape), ref_dict["prompt_token"].dtype, ref_dict["prompt_token"].device)
             shape_logger.info("  prompt_token_len %s %s %s", tuple(ref_dict["prompt_token_len"].shape), ref_dict["prompt_token_len"].dtype, ref_dict["prompt_token_len"].device)
@@ -229,7 +240,7 @@ class S3Token2Mel(torch.nn.Module):
         if speech_token_lens is None:
             speech_token_lens = torch.LongTensor([st.size(-1) for st in speech_tokens]).to(self.device)
 
-        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+        if _trace_s3_enabled():
             shape_logger.info("[models/s3gen/s3gen.py] token2mel.input")
             shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
             shape_logger.info("  speech_token_lens %s %s %s", tuple(speech_token_lens.shape), speech_token_lens.dtype, speech_token_lens.device)
@@ -247,6 +258,9 @@ class S3Token2Mel(torch.nn.Module):
             meanflow=self.meanflow,
             **ref_dict,
         )
+        if _trace_s3_enabled() and _should_trace_event("token2mel.output"):
+            shape_logger.info("[models/s3gen/s3gen.py] token2mel.output")
+            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
         return output_mels
 
 
@@ -345,7 +359,17 @@ class S3Token2Wav(S3Token2Mel):
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
         if cache_source is None:
             cache_source = torch.zeros(1, 1, 0).to(device=self.device, dtype=self.dtype)
-        return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        if _trace_s3_enabled() and _should_trace_event("hift.input"):
+            shape_logger.info("[models/s3gen/s3gen.py] hift.input")
+            shape_logger.info("  speech_feat %s %s %s", tuple(speech_feat.shape), speech_feat.dtype, speech_feat.device)
+            shape_logger.info("  cache_source %s %s %s", tuple(cache_source.shape), cache_source.dtype, cache_source.device)
+        output_wavs, output_sources = self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+        if _trace_s3_enabled() and _should_trace_event("hift.output"):
+            shape_logger.info("[models/s3gen/s3gen.py] hift.output")
+            shape_logger.info("  output_wavs %s %s %s", tuple(output_wavs.shape), output_wavs.dtype, output_wavs.device)
+            if output_sources is not None:
+                shape_logger.info("  output_sources %s %s %s", tuple(output_sources.shape), output_sources.dtype, output_sources.device)
+        return output_wavs, output_sources
 
     @torch.inference_mode()
     def inference(
@@ -379,5 +403,10 @@ class S3Token2Wav(S3Token2Mel):
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+
+        if _trace_s3_enabled() and _should_trace_event("inference.output"):
+            shape_logger.info("[models/s3gen/s3gen.py] inference.output")
+            shape_logger.info("  output_mels %s %s %s", tuple(output_mels.shape), output_mels.dtype, output_mels.device)
+            shape_logger.info("  output_wavs %s %s %s", tuple(output_wavs.shape), output_wavs.dtype, output_wavs.device)
 
         return output_wavs, output_sources
