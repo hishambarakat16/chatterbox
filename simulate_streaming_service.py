@@ -468,6 +468,8 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `stagger_ms`: `{report['stagger_ms']}`")
     lines.append(f"- `batching_window_ms`: `{report['batching_window_ms']}`")
     lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
+    if report["impl"] == "vllm_turbo_s3":
+        lines.append(f"- `vllm_enforce_eager`: `{report.get('vllm_enforce_eager', False)}`")
     lines.append(f"- `rounds_per_level`: `{report['rounds_per_level']}`")
     lines.append(f"- `warmup_runs`: `{report['warmup_runs']}`")
     lines.append("")
@@ -592,6 +594,7 @@ def main():
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
+    parser.add_argument("--allow-vllm-compiled-service-sim", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
@@ -624,6 +627,9 @@ def main():
     warmup_text = args.warmup_text or sentences[0]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    effective_vllm_enforce_eager = args.vllm_enforce_eager
+    if args.impl == "vllm_turbo_s3" and not args.allow_vllm_compiled_service_sim:
+        effective_vllm_enforce_eager = True
 
     model = None
     try:
@@ -644,7 +650,7 @@ def main():
             vllm_prompt_builder_device=args.vllm_prompt_builder_device,
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            vllm_enforce_eager=args.vllm_enforce_eager,
+            vllm_enforce_eager=effective_vllm_enforce_eager,
             vllm_dtype=args.vllm_dtype,
             vllm_max_model_len=args.vllm_max_model_len,
             vllm_enable_prefix_caching=(
@@ -662,6 +668,9 @@ def main():
             print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_max_model_len={args.vllm_max_model_len}")
+            print(f"vllm_enforce_eager={effective_vllm_enforce_eager}")
+            if effective_vllm_enforce_eager and not args.vllm_enforce_eager:
+                print("vllm_enforce_eager_reason=mixed_shape_service_sim_default")
             print(
                 "vllm_enable_prefix_caching="
                 f"{args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
@@ -861,6 +870,7 @@ def main():
             "stagger_ms": args.stagger_ms,
             "batching_window_ms": args.batching_window_ms,
             "text_bucket_width": args.text_bucket_width,
+            "vllm_enforce_eager": effective_vllm_enforce_eager,
             "save_mode": args.save_mode,
             "levels": sanitize_level_summaries(level_summaries),
             "saved_audio": saved_audio,
