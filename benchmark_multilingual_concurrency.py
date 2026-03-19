@@ -341,6 +341,101 @@ def run_concurrency_level(
     else:
         sessions = [None] * concurrency
 
+    if impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
+        started = time.perf_counter()
+        errors = []
+        try:
+            batched_results = model.generate_many_with_sessions(
+                sessions,
+                [text] * concurrency,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+            )
+            maybe_sync(device)
+        except Exception as exc:  # noqa: BLE001
+            batched_results = []
+            errors = [repr(exc)] * concurrency
+            maybe_sync(device)
+        wall_s = time.perf_counter() - started
+
+        results = []
+        if errors:
+            results = [
+                {
+                    "latency_s": wall_s,
+                    "num_samples": None,
+                    "error": error,
+                    "wav": None,
+                    "profile": {},
+                }
+                for error in errors
+            ]
+        else:
+            for item in batched_results:
+                wav = item["wav"]
+                profile = item["profile"]
+                results.append(
+                    {
+                        "latency_s": float(profile.get("audio_ready_s", wall_s)),
+                        "num_samples": None if wav is None else int(wav.shape[-1]),
+                        "error": None,
+                        "wav": wav,
+                        "profile": profile,
+                    }
+                )
+
+        saved_wavs = []
+        if output_dir:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            for index, item in enumerate(results):
+                wav = item["wav"]
+                if wav is None or item["error"] is not None:
+                    continue
+                wav_path = output_path / f"{impl}_c{concurrency}_r{index}.wav"
+                ta.save(str(wav_path), wav, model.sr)
+                saved_wavs.append(str(wav_path))
+
+        latencies = [item["latency_s"] for item in results if item["error"] is None]
+        sample_counts = [item["num_samples"] for item in results if item["num_samples"] is not None]
+        total_audio_s = sum(sample_counts) / 24000.0 if sample_counts else 0.0
+        vram_summary = finish_vram_measurement(device, vram_state)
+        profile_keys = sorted(
+            {
+                key
+                for item in results
+                for key in item.get("profile", {}).keys()
+            }
+        )
+        profile_summary = {}
+        for key in profile_keys:
+            values = [item["profile"].get(key) for item in results if item["error"] is None and key in item.get("profile", {})]
+            if not values:
+                continue
+            rounded_values = [round(float(value), 4) for value in values]
+            profile_summary[f"stage_{key}"] = rounded_values
+            profile_summary[f"stage_{key}_mean"] = round(statistics.mean(values), 4)
+
+        summary = {
+            "concurrency": concurrency,
+            "wall_s": wall_s,
+            "request_latencies_s": [round(item["latency_s"], 4) for item in results],
+            "mean_latency_s": round(statistics.mean(latencies), 4) if latencies else None,
+            "p95_latency_s": round(percentile(latencies, 0.95), 4) if latencies else None,
+            "num_samples": sample_counts,
+            "audio_seconds_total": round(total_audio_s, 4),
+            "audio_seconds_per_second": round(total_audio_s / wall_s, 4) if wall_s > 0 else None,
+            "errors": [item["error"] for item in results if item["error"] is not None],
+            "saved_wavs": saved_wavs,
+        }
+        summary.update(vram_summary)
+        summary.update(profile_summary)
+        return summary
+
     barrier = threading.Barrier(concurrency)
     results = [None] * concurrency
 

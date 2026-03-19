@@ -297,5 +297,38 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             max_new_tokens=max_new_tokens,
         )
 
+    def generate_many_with_sessions(
+        self,
+        sessions: list[StreamingSession],
+        texts: list[str],
+        *,
+        language_id=None,
+        exaggeration=None,
+        cfg_weight=None,
+        temperature=None,
+        repetition_penalty=None,
+        min_p=None,
+        top_p=None,
+        max_new_tokens=None,
+    ) -> list[dict]:
+        options_list = [
+            session.options.merged(
+                language_id=language_id,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+            )
+            for session in sessions
+        ]
+        return self.worker.generate_many(
+            sessions=sessions,
+            texts=texts,
+            options_list=options_list,
+        )
+
     def get_last_profile(self) -> dict:
         return self.worker.get_last_profile()
