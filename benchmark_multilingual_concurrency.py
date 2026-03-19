@@ -71,6 +71,7 @@ def load_model(
     vllm_dtype: str = "auto",
     vllm_max_model_len: int = 2048,
     vllm_enable_prefix_caching: bool = False,
+    vllm_enable_chunked_prefill: bool = True,
     vllm_export_copy: bool = False,
 ):
     model_cls = resolve_model_cls(impl)
@@ -111,6 +112,7 @@ def load_model(
                 vllm_dtype=vllm_dtype,
                 vllm_max_model_len=vllm_max_model_len,
                 vllm_enable_prefix_caching=vllm_enable_prefix_caching,
+                vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
                 vllm_export_copy=vllm_export_copy,
             )
         return model_cls.from_local(checkpoint_dir, device)
@@ -146,6 +148,7 @@ def load_model(
             vllm_dtype=vllm_dtype,
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
+            vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
             vllm_export_copy=vllm_export_copy,
         )
     return model_cls.from_pretrained(device)
@@ -564,6 +567,8 @@ def main():
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
+    parser.add_argument("--vllm-enable-chunked-prefill", action="store_true")
+    parser.add_argument("--no-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -603,6 +608,9 @@ def main():
             vllm_enable_prefix_caching=(
                 args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
             ),
+            vllm_enable_chunked_prefill=(
+                args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill
+            ),
             vllm_export_copy=args.vllm_export_copy,
         )
         maybe_sync(args.device)
@@ -632,6 +640,10 @@ def main():
             print(
                 "vllm_enable_prefix_caching="
                 f"{args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
+            )
+            print(
+                "vllm_enable_chunked_prefill="
+                f"{args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
             )
             for note in describe_vllm_hydra_mode(
                 impl=args.impl,

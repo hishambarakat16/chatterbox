@@ -49,6 +49,9 @@ def parse_args():
     prefix_group = parser.add_mutually_exclusive_group()
     prefix_group.add_argument("--vllm-enable-prefix-caching", action="store_true")
     prefix_group.add_argument("--no-vllm-prefix-caching", action="store_true")
+    chunked_prefill_group = parser.add_mutually_exclusive_group()
+    chunked_prefill_group.add_argument("--vllm-enable-chunked-prefill", action="store_true")
+    chunked_prefill_group.add_argument("--no-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--language-id", default="ar")
     parser.add_argument("--audio-prompt-path")
     parser.add_argument("--exaggeration", type=float, default=0.5)
@@ -267,6 +270,7 @@ def main():
         vllm_dtype=args.vllm_dtype,
         vllm_max_model_len=args.vllm_max_model_len,
         vllm_enable_prefix_caching=args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching,
+        vllm_enable_chunked_prefill=args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill,
     )
 
     sessions = [
@@ -292,6 +296,9 @@ def main():
     print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
     print(
         f"vllm_enable_prefix_caching={args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
+    )
+    print(
+        f"vllm_enable_chunked_prefill={args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
     )
     for note in describe_vllm_hydra_mode(
         impl="vllm_turbo_s3",

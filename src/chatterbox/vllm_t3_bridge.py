@@ -240,6 +240,7 @@ def create_vllm_engine(
     dtype: str = "auto",
     max_model_len: int = 2048,
     enable_prefix_caching: bool = False,
+    enable_chunked_prefill: bool = True,
 ):
     LLM, _, _ = optional_import_vllm()
     register_vllm_t3_model()
@@ -255,6 +256,7 @@ def create_vllm_engine(
         dtype=dtype,
         max_model_len=max_model_len,
         enable_prefix_caching=enable_prefix_caching,
+        enable_chunked_prefill=enable_chunked_prefill,
     )
 
 
