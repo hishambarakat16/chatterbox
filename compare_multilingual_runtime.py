@@ -55,9 +55,10 @@ def load_model(
     vllm_export_dir: str | None = None,
     vllm_prompt_builder_device: str = "cpu",
     vllm_tensor_parallel_size: int = 1,
-    vllm_gpu_memory_utilization: float = 0.9,
+    vllm_gpu_memory_utilization: float = 0.5,
     vllm_enforce_eager: bool = False,
     vllm_dtype: str = "auto",
+    vllm_max_model_len: int = 2048,
     vllm_export_copy: bool = False,
 ):
     model_cls = resolve_model_cls(impl)
@@ -96,6 +97,7 @@ def load_model(
                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
                 vllm_enforce_eager=vllm_enforce_eager,
                 vllm_dtype=vllm_dtype,
+                vllm_max_model_len=vllm_max_model_len,
                 vllm_export_copy=vllm_export_copy,
             )
         return model_cls.from_local(checkpoint_dir, device)
@@ -129,6 +131,7 @@ def load_model(
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
             vllm_dtype=vllm_dtype,
+            vllm_max_model_len=vllm_max_model_len,
             vllm_export_copy=vllm_export_copy,
         )
     return model_cls.from_pretrained(device)
@@ -195,9 +198,10 @@ def main():
     parser.add_argument("--vllm-export-dir")
     parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
+    parser.add_argument("--vllm-max-model-len", type=int, default=2048)
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -213,111 +217,118 @@ def main():
 
     configure_shape_logging(args.trace_shapes)
 
-    load_start = time.perf_counter()
-    model = load_model(
-        args.impl,
-        args.device,
-        args.checkpoint_dir,
-        base_checkpoint_dir=args.base_checkpoint_dir,
-        batching_window_ms=args.batching_window_ms,
-        text_bucket_width=args.text_bucket_width,
-        enable_alignment_controller=args.enable_alignment_controller,
-        hydra_checkpoint_dir=args.hydra_checkpoint_dir,
-        hydra_speculate_k=args.hydra_speculate_k,
-        turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
-        vllm_model_dir=args.vllm_model_dir,
-        vllm_export_dir=args.vllm_export_dir,
-        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_enforce_eager=args.vllm_enforce_eager,
-        vllm_dtype=args.vllm_dtype,
-        vllm_export_copy=args.vllm_export_copy,
-    )
-    maybe_sync(args.device)
-    load_s = time.perf_counter() - load_start
-
-    if args.impl in {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"}:
-        session = model.create_session(
-            audio_prompt_path=args.audio_prompt_path,
-            language_id=args.language_id,
-        )
-        generate_fn = lambda: _call_with_supported_kwargs(
-            model.generate_with_session,
-            session=session,
-            text=args.text,
-            cfg_weight=args.cfg_weight,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            min_p=args.min_p,
-            top_p=args.top_p,
-            max_new_tokens=args.max_new_tokens,
-        )
-    else:
-        generate_fn = lambda: _call_with_supported_kwargs(
-            model.generate,
-            text=args.text,
-            language_id=args.language_id,
-            audio_prompt_path=args.audio_prompt_path,
-            cfg_weight=args.cfg_weight,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            min_p=args.min_p,
-            top_p=args.top_p,
-            max_new_tokens=args.max_new_tokens,
-        )
-
-    for _ in range(args.warmup_runs):
-        _ = generate_fn()
-        maybe_sync(args.device)
-
-    latencies = []
-    wav = None
-    for _ in range(args.runs):
-        start = time.perf_counter()
-        wav = generate_fn()
-        maybe_sync(args.device)
-        latencies.append(time.perf_counter() - start)
-
-    print(f"impl={args.impl}")
-    print(f"device={args.device}")
-    print(f"load_s={load_s:.4f}")
-    if args.impl in {"scheduled", "scheduled_turbo_s3"}:
-        print(f"hydra_checkpoint_dir={args.hydra_checkpoint_dir}")
-        print(f"hydra_speculate_k={args.hydra_speculate_k}")
-        print(f"batching_window_ms={args.batching_window_ms}")
-        print(f"text_bucket_width={args.text_bucket_width}")
-    if args.impl == "scheduled_turbo_s3":
-        print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
-    if args.impl == "vllm_turbo_s3":
-        print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
-        print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
-        print(f"vllm_model_dir={args.vllm_model_dir}")
-        print(f"vllm_export_dir={args.vllm_export_dir}")
-        print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
-        print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
-        print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
-        print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
-        print(f"vllm_dtype={args.vllm_dtype}")
-        for note in describe_vllm_hydra_mode(
-            impl=args.impl,
+    model = None
+    try:
+        load_start = time.perf_counter()
+        model = load_model(
+            args.impl,
+            args.device,
+            args.checkpoint_dir,
+            base_checkpoint_dir=args.base_checkpoint_dir,
+            batching_window_ms=args.batching_window_ms,
+            text_bucket_width=args.text_bucket_width,
+            enable_alignment_controller=args.enable_alignment_controller,
             hydra_checkpoint_dir=args.hydra_checkpoint_dir,
             hydra_speculate_k=args.hydra_speculate_k,
-        ):
-            print(note)
-    print(f"cfg_weight={args.cfg_weight}")
-    print(f"temperature={args.temperature}")
-    print(f"repetition_penalty={args.repetition_penalty}")
-    print(f"min_p={args.min_p}")
-    print(f"top_p={args.top_p}")
-    print(f"max_new_tokens={args.max_new_tokens}")
-    print(f"runs={args.runs}")
-    print(f"latency_s={[round(x, 4) for x in latencies]}")
-    if wav is not None:
-        print(f"num_samples={wav.shape[-1]}")
-        if args.output_wav:
-            ta.save(args.output_wav, wav, model.sr)
-            print(f"saved_wav={args.output_wav}")
+            turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
+            vllm_model_dir=args.vllm_model_dir,
+            vllm_export_dir=args.vllm_export_dir,
+            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
+            vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            vllm_enforce_eager=args.vllm_enforce_eager,
+            vllm_dtype=args.vllm_dtype,
+            vllm_max_model_len=args.vllm_max_model_len,
+            vllm_export_copy=args.vllm_export_copy,
+        )
+        maybe_sync(args.device)
+        load_s = time.perf_counter() - load_start
+
+        if args.impl in {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"}:
+            session = model.create_session(
+                audio_prompt_path=args.audio_prompt_path,
+                language_id=args.language_id,
+            )
+            generate_fn = lambda: _call_with_supported_kwargs(
+                model.generate_with_session,
+                session=session,
+                text=args.text,
+                cfg_weight=args.cfg_weight,
+                temperature=args.temperature,
+                repetition_penalty=args.repetition_penalty,
+                min_p=args.min_p,
+                top_p=args.top_p,
+                max_new_tokens=args.max_new_tokens,
+            )
+        else:
+            generate_fn = lambda: _call_with_supported_kwargs(
+                model.generate,
+                text=args.text,
+                language_id=args.language_id,
+                audio_prompt_path=args.audio_prompt_path,
+                cfg_weight=args.cfg_weight,
+                temperature=args.temperature,
+                repetition_penalty=args.repetition_penalty,
+                min_p=args.min_p,
+                top_p=args.top_p,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+        for _ in range(args.warmup_runs):
+            _ = generate_fn()
+            maybe_sync(args.device)
+
+        latencies = []
+        wav = None
+        for _ in range(args.runs):
+            start = time.perf_counter()
+            wav = generate_fn()
+            maybe_sync(args.device)
+            latencies.append(time.perf_counter() - start)
+
+        print(f"impl={args.impl}")
+        print(f"device={args.device}")
+        print(f"load_s={load_s:.4f}")
+        if args.impl in {"scheduled", "scheduled_turbo_s3"}:
+            print(f"hydra_checkpoint_dir={args.hydra_checkpoint_dir}")
+            print(f"hydra_speculate_k={args.hydra_speculate_k}")
+            print(f"batching_window_ms={args.batching_window_ms}")
+            print(f"text_bucket_width={args.text_bucket_width}")
+        if args.impl == "scheduled_turbo_s3":
+            print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
+        if args.impl == "vllm_turbo_s3":
+            print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
+            print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
+            print(f"vllm_model_dir={args.vllm_model_dir}")
+            print(f"vllm_export_dir={args.vllm_export_dir}")
+            print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
+            print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
+            print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
+            print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
+            print(f"vllm_dtype={args.vllm_dtype}")
+            print(f"vllm_max_model_len={args.vllm_max_model_len}")
+            for note in describe_vllm_hydra_mode(
+                impl=args.impl,
+                hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+                hydra_speculate_k=args.hydra_speculate_k,
+            ):
+                print(note)
+        print(f"cfg_weight={args.cfg_weight}")
+        print(f"temperature={args.temperature}")
+        print(f"repetition_penalty={args.repetition_penalty}")
+        print(f"min_p={args.min_p}")
+        print(f"top_p={args.top_p}")
+        print(f"max_new_tokens={args.max_new_tokens}")
+        print(f"runs={args.runs}")
+        print(f"latency_s={[round(x, 4) for x in latencies]}")
+        if wav is not None:
+            print(f"num_samples={wav.shape[-1]}")
+            if args.output_wav:
+                ta.save(args.output_wav, wav, model.sr)
+                print(f"saved_wav={args.output_wav}")
+    finally:
+        if model is not None and hasattr(model, "close"):
+            model.close()
 
 
 if __name__ == "__main__":

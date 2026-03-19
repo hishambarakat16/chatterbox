@@ -76,9 +76,10 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_export_dir: str | None = None,
         vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
-        vllm_gpu_memory_utilization: float = 0.9,
+        vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
+        vllm_max_model_len: int = 2048,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -127,6 +128,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             gpu_memory_utilization=vllm_gpu_memory_utilization,
             enforce_eager=vllm_enforce_eager,
             dtype=vllm_dtype,
+            max_model_len=vllm_max_model_len,
         )
 
         worker = ChatterboxMultilingualVllmWorker(
@@ -152,9 +154,10 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_export_dir: str | None = None,
         vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
-        vllm_gpu_memory_utilization: float = 0.9,
+        vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
+        vllm_max_model_len: int = 2048,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():
@@ -186,8 +189,17 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
             vllm_dtype=vllm_dtype,
+            vllm_max_model_len=vllm_max_model_len,
             vllm_export_copy=vllm_export_copy,
         )
+
+    def close(self):
+        engine = getattr(self.worker, "vllm_engine", None)
+        if engine is not None and hasattr(engine, "shutdown"):
+            try:
+                engine.shutdown()
+            except Exception:
+                pass
 
     def create_session(
         self,

@@ -235,9 +235,10 @@ def create_vllm_engine(
     *,
     model_dir: str | Path,
     tensor_parallel_size: int = 1,
-    gpu_memory_utilization: float = 0.9,
+    gpu_memory_utilization: float = 0.5,
     enforce_eager: bool = False,
     dtype: str = "auto",
+    max_model_len: int = 2048,
 ):
     LLM, _, _ = optional_import_vllm()
     register_vllm_t3_model()
@@ -251,6 +252,7 @@ def create_vllm_engine(
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=enforce_eager,
         dtype=dtype,
+        max_model_len=max_model_len,
     )
 
 

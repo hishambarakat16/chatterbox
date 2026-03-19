@@ -369,9 +369,10 @@ def main():
     parser.add_argument("--vllm-export-dir")
     parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
+    parser.add_argument("--vllm-max-model-len", type=int, default=2048)
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--batching-window-ms", type=float, default=5.0)
@@ -401,232 +402,240 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    load_start = time.perf_counter()
-    model = load_model(
-        args.impl,
-        args.device,
-        args.checkpoint_dir,
-        base_checkpoint_dir=args.base_checkpoint_dir,
-        batching_window_ms=args.batching_window_ms,
-        text_bucket_width=args.text_bucket_width,
-        enable_alignment_controller=args.enable_alignment_controller,
-        hydra_checkpoint_dir=args.hydra_checkpoint_dir,
-        hydra_speculate_k=args.hydra_speculate_k,
-        turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
-        vllm_model_dir=args.vllm_model_dir,
-        vllm_export_dir=args.vllm_export_dir,
-        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_enforce_eager=args.vllm_enforce_eager,
-        vllm_dtype=args.vllm_dtype,
-        vllm_export_copy=args.vllm_export_copy,
-    )
-    maybe_sync(args.device)
-    load_s = time.perf_counter() - load_start
-
-    print(f"impl={args.impl}")
-    print(f"device={args.device}")
-    print(f"load_s={load_s:.4f}")
-    if args.impl == "vllm_turbo_s3":
-        print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
-    print(f"warmup_runs={args.warmup_runs}")
-    print(f"stagger_ms={args.stagger_ms}")
-    print(f"batching_window_ms={args.batching_window_ms}")
-    print(f"text_bucket_width={args.text_bucket_width}")
-    print(f"rounds_per_level={args.rounds_per_level}")
-    print(f"save_mode={args.save_mode}")
-    for note in describe_vllm_hydra_mode(
-        impl=args.impl,
-        hydra_checkpoint_dir=args.hydra_checkpoint_dir,
-        hydra_speculate_k=args.hydra_speculate_k,
-    ):
-        print(note)
-
-    run_warmup(
-        model=model,
-        impl=args.impl,
-        audio_prompt_path=args.audio_prompt_path,
-        language_id=args.language_id,
-        warmup_text=warmup_text,
-        warmup_runs=args.warmup_runs,
-        cfg_weight=args.cfg_weight,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
-        min_p=args.min_p,
-        top_p=args.top_p,
-        max_new_tokens=args.max_new_tokens,
-    )
-
-    sentence_cursor = 0
-    level_summaries = []
-
-    for level in args.concurrency_levels:
-        requests = []
-        vram_state = begin_vram_measurement(args.device)
-        level_wall_start = time.perf_counter()
-
-        for round_index in range(args.rounds_per_level):
-            sessions = [
-                build_session(
-                    model=model,
-                    audio_prompt_path=args.audio_prompt_path,
-                    language_id=args.language_id,
-                    cfg_weight=args.cfg_weight,
-                    temperature=args.temperature,
-                    repetition_penalty=args.repetition_penalty,
-                    min_p=args.min_p,
-                    top_p=args.top_p,
-                    max_new_tokens=args.max_new_tokens,
-                )
-                for _ in range(level)
-            ]
-
-            texts = []
-            for _ in range(level):
-                texts.append(sentences[sentence_cursor % len(sentences)])
-                sentence_cursor += 1
-
-            round_results = [None] * level
-            round_start = time.perf_counter()
-
-            def worker(index: int):
-                scheduled_at = round_start + (index * args.stagger_ms / 1000.0)
-                sleep_s = scheduled_at - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
-
-                session = sessions[index]
-                text = texts[index]
-                started = time.perf_counter()
-                error = None
-                wav = None
-                try:
-                    wav = model.generate_with_session(session, text)
-                    maybe_sync(args.device)
-                except Exception as exc:  # noqa: BLE001
-                    error = repr(exc)
-                    maybe_sync(args.device)
-                ended = time.perf_counter()
-                profile = get_last_profile(model) if error is None else {}
-                round_results[index] = {
-                    "round_index": round_index,
-                    "request_index": index,
-                    "session_id": session.session_id,
-                    "text": text,
-                    "arrival_offset_s": round(index * args.stagger_ms / 1000.0, 4),
-                    "started_at_s": round(started - round_start, 4),
-                    "latency_s": round(ended - started, 4),
-                    "num_samples": None if wav is None else int(wav.shape[-1]),
-                    "error": error,
-                    "wav": wav,
-                    "profile": profile,
-                }
-
-            with ThreadPoolExecutor(max_workers=level) as executor:
-                futures = [executor.submit(worker, idx) for idx in range(level)]
-                for future in futures:
-                    future.result()
-
-            requests.extend(round_results)
-
+    model = None
+    try:
+        load_start = time.perf_counter()
+        model = load_model(
+            args.impl,
+            args.device,
+            args.checkpoint_dir,
+            base_checkpoint_dir=args.base_checkpoint_dir,
+            batching_window_ms=args.batching_window_ms,
+            text_bucket_width=args.text_bucket_width,
+            enable_alignment_controller=args.enable_alignment_controller,
+            hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+            hydra_speculate_k=args.hydra_speculate_k,
+            turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
+            vllm_model_dir=args.vllm_model_dir,
+            vllm_export_dir=args.vllm_export_dir,
+            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
+            vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            vllm_enforce_eager=args.vllm_enforce_eager,
+            vllm_dtype=args.vllm_dtype,
+            vllm_max_model_len=args.vllm_max_model_len,
+            vllm_export_copy=args.vllm_export_copy,
+        )
         maybe_sync(args.device)
-        level_wall_s = time.perf_counter() - level_wall_start
-        vram_summary = finish_vram_measurement(args.device, vram_state)
-        summary = summarize_requests(level, requests, level_wall_s, vram_summary)
-        level_summaries.append(summary)
+        load_s = time.perf_counter() - load_start
 
-        print(f"concurrency={summary['concurrency']}")
-        print(f"num_success={summary['num_success']}")
-        print(f"mean_first_token_s={summary['mean_first_token_s']}")
-        print(f"p95_first_token_s={summary['p95_first_token_s']}")
-        print(f"mean_audio_ready_s={summary['mean_audio_ready_s']}")
-        print(f"p95_audio_ready_s={summary['p95_audio_ready_s']}")
-        print(f"mean_latency_s={summary['mean_latency_s']}")
-        print(f"audio_seconds_per_second={summary['audio_seconds_per_second']}")
-        print(f"mean_t3_wait_s={summary['mean_t3_wait_s']}")
-        print(f"mean_t3_active_s={summary['mean_t3_active_s']}")
-        print(f"mean_t3_s={summary['mean_t3_s']}")
-        print(f"mean_t3_acceptance_rate={summary['mean_t3_acceptance_rate']}")
-        print(f"mean_t3_rounds={summary['mean_t3_rounds']}")
-        print(f"mean_t3_active_cohorts_at_admit={summary['mean_t3_active_cohorts_at_admit']}")
-        print(f"singleton_request_fraction={summary['singleton_request_fraction']}")
-        print(f"admission_cohort_size_hist={summary['admission_cohort_size_hist']}")
-        print(f"batch_key_hist={summary['batch_key_hist']}")
-        print(f"group_key_hist={summary['group_key_hist']}")
-        print(f"mean_s3_s={summary['mean_s3_s']}")
-        print(f"mean_s3_token2mel_s={summary['mean_s3_token2mel_s']}")
-        print(f"errors={summary['errors']}")
-        if args.print_forensics:
-            print("forensics_requests=[")
-            for item in summary["requests"]:
-                if item["error"] is not None:
-                    continue
-                profile = item["profile"]
-                print(
-                    "  {"
-                    f"'round': {item['round_index']}, "
-                    f"'request': {item['request_index']}, "
-                    f"'arrival_offset_s': {item['arrival_offset_s']}, "
-                    f"'text': {item['text']!r}, "
-                    f"'batch_key': ({int(profile.get('t3_batch_text_len', 0))}, {int(profile.get('t3_batch_prompt_len', 0))}), "
-                    f"'group_key': ({int(profile.get('t3_group_text_len', 0))}, {int(profile.get('t3_group_prompt_len', 0))}), "
-                    f"'admission_cohort_size': {int(profile.get('t3_admission_cohort_size', 0))}, "
-                    f"'active_cohorts_at_admit': {float(profile.get('t3_active_cohorts_at_admit', 0.0)):.4f}, "
-                    f"'t3_wait_s': {float(profile.get('t3_wait_s', 0.0)):.4f}, "
-                    f"'t3_active_s': {float(profile.get('t3_active_s', 0.0)):.4f}, "
-                    f"'t3_s': {float(profile.get('t3_s', 0.0)):.4f}"
-                    "},"
-                )
-            print("]")
+        print(f"impl={args.impl}")
+        print(f"device={args.device}")
+        print(f"load_s={load_s:.4f}")
+        if args.impl == "vllm_turbo_s3":
+            print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
+            print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
+            print(f"vllm_max_model_len={args.vllm_max_model_len}")
+        print(f"warmup_runs={args.warmup_runs}")
+        print(f"stagger_ms={args.stagger_ms}")
+        print(f"batching_window_ms={args.batching_window_ms}")
+        print(f"text_bucket_width={args.text_bucket_width}")
+        print(f"rounds_per_level={args.rounds_per_level}")
+        print(f"save_mode={args.save_mode}")
+        for note in describe_vllm_hydra_mode(
+            impl=args.impl,
+            hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+            hydra_speculate_k=args.hydra_speculate_k,
+        ):
+            print(note)
 
-    saved_audio = save_representative_wavs(
-        output_dir=output_dir,
-        save_mode=args.save_mode,
-        level_summaries=level_summaries,
-        sample_rate=model.sr,
-    )
+        run_warmup(
+            model=model,
+            impl=args.impl,
+            audio_prompt_path=args.audio_prompt_path,
+            language_id=args.language_id,
+            warmup_text=warmup_text,
+            warmup_runs=args.warmup_runs,
+            cfg_weight=args.cfg_weight,
+            temperature=args.temperature,
+            repetition_penalty=args.repetition_penalty,
+            min_p=args.min_p,
+            top_p=args.top_p,
+            max_new_tokens=args.max_new_tokens,
+        )
 
-    report = {
-        "impl": args.impl,
-        "device": args.device,
-        "load_s": round(load_s, 4),
-        "language_id": args.language_id,
-        "audio_prompt_path": args.audio_prompt_path,
-        "sentences_file": str(DEFAULT_SENTENCES_FILE if args.sentences_file is None else Path(args.sentences_file)),
-        "warmup_runs": args.warmup_runs,
-        "warmup_text": warmup_text,
-        "rounds_per_level": args.rounds_per_level,
-        "stagger_ms": args.stagger_ms,
-        "batching_window_ms": args.batching_window_ms,
-        "text_bucket_width": args.text_bucket_width,
-        "save_mode": args.save_mode,
-        "levels": sanitize_level_summaries(level_summaries),
-        "saved_audio": saved_audio,
-    }
+        sentence_cursor = 0
+        level_summaries = []
 
-    summary_path = output_dir / "summary.json"
-    markdown_path = output_dir / "summary.md"
-    serializable = json.loads(json.dumps(report, default=str))
-    summary_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    write_markdown_report(markdown_path, serializable)
+        for level in args.concurrency_levels:
+            requests = []
+            vram_state = begin_vram_measurement(args.device)
+            level_wall_start = time.perf_counter()
 
-    playback_errors = []
-    resolved_play_command = None
-    if args.play_command:
-        resolved_play_command, playback_error = resolve_play_command(args.play_command)
-        if playback_error is not None:
-            playback_errors.append(playback_error)
-        elif resolved_play_command is not None:
-            playback_errors.extend(play_saved_audio(resolved_play_command, saved_audio))
+            for round_index in range(args.rounds_per_level):
+                sessions = [
+                    build_session(
+                        model=model,
+                        audio_prompt_path=args.audio_prompt_path,
+                        language_id=args.language_id,
+                        cfg_weight=args.cfg_weight,
+                        temperature=args.temperature,
+                        repetition_penalty=args.repetition_penalty,
+                        min_p=args.min_p,
+                        top_p=args.top_p,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    for _ in range(level)
+                ]
 
-    print(f"summary_json={summary_path}")
-    print(f"summary_md={markdown_path}")
-    print(f"saved_audio={saved_audio}")
-    if resolved_play_command is not None:
-        print(f"play_command={resolved_play_command}")
-    if playback_errors:
-        print(f"playback_errors={playback_errors}")
+                texts = []
+                for _ in range(level):
+                    texts.append(sentences[sentence_cursor % len(sentences)])
+                    sentence_cursor += 1
+
+                round_results = [None] * level
+                round_start = time.perf_counter()
+
+                def worker(index: int):
+                    scheduled_at = round_start + (index * args.stagger_ms / 1000.0)
+                    sleep_s = scheduled_at - time.perf_counter()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+
+                    session = sessions[index]
+                    text = texts[index]
+                    started = time.perf_counter()
+                    error = None
+                    wav = None
+                    try:
+                        wav = model.generate_with_session(session, text)
+                        maybe_sync(args.device)
+                    except Exception as exc:  # noqa: BLE001
+                        error = repr(exc)
+                        maybe_sync(args.device)
+                    ended = time.perf_counter()
+                    profile = get_last_profile(model) if error is None else {}
+                    round_results[index] = {
+                        "round_index": round_index,
+                        "request_index": index,
+                        "session_id": session.session_id,
+                        "text": text,
+                        "arrival_offset_s": round(index * args.stagger_ms / 1000.0, 4),
+                        "started_at_s": round(started - round_start, 4),
+                        "latency_s": round(ended - started, 4),
+                        "num_samples": None if wav is None else int(wav.shape[-1]),
+                        "error": error,
+                        "wav": wav,
+                        "profile": profile,
+                    }
+
+                with ThreadPoolExecutor(max_workers=level) as executor:
+                    futures = [executor.submit(worker, idx) for idx in range(level)]
+                    for future in futures:
+                        future.result()
+
+                requests.extend(round_results)
+
+            maybe_sync(args.device)
+            level_wall_s = time.perf_counter() - level_wall_start
+            vram_summary = finish_vram_measurement(args.device, vram_state)
+            summary = summarize_requests(level, requests, level_wall_s, vram_summary)
+            level_summaries.append(summary)
+
+            print(f"concurrency={summary['concurrency']}")
+            print(f"num_success={summary['num_success']}")
+            print(f"mean_first_token_s={summary['mean_first_token_s']}")
+            print(f"p95_first_token_s={summary['p95_first_token_s']}")
+            print(f"mean_audio_ready_s={summary['mean_audio_ready_s']}")
+            print(f"p95_audio_ready_s={summary['p95_audio_ready_s']}")
+            print(f"mean_latency_s={summary['mean_latency_s']}")
+            print(f"audio_seconds_per_second={summary['audio_seconds_per_second']}")
+            print(f"mean_t3_wait_s={summary['mean_t3_wait_s']}")
+            print(f"mean_t3_active_s={summary['mean_t3_active_s']}")
+            print(f"mean_t3_s={summary['mean_t3_s']}")
+            print(f"mean_t3_acceptance_rate={summary['mean_t3_acceptance_rate']}")
+            print(f"mean_t3_rounds={summary['mean_t3_rounds']}")
+            print(f"mean_t3_active_cohorts_at_admit={summary['mean_t3_active_cohorts_at_admit']}")
+            print(f"singleton_request_fraction={summary['singleton_request_fraction']}")
+            print(f"admission_cohort_size_hist={summary['admission_cohort_size_hist']}")
+            print(f"batch_key_hist={summary['batch_key_hist']}")
+            print(f"group_key_hist={summary['group_key_hist']}")
+            print(f"mean_s3_s={summary['mean_s3_s']}")
+            print(f"mean_s3_token2mel_s={summary['mean_s3_token2mel_s']}")
+            print(f"errors={summary['errors']}")
+            if args.print_forensics:
+                print("forensics_requests=[")
+                for item in summary["requests"]:
+                    if item["error"] is not None:
+                        continue
+                    profile = item["profile"]
+                    print(
+                        "  {"
+                        f"'round': {item['round_index']}, "
+                        f"'request': {item['request_index']}, "
+                        f"'arrival_offset_s': {item['arrival_offset_s']}, "
+                        f"'text': {item['text']!r}, "
+                        f"'batch_key': ({int(profile.get('t3_batch_text_len', 0))}, {int(profile.get('t3_batch_prompt_len', 0))}), "
+                        f"'group_key': ({int(profile.get('t3_group_text_len', 0))}, {int(profile.get('t3_group_prompt_len', 0))}), "
+                        f"'admission_cohort_size': {int(profile.get('t3_admission_cohort_size', 0))}, "
+                        f"'active_cohorts_at_admit': {float(profile.get('t3_active_cohorts_at_admit', 0.0)):.4f}, "
+                        f"'t3_wait_s': {float(profile.get('t3_wait_s', 0.0)):.4f}, "
+                        f"'t3_active_s': {float(profile.get('t3_active_s', 0.0)):.4f}, "
+                        f"'t3_s': {float(profile.get('t3_s', 0.0)):.4f}"
+                        "},"
+                    )
+                print("]")
+
+        saved_audio = save_representative_wavs(
+            output_dir=output_dir,
+            save_mode=args.save_mode,
+            level_summaries=level_summaries,
+            sample_rate=model.sr,
+        )
+
+        report = {
+            "impl": args.impl,
+            "device": args.device,
+            "load_s": round(load_s, 4),
+            "language_id": args.language_id,
+            "audio_prompt_path": args.audio_prompt_path,
+            "sentences_file": str(DEFAULT_SENTENCES_FILE if args.sentences_file is None else Path(args.sentences_file)),
+            "warmup_runs": args.warmup_runs,
+            "warmup_text": warmup_text,
+            "rounds_per_level": args.rounds_per_level,
+            "stagger_ms": args.stagger_ms,
+            "batching_window_ms": args.batching_window_ms,
+            "text_bucket_width": args.text_bucket_width,
+            "save_mode": args.save_mode,
+            "levels": sanitize_level_summaries(level_summaries),
+            "saved_audio": saved_audio,
+        }
+
+        summary_path = output_dir / "summary.json"
+        markdown_path = output_dir / "summary.md"
+        serializable = json.loads(json.dumps(report, default=str))
+        summary_path.write_text(json.dumps(serializable, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_markdown_report(markdown_path, serializable)
+
+        playback_errors = []
+        resolved_play_command = None
+        if args.play_command:
+            resolved_play_command, playback_error = resolve_play_command(args.play_command)
+            if playback_error is not None:
+                playback_errors.append(playback_error)
+            elif resolved_play_command is not None:
+                playback_errors.extend(play_saved_audio(resolved_play_command, saved_audio))
+
+        print(f"summary_json={summary_path}")
+        print(f"summary_md={markdown_path}")
+        print(f"saved_audio={saved_audio}")
+        if resolved_play_command is not None:
+            print(f"play_command={resolved_play_command}")
+        if playback_errors:
+            print(f"playback_errors={playback_errors}")
+    finally:
+        if model is not None and hasattr(model, "close"):
+            model.close()
 
 
 if __name__ == "__main__":

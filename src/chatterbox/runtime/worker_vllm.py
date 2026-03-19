@@ -100,6 +100,7 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             outputs = self.vllm_engine.generate(
                 [{"prompt_embeds": prompt_embeds}],
                 sampling_params=sampling_params,
+                use_tqdm=False,
             )
             profile["t3_s"] = time.perf_counter() - t3_start
             profile["t3_active_s"] = profile["t3_s"]
