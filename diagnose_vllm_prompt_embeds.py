@@ -3,14 +3,26 @@ import json
 import time
 from pathlib import Path
 
-from benchmark_multilingual_concurrency import (
-    describe_vllm_hydra_mode,
-    load_model,
-    maybe_sync,
-)
-
 
 DEFAULT_SENTENCES_FILE = Path(__file__).with_name("arabic_streaming_sentences.txt")
+_RUNTIME_HELPERS = None
+
+
+def runtime_helpers():
+    global _RUNTIME_HELPERS
+    if _RUNTIME_HELPERS is None:
+        from benchmark_multilingual_concurrency import (  # noqa: PLC0415
+            describe_vllm_hydra_mode,
+            load_model,
+            maybe_sync,
+        )
+
+        _RUNTIME_HELPERS = {
+            "describe_vllm_hydra_mode": describe_vllm_hydra_mode,
+            "load_model": load_model,
+            "maybe_sync": maybe_sync,
+        }
+    return _RUNTIME_HELPERS
 
 
 def parse_args():
@@ -122,6 +134,7 @@ def inspect_requests(model, sessions, texts, args) -> list[dict]:
 
 
 def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> list[dict]:
+    maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
     for row, session, text in zip(inspect_rows, sessions, texts):
         started = time.perf_counter()
@@ -164,6 +177,7 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
 
 
 def run_batched(model, sessions, texts, inspect_rows, args) -> list[dict]:
+    maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
     for batch_index, index_chunk in enumerate(chunked(list(range(len(texts))), args.batch_size)):
         session_chunk = [sessions[idx] for idx in index_chunk]
@@ -235,6 +249,9 @@ def build_summary(*, args, texts, inspect_rows, run_rows) -> dict:
 def main():
     args = parse_args()
     texts = load_texts(args)
+    helpers = runtime_helpers()
+    load_model = helpers["load_model"]
+    describe_vllm_hydra_mode = helpers["describe_vllm_hydra_mode"]
     model = load_model(
         "vllm_turbo_s3",
         args.device,
