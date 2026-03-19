@@ -373,6 +373,9 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     t3_prompt_lens = [int(request_metric(item, "t3_batch_prompt_len")) for item in ok if "t3_batch_prompt_len" in item["profile"]]
     t3_group_text_lens = [int(request_metric(item, "t3_group_text_len")) for item in ok if "t3_group_text_len" in item["profile"]]
     t3_group_prompt_lens = [int(request_metric(item, "t3_group_prompt_len")) for item in ok if "t3_group_prompt_len" in item["profile"]]
+    t3_prompt_embed_seq_lens = [int(request_metric(item, "t3_prompt_embed_seq_len")) for item in ok if "t3_prompt_embed_seq_len" in item["profile"]]
+    t3_cond_seq_lens = [int(request_metric(item, "t3_cond_seq_len")) for item in ok if "t3_cond_seq_len" in item["profile"]]
+    t3_text_token_lens = [int(request_metric(item, "t3_text_token_len")) for item in ok if "t3_text_token_len" in item["profile"]]
     s3_total = [request_metric(item, "s3_s") for item in ok]
     s3_token2mel = [request_metric(item, "s3_token2mel_s") for item in ok]
     s3_hift = [request_metric(item, "s3_hift_s") for item in ok]
@@ -380,6 +383,9 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     total_audio_s = sum(num_samples) / 24000.0 if num_samples else 0.0
     batch_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_text_lens, t3_prompt_lens)])
     group_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_group_text_lens, t3_group_prompt_lens)])
+    prompt_embed_seq_len_hist = histogram(t3_prompt_embed_seq_lens)
+    cond_seq_len_hist = histogram(t3_cond_seq_lens)
+    text_token_len_hist = histogram(t3_text_token_lens)
     admission_cohort_hist = histogram(t3_cohort_sizes)
     singleton_fraction = 0.0 if not t3_cohort_sizes else (sum(1 for size in t3_cohort_sizes if size == 1) / len(t3_cohort_sizes))
 
@@ -410,6 +416,9 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
         "admission_cohort_size_hist": admission_cohort_hist,
         "batch_key_hist": batch_key_hist,
         "group_key_hist": group_key_hist,
+        "prompt_embed_seq_len_hist": prompt_embed_seq_len_hist,
+        "cond_seq_len_hist": cond_seq_len_hist,
+        "text_token_len_hist": text_token_len_hist,
         "singleton_request_fraction": round(float(singleton_fraction), 4),
         "mean_s3_s": round(mean_or_zero(s3_total), 4),
         "mean_s3_token2mel_s": round(mean_or_zero(s3_token2mel), 4),
@@ -855,6 +864,9 @@ def main():
             print(f"admission_cohort_size_hist={summary['admission_cohort_size_hist']}")
             print(f"batch_key_hist={summary['batch_key_hist']}")
             print(f"group_key_hist={summary['group_key_hist']}")
+            print(f"prompt_embed_seq_len_hist={summary['prompt_embed_seq_len_hist']}")
+            print(f"cond_seq_len_hist={summary['cond_seq_len_hist']}")
+            print(f"text_token_len_hist={summary['text_token_len_hist']}")
             print(f"mean_s3_s={summary['mean_s3_s']}")
             print(f"mean_s3_token2mel_s={summary['mean_s3_token2mel_s']}")
             print(f"errors={summary['errors']}")

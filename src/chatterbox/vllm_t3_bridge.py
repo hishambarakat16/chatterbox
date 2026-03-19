@@ -294,6 +294,7 @@ def build_prompt_embeds(
     prompt_builder_t3,
     t3_cond,
     text_tokens: torch.Tensor,
+    return_metadata: bool = False,
 ) -> torch.Tensor:
     t3_cond = t3_cond.to(device=prompt_builder_t3.device)
     text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=prompt_builder_t3.device)
@@ -304,4 +305,23 @@ def build_prompt_embeds(
         speech_tokens=initial_speech,
         cfg_weight=0.0,
     )
-    return embeds.squeeze(0).detach().cpu()
+    prompt_embeds = embeds.squeeze(0).detach().cpu()
+    if not return_metadata:
+        return prompt_embeds
+
+    prompt_speech_tokens = getattr(t3_cond, "cond_prompt_speech_tokens", None)
+    prompt_speech_token_len = 0 if prompt_speech_tokens is None else int(prompt_speech_tokens.shape[-1])
+    text_token_len = int(text_tokens.shape[-1])
+    initial_speech_len = int(initial_speech.shape[-1])
+    prompt_embed_seq_len = int(prompt_embeds.shape[0])
+    prompt_embed_hidden_size = int(prompt_embeds.shape[1]) if prompt_embeds.ndim >= 2 else 0
+    cond_seq_len = prompt_embed_seq_len - text_token_len - initial_speech_len
+    metadata = {
+        "prompt_speech_token_len": prompt_speech_token_len,
+        "text_token_len": text_token_len,
+        "initial_speech_len": initial_speech_len,
+        "prompt_embed_seq_len": prompt_embed_seq_len,
+        "prompt_embed_hidden_size": prompt_embed_hidden_size,
+        "cond_seq_len": cond_seq_len,
+    }
+    return prompt_embeds, metadata

@@ -145,12 +145,19 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             language_id=language_id,
             device=self.prompt_builder_device,
         )
-        prompt_embeds = build_prompt_embeds(
+        prompt_embeds, prompt_embed_meta = build_prompt_embeds(
             prompt_builder_t3=self.prompt_builder_t3,
             t3_cond=prompt_conds.t3,
             text_tokens=text_tokens,
+            return_metadata=True,
         )
         profile["text_prep_s"] = time.perf_counter() - prep_start
+        profile["t3_text_token_len"] = float(prompt_embed_meta["text_token_len"])
+        profile["t3_prompt_speech_token_len"] = float(prompt_embed_meta["prompt_speech_token_len"])
+        profile["t3_initial_speech_len"] = float(prompt_embed_meta["initial_speech_len"])
+        profile["t3_cond_seq_len"] = float(prompt_embed_meta["cond_seq_len"])
+        profile["t3_prompt_embed_seq_len"] = float(prompt_embed_meta["prompt_embed_seq_len"])
+        profile["t3_prompt_embed_hidden_size"] = float(prompt_embed_meta["prompt_embed_hidden_size"])
 
         if float(active_options.cfg_weight) != 0.0:
             profile["t3_cfg_requested"] = float(active_options.cfg_weight)
@@ -168,6 +175,27 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             "active_conds": active_conds,
             "prompt": {"prompt_embeds": prompt_embeds},
             "sampling_params": sampling_params,
+        }
+
+    def inspect_prompt_embed(self, *, session, text: str, options=None) -> dict:
+        prepared = self._prepare_request(session=session, text=text, options=options)
+        profile = prepared["profile"]
+        sampling_params = prepared["sampling_params"]
+        return {
+            "session_id": session.session_id,
+            "text": text,
+            "text_chars": int(len(text)),
+            "text_words": int(len(text.split())),
+            "t3_text_token_len": int(profile.get("t3_text_token_len", 0.0)),
+            "t3_prompt_speech_token_len": int(profile.get("t3_prompt_speech_token_len", 0.0)),
+            "t3_initial_speech_len": int(profile.get("t3_initial_speech_len", 0.0)),
+            "t3_cond_seq_len": int(profile.get("t3_cond_seq_len", 0.0)),
+            "t3_prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", 0.0)),
+            "t3_prompt_embed_hidden_size": int(profile.get("t3_prompt_embed_hidden_size", 0.0)),
+            "sampling_max_tokens": int(getattr(sampling_params, "max_tokens", 0) or 0),
+            "sampling_stop_token_ids": [
+                int(token_id) for token_id in (getattr(sampling_params, "stop_token_ids", None) or [])
+            ],
         }
 
     def _finalize_request(

@@ -334,5 +334,35 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             options_list=options_list,
         )
 
+    def inspect_prompt_embed_with_session(
+        self,
+        session: StreamingSession,
+        text: str,
+        *,
+        language_id=None,
+        exaggeration=None,
+        cfg_weight=None,
+        temperature=None,
+        repetition_penalty=None,
+        min_p=None,
+        top_p=None,
+        max_new_tokens=None,
+    ) -> dict:
+        options = session.options.merged(
+            language_id=language_id,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+        )
+        return self.worker.inspect_prompt_embed(
+            session=session,
+            text=text,
+            options=options,
+        )
+
     def get_last_profile(self) -> dict:
         return self.worker.get_last_profile()
