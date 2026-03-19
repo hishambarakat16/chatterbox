@@ -134,6 +134,23 @@ def load_model(
     return model_cls.from_pretrained(device)
 
 
+def describe_vllm_hydra_mode(
+    *,
+    impl: str,
+    hydra_checkpoint_dir: str | None,
+    hydra_speculate_k: int,
+) -> list[str]:
+    if impl != "vllm_turbo_s3":
+        return []
+
+    notes = ["hydra_mode=disabled"]
+    if hydra_checkpoint_dir:
+        notes.append(f"hydra_checkpoint_dir_ignored={hydra_checkpoint_dir}")
+    if hydra_speculate_k != 3:
+        notes.append(f"hydra_speculate_k_ignored={hydra_speculate_k}")
+    return notes
+
+
 def configure_shape_logging(enabled: bool, *, trace_s3_shapes: bool = False):
     if not enabled and not trace_s3_shapes:
         os.environ.pop("CHATTERBOX_TRACE_SHAPES", None)
@@ -484,6 +501,12 @@ def main():
         print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
         print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
         print(f"vllm_dtype={args.vllm_dtype}")
+        for note in describe_vllm_hydra_mode(
+            impl=args.impl,
+            hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+            hydra_speculate_k=args.hydra_speculate_k,
+        ):
+            print(note)
     print(f"cfg_weight={args.cfg_weight}")
     print(f"temperature={args.temperature}")
     print(f"repetition_penalty={args.repetition_penalty}")

@@ -12,6 +12,7 @@ import torchaudio as ta
 
 from benchmark_multilingual_concurrency import (
     begin_vram_measurement,
+    describe_vllm_hydra_mode,
     finish_vram_measurement,
     get_last_profile,
     load_model,
@@ -431,6 +432,12 @@ def main():
     print(f"text_bucket_width={args.text_bucket_width}")
     print(f"rounds_per_level={args.rounds_per_level}")
     print(f"save_mode={args.save_mode}")
+    for note in describe_vllm_hydra_mode(
+        impl=args.impl,
+        hydra_checkpoint_dir=args.hydra_checkpoint_dir,
+        hydra_speculate_k=args.hydra_speculate_k,
+    ):
+        print(note)
 
     run_warmup(
         model=model,
