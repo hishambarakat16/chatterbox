@@ -13,7 +13,11 @@ from .models.voice_encoder import VoiceEncoder
 from .mtl_tts import Conditionals, REPO_ID, SUPPORTED_LANGUAGES
 from .runtime import GenerationOptions, StreamingSession
 from .runtime.worker_vllm import ChatterboxMultilingualVllmWorker
-from .vllm_t3_bridge import create_vllm_engine, export_vllm_t3_model
+from .vllm_t3_bridge import (
+    create_vllm_engine,
+    export_vllm_t3_model,
+    resolve_base_t3_checkpoint_dir,
+)
 
 
 TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
@@ -66,6 +70,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         ckpt_dir,
         device,
         *,
+        base_checkpoint_dir: str | None = None,
         turbo_s3_checkpoint_dir: str | None = None,
         vllm_model_dir: str | None = None,
         vllm_export_dir: str | None = None,
@@ -77,17 +82,21 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
+        base_ckpt_dir = resolve_base_t3_checkpoint_dir(
+            ckpt_dir,
+            base_checkpoint_dir=base_checkpoint_dir,
+        )
         turbo_s3_dir = _resolve_turbo_s3_checkpoint_dir(turbo_s3_checkpoint_dir)
         map_location = _resolve_map_location(device)
 
         ve = VoiceEncoder()
         ve.load_state_dict(
-            torch.load(ckpt_dir / "ve.pt", map_location=map_location, weights_only=True)
+            torch.load(base_ckpt_dir / "ve.pt", map_location=map_location, weights_only=True)
         )
         ve.to(device).eval()
 
         prompt_builder_t3 = _load_prompt_builder_t3(
-            ckpt_dir,
+            base_ckpt_dir,
             vllm_prompt_builder_device,
         )
 
@@ -98,16 +107,17 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         )
         s3gen.to(device).eval()
 
-        tokenizer = MTLTokenizer(str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
+        tokenizer = MTLTokenizer(str(base_ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
 
         default_conds = None
-        if (builtin_voice := ckpt_dir / "conds.pt").exists():
+        if (builtin_voice := base_ckpt_dir / "conds.pt").exists():
             default_conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
         if vllm_model_dir is None:
             vllm_model_dir = export_vllm_t3_model(
                 ckpt_dir,
                 output_dir=vllm_export_dir,
+                base_checkpoint_dir=base_ckpt_dir,
                 use_symlink=(not vllm_export_copy),
             )
 

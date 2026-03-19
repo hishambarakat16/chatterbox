@@ -35,6 +35,7 @@ def load_model(
     device: str,
     checkpoint_dir: str | None,
     *,
+    base_checkpoint_dir: str | None = None,
     batching_window_ms: float = 5.0,
     text_bucket_width: int = 1,
     enable_alignment_controller: bool = False,
@@ -88,6 +89,7 @@ def load_model(
             return model_cls.from_local(
                 checkpoint_dir,
                 device,
+                base_checkpoint_dir=base_checkpoint_dir,
                 turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
                 vllm_model_dir=vllm_model_dir,
                 vllm_export_dir=vllm_export_dir,
@@ -431,6 +433,7 @@ def main():
     parser.add_argument("--audio-prompt-path")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--checkpoint-dir")
+    parser.add_argument("--base-checkpoint-dir")
     parser.add_argument("--concurrency-levels", type=int, nargs="+", required=True)
     parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--batching-window-ms", type=float, default=5.0)
@@ -464,6 +467,7 @@ def main():
         args.impl,
         args.device,
         args.checkpoint_dir,
+        base_checkpoint_dir=args.base_checkpoint_dir,
         batching_window_ms=args.batching_window_ms,
         text_bucket_width=args.text_bucket_width,
         enable_alignment_controller=args.enable_alignment_controller,
@@ -493,6 +497,7 @@ def main():
     if args.impl == "scheduled_turbo_s3":
         print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
     if args.impl == "vllm_turbo_s3":
+        print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
         print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
         print(f"vllm_model_dir={args.vllm_model_dir}")
         print(f"vllm_export_dir={args.vllm_export_dir}")

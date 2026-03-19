@@ -361,6 +361,7 @@ def main():
     parser.add_argument("--impl", choices=sorted(SESSION_IMPLS), default="scheduled_turbo_s3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--checkpoint-dir")
+    parser.add_argument("--base-checkpoint-dir")
     parser.add_argument("--hydra-checkpoint-dir")
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
     parser.add_argument("--turbo-s3-checkpoint-dir")
@@ -405,6 +406,7 @@ def main():
         args.impl,
         args.device,
         args.checkpoint_dir,
+        base_checkpoint_dir=args.base_checkpoint_dir,
         batching_window_ms=args.batching_window_ms,
         text_bucket_width=args.text_bucket_width,
         enable_alignment_controller=args.enable_alignment_controller,
@@ -426,6 +428,8 @@ def main():
     print(f"impl={args.impl}")
     print(f"device={args.device}")
     print(f"load_s={load_s:.4f}")
+    if args.impl == "vllm_turbo_s3":
+        print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
     print(f"warmup_runs={args.warmup_runs}")
     print(f"stagger_ms={args.stagger_ms}")
     print(f"batching_window_ms={args.batching_window_ms}")

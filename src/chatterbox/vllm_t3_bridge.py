@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
 
 from .models.t3.llama_configs import LLAMA_CONFIGS
 from .models.t3.modules.t3_config import T3Config
-from .mtl_tts import punc_norm
+from .mtl_tts import REPO_ID, punc_norm
 
 
 VLLM_T3_ARCHITECTURE = "ChatterboxT3ForCausalLM"
+BASE_T3_FILENAME = "t3_mtl23ls_v2.safetensors"
+HYDRA_HEADS_FILENAME = "t3_hydra_heads.safetensors"
 
 
 def optional_import_vllm():
@@ -61,21 +65,77 @@ def build_vllm_t3_config(hp: T3Config | None = None) -> dict:
     return cfg
 
 
+def resolve_base_t3_checkpoint_dir(
+    checkpoint_dir: str | Path | None,
+    *,
+    base_checkpoint_dir: str | Path | None = None,
+    allow_pretrained_fallback: bool = False,
+) -> Path:
+    searched: list[Path] = []
+    hydra_like_paths: list[Path] = []
+    for raw_path in [base_checkpoint_dir, checkpoint_dir]:
+        if raw_path is None:
+            continue
+        candidate = Path(raw_path)
+        searched.append(candidate)
+        if (candidate / BASE_T3_FILENAME).exists():
+            return candidate
+        if (candidate / HYDRA_HEADS_FILENAME).exists():
+            hydra_like_paths.append(candidate)
+
+    if allow_pretrained_fallback:
+        return Path(
+            snapshot_download(
+                repo_id=REPO_ID,
+                repo_type="model",
+                revision="main",
+                allow_patterns=[
+                    "ve.pt",
+                    BASE_T3_FILENAME,
+                    "grapheme_mtl_merged_expanded_v1.json",
+                    "conds.pt",
+                    "Cangjie5_TC.json",
+                ],
+                token=os.getenv("HF_TOKEN"),
+            )
+        )
+
+    if hydra_like_paths:
+        hydra_paths = ", ".join(str(path) for path in hydra_like_paths)
+        raise FileNotFoundError(
+            "Received a Hydra-head checkpoint directory, but the vLLM export/runtime path is Hydra-free "
+            f"and needs the base multilingual T3 checkpoint containing `{BASE_T3_FILENAME}`. "
+            f"Hydra-only paths seen: {hydra_paths}. "
+            "Pass `--base-checkpoint-dir /path/to/base_multilingual_ckpt` or use the exporter with `--from-pretrained`."
+        )
+
+    searched_desc = ", ".join(str(path) for path in searched) if searched else "<none>"
+    raise FileNotFoundError(
+        f"Could not find `{BASE_T3_FILENAME}` in: {searched_desc}. "
+        "Pass the base multilingual checkpoint dir, or use the exporter with `--from-pretrained`."
+    )
+
+
 def export_vllm_t3_model(
-    checkpoint_dir: str | Path,
+    checkpoint_dir: str | Path | None,
     output_dir: str | Path | None = None,
     *,
+    base_checkpoint_dir: str | Path | None = None,
+    allow_pretrained_fallback: bool = False,
     use_symlink: bool = True,
 ) -> Path:
-    checkpoint_dir = Path(checkpoint_dir)
+    requested_checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
+    base_checkpoint_dir = resolve_base_t3_checkpoint_dir(
+        checkpoint_dir,
+        base_checkpoint_dir=base_checkpoint_dir,
+        allow_pretrained_fallback=allow_pretrained_fallback,
+    )
     output_dir = Path(output_dir) if output_dir is not None else Path(
         tempfile.mkdtemp(prefix="chatterbox_vllm_t3_")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    source_weights = checkpoint_dir / "t3_mtl23ls_v2.safetensors"
-    if not source_weights.exists():
-        raise FileNotFoundError(f"Missing T3 checkpoint: {source_weights}")
+    source_weights = base_checkpoint_dir / BASE_T3_FILENAME
 
     config = build_vllm_t3_config(T3Config.multilingual())
     generation_config = {
@@ -84,7 +144,8 @@ def export_vllm_t3_model(
         "pad_token_id": config["pad_token_id"],
     }
     export_meta = {
-        "source_checkpoint_dir": str(checkpoint_dir),
+        "requested_checkpoint_dir": None if requested_checkpoint_dir is None else str(requested_checkpoint_dir),
+        "source_checkpoint_dir": str(base_checkpoint_dir),
         "source_weights": str(source_weights),
         "architecture": VLLM_T3_ARCHITECTURE,
         "hydra_supported": False,
