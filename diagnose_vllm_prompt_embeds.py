@@ -31,7 +31,13 @@ def parse_args():
     )
     parser.add_argument(
         "--mode",
-        choices=["inspect", "sequential_singletons", "batched"],
+        choices=[
+            "inspect",
+            "sequential_singletons",
+            "batched",
+            "engine_replay_singletons",
+            "engine_replay_zero_singletons",
+        ],
         default="inspect",
     )
     parser.add_argument("--device", default="cuda")
@@ -136,6 +142,36 @@ def inspect_requests(model, sessions, texts, args) -> list[dict]:
     return records
 
 
+def build_request_options(session, args):
+    return session.options.merged(
+        language_id=args.language_id,
+        exaggeration=args.exaggeration,
+        cfg_weight=args.cfg_weight,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        min_p=args.min_p,
+        top_p=args.top_p,
+        max_new_tokens=args.max_new_tokens,
+    )
+
+
+def prepare_engine_requests(model, sessions, texts, args) -> list[dict]:
+    worker = getattr(model, "worker", None)
+    if worker is None or not hasattr(worker, "_prepare_request"):
+        raise RuntimeError("The selected model does not expose the vLLM worker prepare path.")
+
+    prepared = []
+    for session, text in zip(sessions, texts):
+        prepared.append(
+            worker._prepare_request(
+                session=session,
+                text=text,
+                options=build_request_options(session, args),
+            )
+        )
+    return prepared
+
+
 def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> list[dict]:
     maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
@@ -174,6 +210,53 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
                 "t3_s": round(float(profile.get("t3_s", 0.0)), 4) if profile else 0.0,
                 "prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", row["t3_prompt_embed_seq_len"])),
                 "cond_seq_len": int(profile.get("t3_cond_seq_len", row["t3_cond_seq_len"])),
+            }
+        )
+    return results
+
+
+def run_engine_replay_singletons(model, sessions, texts, inspect_rows, args, *, zero_prompt_embeds: bool) -> list[dict]:
+    maybe_sync = runtime_helpers()["maybe_sync"]
+    worker = getattr(model, "worker", None)
+    if worker is None:
+        raise RuntimeError("The selected model does not expose the underlying worker.")
+
+    prepared_requests = prepare_engine_requests(model, sessions, texts, args)
+    results = []
+    for row, prepared in zip(inspect_rows, prepared_requests):
+        prompt = prepared["prompt"]
+        prompt_embeds = prompt["prompt_embeds"]
+        replay_prompt_embeds = prompt_embeds.clone()
+        if zero_prompt_embeds:
+            replay_prompt_embeds.zero_()
+        replay_prompt = {"prompt_embeds": replay_prompt_embeds}
+
+        started = time.perf_counter()
+        error = None
+        num_outputs = 0
+        try:
+            outputs = worker.vllm_engine.generate(
+                [replay_prompt],
+                sampling_params=prepared["sampling_params"],
+                use_tqdm=False,
+            )
+            maybe_sync(args.device)
+            num_outputs = len(outputs)
+        except Exception as exc:  # noqa: BLE001
+            error = repr(exc)
+            maybe_sync(args.device)
+
+        results.append(
+            {
+                "mode": "engine_replay_zero_singletons" if zero_prompt_embeds else "engine_replay_singletons",
+                "index": row["index"],
+                "shape_key": row["shape_key"],
+                "text": row["text"],
+                "error": error,
+                "wall_s": round(time.perf_counter() - started, 4),
+                "num_outputs": num_outputs,
+                "prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
+                "cond_seq_len": row["t3_cond_seq_len"],
             }
         )
     return results
@@ -333,6 +416,24 @@ def main():
         run_rows = []
     elif args.mode == "sequential_singletons":
         run_rows = run_sequential_singletons(model, sessions, texts, inspect_rows, args)
+    elif args.mode == "engine_replay_singletons":
+        run_rows = run_engine_replay_singletons(
+            model,
+            sessions,
+            texts,
+            inspect_rows,
+            args,
+            zero_prompt_embeds=False,
+        )
+    elif args.mode == "engine_replay_zero_singletons":
+        run_rows = run_engine_replay_singletons(
+            model,
+            sessions,
+            texts,
+            inspect_rows,
+            args,
+            zero_prompt_embeds=True,
+        )
     else:
         run_rows = run_batched(model, sessions, texts, inspect_rows, args)
 
