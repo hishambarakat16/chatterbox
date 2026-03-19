@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
-import torchaudio as ta
+
+from chatterbox.audio_utils import save_wav
 
 def maybe_sync(device: str):
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -397,7 +398,7 @@ def run_concurrency_level(
                 if wav is None or item["error"] is not None:
                     continue
                 wav_path = output_path / f"{impl}_c{concurrency}_r{index}.wav"
-                ta.save(str(wav_path), wav, model.sr)
+                save_wav(wav_path, wav, model.sr)
                 saved_wavs.append(str(wav_path))
 
         latencies = [item["latency_s"] for item in results if item["error"] is None]
@@ -491,7 +492,7 @@ def run_concurrency_level(
             if wav is None or item["error"] is not None:
                 continue
             wav_path = output_path / f"{impl}_c{concurrency}_r{index}.wav"
-            ta.save(str(wav_path), wav, model.sr)
+            save_wav(wav_path, wav, model.sr)
             saved_wavs.append(str(wav_path))
 
     latencies = [item["latency_s"] for item in results if item["error"] is None]

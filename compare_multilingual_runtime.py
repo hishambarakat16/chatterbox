@@ -5,7 +5,8 @@ import os
 import time
 
 import torch
-import torchaudio as ta
+
+from chatterbox.audio_utils import save_wav
 
 def maybe_sync(device: str):
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -324,7 +325,7 @@ def main():
         if wav is not None:
             print(f"num_samples={wav.shape[-1]}")
             if args.output_wav:
-                ta.save(args.output_wav, wav, model.sr)
+                save_wav(args.output_wav, wav, model.sr)
                 print(f"saved_wav={args.output_wav}")
     finally:
         if model is not None and hasattr(model, "close"):

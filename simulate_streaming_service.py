@@ -8,8 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import torchaudio as ta
-
+from chatterbox.audio_utils import save_wav
 from benchmark_multilingual_concurrency import (
     begin_vram_measurement,
     describe_vllm_hydra_mode,
@@ -207,7 +206,7 @@ def save_representative_wavs(
             for item in ok:
                 wav_path = output_dir / "wav_outputs" / f"c{level}_round{item['round_index']}_req{item['request_index']}.wav"
                 wav_path.parent.mkdir(parents=True, exist_ok=True)
-                ta.save(str(wav_path), item["wav"], sample_rate)
+                save_wav(wav_path, item["wav"], sample_rate)
                 item["wav_path"] = str(wav_path)
                 level_saved.append(str(wav_path))
             saved.append({
@@ -221,7 +220,7 @@ def save_representative_wavs(
         representative = min(ok, key=lambda item: abs(request_metric(item, "audio_ready_s") - median_target))
         wav_path = output_dir / "wav_outputs" / f"representative_c{level}.wav"
         wav_path.parent.mkdir(parents=True, exist_ok=True)
-        ta.save(str(wav_path), representative["wav"], sample_rate)
+        save_wav(wav_path, representative["wav"], sample_rate)
         representative["wav_path"] = str(wav_path)
         saved.append({
             "concurrency": level,
