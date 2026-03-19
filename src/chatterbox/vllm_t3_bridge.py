@@ -11,12 +11,46 @@ from huggingface_hub import snapshot_download
 
 from .models.t3.llama_configs import LLAMA_CONFIGS
 from .models.t3.modules.t3_config import T3Config
-from .mtl_tts import REPO_ID, punc_norm
 
 
 VLLM_T3_ARCHITECTURE = "ChatterboxT3ForCausalLM"
 BASE_T3_FILENAME = "t3_mtl23ls_v2.safetensors"
 HYDRA_HEADS_FILENAME = "t3_hydra_heads.safetensors"
+REPO_ID = "ResembleAI/chatterbox"
+
+
+def punc_norm(text: str) -> str:
+    if len(text) == 0:
+        return "You need to add some text for me to talk."
+
+    if text[0].islower():
+        text = text[0].upper() + text[1:]
+
+    text = " ".join(text.split())
+
+    punc_to_replace = [
+        ("...", ", "),
+        ("…", ", "),
+        (":", ","),
+        (" - ", ", "),
+        (";", ", "),
+        ("—", "-"),
+        ("–", "-"),
+        (" ,", ","),
+        ("“", "\""),
+        ("”", "\""),
+        ("‘", "'"),
+        ("’", "'"),
+    ]
+    for old_char_sequence, new_char in punc_to_replace:
+        text = text.replace(old_char_sequence, new_char)
+
+    text = text.rstrip(" ")
+    sentence_enders = {".", "!", "?", "-", ",", "、", "，", "。", "？", "！"}
+    if not any(text.endswith(p) for p in sentence_enders):
+        text += "."
+
+    return text
 
 
 def optional_import_vllm():
