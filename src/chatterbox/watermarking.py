@@ -1,4 +1,7 @@
-import perth
+try:
+    import perth
+except Exception:  # pragma: no cover - watermarking is optional in service envs
+    perth = None
 
 
 class PassthroughWatermarker:
@@ -10,6 +13,9 @@ class PassthroughWatermarker:
 
 
 def create_watermarker():
+    if perth is None:
+        return PassthroughWatermarker()
+
     implicit_cls = getattr(perth, "PerthImplicitWatermarker", None)
     if callable(implicit_cls):
         try:

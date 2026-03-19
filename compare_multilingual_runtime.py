@@ -7,17 +7,36 @@ import time
 import torch
 import torchaudio as ta
 
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
-from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
-from chatterbox.mtl_tts_scheduled_turbo_s3 import ChatterboxMultilingualScheduledTurboS3TTS
-from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
-from chatterbox.mtl_tts_vllm_turbo_s3 import ChatterboxMultilingualVllmTurboS3TTS
-
-
 def maybe_sync(device: str):
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def resolve_model_cls(impl: str):
+    if impl == "baseline":
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+        return ChatterboxMultilingualTTS
+    if impl == "streaming":
+        from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
+
+        return ChatterboxMultilingualStreamingTTS
+    if impl == "concurrent":
+        from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
+
+        return ChatterboxMultilingualConcurrentTTS
+    if impl == "scheduled_turbo_s3":
+        from chatterbox.mtl_tts_scheduled_turbo_s3 import ChatterboxMultilingualScheduledTurboS3TTS
+
+        return ChatterboxMultilingualScheduledTurboS3TTS
+    if impl == "vllm_turbo_s3":
+        from chatterbox.mtl_tts_vllm_turbo_s3 import ChatterboxMultilingualVllmTurboS3TTS
+
+        return ChatterboxMultilingualVllmTurboS3TTS
+
+    from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
+
+    return ChatterboxMultilingualScheduledTTS
 
 
 def load_model(
@@ -41,18 +60,7 @@ def load_model(
     vllm_dtype: str = "auto",
     vllm_export_copy: bool = False,
 ):
-    if impl == "baseline":
-        model_cls = ChatterboxMultilingualTTS
-    elif impl == "streaming":
-        model_cls = ChatterboxMultilingualStreamingTTS
-    elif impl == "concurrent":
-        model_cls = ChatterboxMultilingualConcurrentTTS
-    elif impl == "scheduled_turbo_s3":
-        model_cls = ChatterboxMultilingualScheduledTurboS3TTS
-    elif impl == "vllm_turbo_s3":
-        model_cls = ChatterboxMultilingualVllmTurboS3TTS
-    else:
-        model_cls = ChatterboxMultilingualScheduledTTS
+    model_cls = resolve_model_cls(impl)
     if checkpoint_dir:
         if impl == "scheduled":
             return model_cls.from_local(
