@@ -278,6 +278,9 @@ def run_vllm_service_round(
         batch_error = None
         batch_results = []
         try:
+            # Unlike the benchmark helper, this path may submit varied texts with
+            # arrival-driven cohorting. Keeping the call site obvious helps compare
+            # the service shim against the benchmark's single `[text] * concurrency` batch.
             batch_results = model.generate_many_with_sessions(
                 [item["session"] for item in cohort],
                 [item["text"] for item in cohort],
@@ -476,6 +479,9 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `impl`: `{report['impl']}`")
     lines.append(f"- `device`: `{report['device']}`")
     lines.append(f"- `language_id`: `{report['language_id']}`")
+    lines.append(f"- `request_text_mode`: `{'fixed' if report.get('fixed_text') else 'rotating_sentences'}`")
+    if report.get("fixed_text"):
+        lines.append(f"- `fixed_text`: `{report['fixed_text']}`")
     lines.append(f"- `stagger_ms`: `{report['stagger_ms']}`")
     lines.append(f"- `batching_window_ms`: `{report['batching_window_ms']}`")
     lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
@@ -621,6 +627,7 @@ def main():
     parser.add_argument("--audio-prompt-path", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--sentences-file")
+    parser.add_argument("--fixed-text")
     parser.add_argument("--concurrency-levels", nargs="+", type=int, default=[1, 2, 4, 6, 8])
     parser.add_argument("--rounds-per-level", type=int, default=2)
     parser.add_argument("--stagger-ms", type=float, default=250.0)
@@ -638,8 +645,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
 
-    sentences = load_sentences(args.sentences_file)
-    warmup_text = args.warmup_text or sentences[0]
+    sentences = [] if args.fixed_text else load_sentences(args.sentences_file)
+    warmup_text = args.warmup_text or args.fixed_text or sentences[0]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_vllm_enforce_eager = args.vllm_enforce_eager
@@ -697,6 +704,7 @@ def main():
         print(f"stagger_ms={args.stagger_ms}")
         print(f"batching_window_ms={args.batching_window_ms}")
         print(f"text_bucket_width={effective_text_bucket_width}")
+        print(f"request_text_mode={'fixed' if args.fixed_text else 'rotating_sentences'}")
         if args.impl == "vllm_turbo_s3":
             print(f"vllm_prompt_len_only_grouping={not args.allow_vllm_text_bucketing}")
         print(f"rounds_per_level={args.rounds_per_level}")
@@ -748,10 +756,13 @@ def main():
                     for _ in range(level)
                 ]
 
-                texts = []
-                for _ in range(level):
-                    texts.append(sentences[sentence_cursor % len(sentences)])
-                    sentence_cursor += 1
+                if args.fixed_text:
+                    texts = [args.fixed_text] * level
+                else:
+                    texts = []
+                    for _ in range(level):
+                        texts.append(sentences[sentence_cursor % len(sentences)])
+                        sentence_cursor += 1
 
                 if args.impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
                     round_results, round_wall_s = run_vllm_service_round(
@@ -884,6 +895,7 @@ def main():
             "language_id": args.language_id,
             "audio_prompt_path": args.audio_prompt_path,
             "sentences_file": str(DEFAULT_SENTENCES_FILE if args.sentences_file is None else Path(args.sentences_file)),
+            "fixed_text": args.fixed_text,
             "warmup_runs": args.warmup_runs,
             "warmup_text": warmup_text,
             "rounds_per_level": args.rounds_per_level,

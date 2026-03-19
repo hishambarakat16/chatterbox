@@ -349,6 +349,9 @@ def run_concurrency_level(
         started = time.perf_counter()
         errors = []
         try:
+            # The benchmark's healthy `vLLM` path is intentionally one
+            # benchmark-shaped batch: same text, same request options,
+            # N independent sessions, one shared engine call.
             batched_results = model.generate_many_with_sessions(
                 sessions,
                 [text] * concurrency,
