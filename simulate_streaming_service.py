@@ -21,7 +21,7 @@ from benchmark_multilingual_concurrency import (
 
 
 DEFAULT_SENTENCES_FILE = Path(__file__).with_name("arabic_streaming_sentences.txt")
-SESSION_IMPLS = {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3"}
+SESSION_IMPLS = {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"}
 
 
 def load_sentences(path: str | None) -> list[str]:
@@ -363,6 +363,14 @@ def main():
     parser.add_argument("--hydra-checkpoint-dir")
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
     parser.add_argument("--turbo-s3-checkpoint-dir")
+    parser.add_argument("--vllm-model-dir")
+    parser.add_argument("--vllm-export-dir")
+    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-enforce-eager", action="store_true")
+    parser.add_argument("--vllm-dtype", default="auto")
+    parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--batching-window-ms", type=float, default=5.0)
     parser.add_argument("--text-bucket-width", type=int, default=1)
@@ -402,6 +410,14 @@ def main():
         hydra_checkpoint_dir=args.hydra_checkpoint_dir,
         hydra_speculate_k=args.hydra_speculate_k,
         turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
+        vllm_model_dir=args.vllm_model_dir,
+        vllm_export_dir=args.vllm_export_dir,
+        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_enforce_eager=args.vllm_enforce_eager,
+        vllm_dtype=args.vllm_dtype,
+        vllm_export_copy=args.vllm_export_copy,
     )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start

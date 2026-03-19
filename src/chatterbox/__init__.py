@@ -12,3 +12,5 @@ from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 from .mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
 from .mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
 from .mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
+from .mtl_tts_scheduled_turbo_s3 import ChatterboxMultilingualScheduledTurboS3TTS
+from .mtl_tts_vllm_turbo_s3 import ChatterboxMultilingualVllmTurboS3TTS

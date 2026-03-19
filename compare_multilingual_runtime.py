@@ -12,6 +12,7 @@ from chatterbox.mtl_tts_concurrent import ChatterboxMultilingualConcurrentTTS
 from chatterbox.mtl_tts_scheduled import ChatterboxMultilingualScheduledTTS
 from chatterbox.mtl_tts_scheduled_turbo_s3 import ChatterboxMultilingualScheduledTurboS3TTS
 from chatterbox.mtl_tts_streaming import ChatterboxMultilingualStreamingTTS
+from chatterbox.mtl_tts_vllm_turbo_s3 import ChatterboxMultilingualVllmTurboS3TTS
 
 
 def maybe_sync(device: str):
@@ -30,6 +31,14 @@ def load_model(
     hydra_checkpoint_dir: str | None = None,
     hydra_speculate_k: int = 3,
     turbo_s3_checkpoint_dir: str | None = None,
+    vllm_model_dir: str | None = None,
+    vllm_export_dir: str | None = None,
+    vllm_prompt_builder_device: str = "cpu",
+    vllm_tensor_parallel_size: int = 1,
+    vllm_gpu_memory_utilization: float = 0.9,
+    vllm_enforce_eager: bool = False,
+    vllm_dtype: str = "auto",
+    vllm_export_copy: bool = False,
 ):
     if impl == "baseline":
         model_cls = ChatterboxMultilingualTTS
@@ -39,6 +48,8 @@ def load_model(
         model_cls = ChatterboxMultilingualConcurrentTTS
     elif impl == "scheduled_turbo_s3":
         model_cls = ChatterboxMultilingualScheduledTurboS3TTS
+    elif impl == "vllm_turbo_s3":
+        model_cls = ChatterboxMultilingualVllmTurboS3TTS
     else:
         model_cls = ChatterboxMultilingualScheduledTTS
     if checkpoint_dir:
@@ -63,6 +74,20 @@ def load_model(
                 hydra_checkpoint_dir=hydra_checkpoint_dir,
                 hydra_speculate_k=hydra_speculate_k,
             )
+        if impl == "vllm_turbo_s3":
+            return model_cls.from_local(
+                checkpoint_dir,
+                device,
+                turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
+                vllm_model_dir=vllm_model_dir,
+                vllm_export_dir=vllm_export_dir,
+                vllm_prompt_builder_device=vllm_prompt_builder_device,
+                vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+                vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+                vllm_enforce_eager=vllm_enforce_eager,
+                vllm_dtype=vllm_dtype,
+                vllm_export_copy=vllm_export_copy,
+            )
         return model_cls.from_local(checkpoint_dir, device)
     if impl == "scheduled":
         return model_cls.from_pretrained(
@@ -82,6 +107,19 @@ def load_model(
             enable_alignment_controller=enable_alignment_controller,
             hydra_checkpoint_dir=hydra_checkpoint_dir,
             hydra_speculate_k=hydra_speculate_k,
+        )
+    if impl == "vllm_turbo_s3":
+        return model_cls.from_pretrained(
+            device,
+            turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
+            vllm_model_dir=vllm_model_dir,
+            vllm_export_dir=vllm_export_dir,
+            vllm_prompt_builder_device=vllm_prompt_builder_device,
+            vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+            vllm_enforce_eager=vllm_enforce_eager,
+            vllm_dtype=vllm_dtype,
+            vllm_export_copy=vllm_export_copy,
         )
     return model_cls.from_pretrained(device)
 
@@ -113,7 +151,7 @@ def _call_with_supported_kwargs(fn, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare multilingual Chatterbox runtime variants.")
-    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled", "scheduled_turbo_s3"], required=True)
+    parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"], required=True)
     parser.add_argument("--text", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--audio-prompt-path")
@@ -125,6 +163,14 @@ def main():
     parser.add_argument("--hydra-checkpoint-dir")
     parser.add_argument("--hydra-speculate-k", type=int, default=3)
     parser.add_argument("--turbo-s3-checkpoint-dir")
+    parser.add_argument("--vllm-model-dir")
+    parser.add_argument("--vllm-export-dir")
+    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-enforce-eager", action="store_true")
+    parser.add_argument("--vllm-dtype", default="auto")
+    parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--repetition-penalty", type=float, default=2.0)
@@ -150,11 +196,19 @@ def main():
         hydra_checkpoint_dir=args.hydra_checkpoint_dir,
         hydra_speculate_k=args.hydra_speculate_k,
         turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
+        vllm_model_dir=args.vllm_model_dir,
+        vllm_export_dir=args.vllm_export_dir,
+        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_enforce_eager=args.vllm_enforce_eager,
+        vllm_dtype=args.vllm_dtype,
+        vllm_export_copy=args.vllm_export_copy,
     )
     maybe_sync(args.device)
     load_s = time.perf_counter() - load_start
 
-    if args.impl in {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3"}:
+    if args.impl in {"streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"}:
         session = model.create_session(
             audio_prompt_path=args.audio_prompt_path,
             language_id=args.language_id,
@@ -206,6 +260,15 @@ def main():
         print(f"text_bucket_width={args.text_bucket_width}")
     if args.impl == "scheduled_turbo_s3":
         print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
+    if args.impl == "vllm_turbo_s3":
+        print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
+        print(f"vllm_model_dir={args.vllm_model_dir}")
+        print(f"vllm_export_dir={args.vllm_export_dir}")
+        print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
+        print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
+        print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
+        print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
+        print(f"vllm_dtype={args.vllm_dtype}")
     print(f"cfg_weight={args.cfg_weight}")
     print(f"temperature={args.temperature}")
     print(f"repetition_penalty={args.repetition_penalty}")
