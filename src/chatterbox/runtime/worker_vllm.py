@@ -9,6 +9,73 @@ from .worker import ChatterboxMultilingualStreamingWorker
 from ..vllm_t3_bridge import build_prompt_embeds, make_sampling_params, prepare_vllm_text_tokens
 
 
+def _find_repeated_suffix(
+    token_ids: list[int],
+    *,
+    min_repeats: int = 3,
+    max_pattern_size: int = 4,
+):
+    if len(token_ids) < min_repeats:
+        return None
+
+    best = None
+    limit = min(max_pattern_size, len(token_ids) // min_repeats)
+    for pattern_size in range(1, limit + 1):
+        suffix = token_ids[-pattern_size:]
+        repeats = 1
+        pos = len(token_ids) - pattern_size
+        while pos - pattern_size >= 0 and token_ids[pos - pattern_size : pos] == suffix:
+            repeats += 1
+            pos -= pattern_size
+        if repeats < min_repeats:
+            continue
+        trim_index = pos + pattern_size
+        trim_tokens = len(token_ids) - trim_index
+        candidate = {
+            "trim_index": trim_index,
+            "trim_tokens": trim_tokens,
+            "pattern_size": pattern_size,
+            "repeats": repeats,
+        }
+        if best is None or candidate["trim_tokens"] > best["trim_tokens"]:
+            best = candidate
+    return best
+
+
+def _trim_length_capped_tail(
+    token_ids: list[int],
+    *,
+    finish_reason: str | None,
+    stop_token_id: int,
+):
+    diagnostics = {
+        "generated_tokens": float(len(token_ids)),
+        "finish_reason_stop": 1.0 if finish_reason == "stop" else 0.0,
+        "finish_reason_length": 1.0 if finish_reason == "length" else 0.0,
+        "output_has_stop_token": 1.0 if stop_token_id in token_ids else 0.0,
+        "tail_trimmed": 0.0,
+        "tail_trim_tokens": 0.0,
+        "tail_trim_pattern_size": 0.0,
+        "tail_trim_repeats": 0.0,
+    }
+
+    if finish_reason != "length" or stop_token_id in token_ids:
+        return token_ids, diagnostics
+
+    repeated_suffix = _find_repeated_suffix(token_ids)
+    if repeated_suffix is None:
+        return token_ids, diagnostics
+
+    trim_index = repeated_suffix["trim_index"]
+    trimmed = token_ids[:trim_index]
+    diagnostics["tail_trimmed"] = 1.0
+    diagnostics["tail_trim_tokens"] = float(repeated_suffix["trim_tokens"])
+    diagnostics["tail_trim_pattern_size"] = float(repeated_suffix["pattern_size"])
+    diagnostics["tail_trim_repeats"] = float(repeated_suffix["repeats"])
+    diagnostics["generated_tokens"] = float(len(trimmed))
+    return trimmed, diagnostics
+
+
 class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
     """
     Experimental vLLM T3 worker.
@@ -103,11 +170,35 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             "sampling_params": sampling_params,
         }
 
-    def _finalize_request(self, *, prepared: dict, token_ids: list[int], t3_duration_s: float) -> tuple[torch.Tensor, dict]:
+    def _finalize_request(
+        self,
+        *,
+        prepared: dict,
+        output,
+        t3_duration_s: float,
+    ) -> tuple[torch.Tensor, dict]:
         profile = prepared["profile"]
         profile["t3_s"] = t3_duration_s
         profile["t3_active_s"] = t3_duration_s
         profile["t3_batch_size"] = float(prepared.get("batch_size", 1))
+        token_ids = list(output.token_ids) if output is not None else []
+        finish_reason = getattr(output, "finish_reason", None)
+        stop_reason = getattr(output, "stop_reason", None)
+        stop_token_id = int(self.prompt_builder_t3.hp.stop_speech_token)
+        token_ids, trim_diag = _trim_length_capped_tail(
+            token_ids,
+            finish_reason=finish_reason,
+            stop_token_id=stop_token_id,
+        )
+        profile["t3_finish_reason_stop"] = trim_diag["finish_reason_stop"]
+        profile["t3_finish_reason_length"] = trim_diag["finish_reason_length"]
+        profile["t3_output_has_stop_token"] = trim_diag["output_has_stop_token"]
+        profile["t3_generated_tokens"] = trim_diag["generated_tokens"]
+        profile["t3_tail_trimmed"] = trim_diag["tail_trimmed"]
+        profile["t3_tail_trim_tokens"] = trim_diag["tail_trim_tokens"]
+        profile["t3_tail_trim_pattern_size"] = trim_diag["tail_trim_pattern_size"]
+        profile["t3_tail_trim_repeats"] = trim_diag["tail_trim_repeats"]
+        profile["t3_stop_reason_is_stop_token"] = 1.0 if stop_reason == stop_token_id else 0.0
 
         speech_tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device)
         if speech_tokens.ndim == 1:
@@ -139,10 +230,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
                 use_tqdm=False,
             )
             t3_duration_s = time.perf_counter() - t3_start
-            token_ids = outputs[0].outputs[0].token_ids if outputs and outputs[0].outputs else []
             output_wav, profile = self._finalize_request(
                 prepared=prepared,
-                token_ids=token_ids,
+                output=(outputs[0].outputs[0] if outputs and outputs[0].outputs else None),
                 t3_duration_s=t3_duration_s,
             )
         self._set_last_profile(profile)
@@ -181,10 +271,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             for item in prepared:
                 item["batch_size"] = len(prepared)
             for item, output in zip(prepared, outputs):
-                token_ids = output.outputs[0].token_ids if output.outputs else []
                 wav, profile = self._finalize_request(
                     prepared=item,
-                    token_ids=token_ids,
+                    output=(output.outputs[0] if output.outputs else None),
                     t3_duration_s=t3_duration_s,
                 )
                 results.append(
