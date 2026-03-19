@@ -56,11 +56,21 @@ def punc_norm(text: str) -> str:
 def optional_import_vllm():
     try:
         from vllm import LLM, ModelRegistry, SamplingParams
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm":
+            raise
         raise ImportError(
             "vLLM is not installed in the active environment. "
             "Activate your dedicated vLLM env (for example `conda activate chatterbox-vllm`) "
             "or install `vllm` into the current env. "
+            "See `GPU_MIGRATION_SERVING_PLAN.md`."
+        ) from exc
+    except ImportError as exc:
+        raise ImportError(
+            "vLLM is installed but failed to import. "
+            f"Original error: {exc}. "
+            "This usually means a CUDA / wheel mismatch in the vLLM environment. "
+            "Recreate the env, install vLLM with an explicit CUDA backend, and retry. "
             "See `GPU_MIGRATION_SERVING_PLAN.md`."
         ) from exc
     return LLM, ModelRegistry, SamplingParams
