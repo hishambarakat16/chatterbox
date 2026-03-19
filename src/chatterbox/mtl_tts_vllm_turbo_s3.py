@@ -80,6 +80,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
+        vllm_enable_prefix_caching: bool = True,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -129,6 +130,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             enforce_eager=vllm_enforce_eager,
             dtype=vllm_dtype,
             max_model_len=vllm_max_model_len,
+            enable_prefix_caching=vllm_enable_prefix_caching,
         )
 
         worker = ChatterboxMultilingualVllmWorker(
@@ -158,6 +160,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
+        vllm_enable_prefix_caching: bool = True,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():
@@ -190,6 +193,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             vllm_enforce_eager=vllm_enforce_eager,
             vllm_dtype=vllm_dtype,
             vllm_max_model_len=vllm_max_model_len,
+            vllm_enable_prefix_caching=vllm_enable_prefix_caching,
             vllm_export_copy=vllm_export_copy,
         )
 
