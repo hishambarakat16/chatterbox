@@ -155,8 +155,13 @@ def group_vllm_pending_requests(
         grouped_by_prompt.setdefault(item["prompt_len"], []).append(item)
 
     grouped: list[tuple[tuple[int, int], list[dict]]] = []
-    width = max(1, int(text_bucket_width))
+    width = int(text_bucket_width)
     for prompt_len, items in sorted(grouped_by_prompt.items(), key=lambda item: item[0]):
+        if width <= 0:
+            max_text_len = max(item["text_len"] for item in items)
+            grouped.append(((max_text_len, prompt_len), sorted(items, key=lambda item: item["arrival_offset_s"])))
+            continue
+
         ordered = sorted(items, key=lambda item: item["text_len"])
         current_items: list[dict] = []
         current_min = 0
@@ -255,7 +260,13 @@ def run_vllm_service_round(
         if not grouped_pending:
             continue
 
-        group_key, cohort = grouped_pending[0]
+        group_key, cohort = max(
+            grouped_pending,
+            key=lambda item: (
+                len(item[1]),
+                -min(entry["arrival_offset_s"] for entry in item[1]),
+            ),
+        )
         cohort_ids = {item["request_index"] for item in cohort}
         pending_requests = [
             item for item in pending_requests if item["request_index"] not in cohort_ids
@@ -470,6 +481,9 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
     if report["impl"] == "vllm_turbo_s3":
         lines.append(f"- `vllm_enforce_eager`: `{report.get('vllm_enforce_eager', False)}`")
+        lines.append(
+            f"- `vllm_prompt_len_only_grouping`: `{report.get('vllm_prompt_len_only_grouping', False)}`"
+        )
     lines.append(f"- `rounds_per_level`: `{report['rounds_per_level']}`")
     lines.append(f"- `warmup_runs`: `{report['warmup_runs']}`")
     lines.append("")
@@ -603,6 +617,7 @@ def main():
     parser.add_argument("--enable-alignment-controller", action="store_true")
     parser.add_argument("--batching-window-ms", type=float, default=5.0)
     parser.add_argument("--text-bucket-width", type=int, default=1)
+    parser.add_argument("--allow-vllm-text-bucketing", action="store_true")
     parser.add_argument("--audio-prompt-path", required=True)
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--sentences-file")
@@ -630,6 +645,9 @@ def main():
     effective_vllm_enforce_eager = args.vllm_enforce_eager
     if args.impl == "vllm_turbo_s3" and not args.allow_vllm_compiled_service_sim:
         effective_vllm_enforce_eager = True
+    effective_text_bucket_width = args.text_bucket_width
+    if args.impl == "vllm_turbo_s3" and not args.allow_vllm_text_bucketing:
+        effective_text_bucket_width = 0
 
     model = None
     try:
@@ -640,7 +658,7 @@ def main():
             args.checkpoint_dir,
             base_checkpoint_dir=args.base_checkpoint_dir,
             batching_window_ms=args.batching_window_ms,
-            text_bucket_width=args.text_bucket_width,
+            text_bucket_width=effective_text_bucket_width,
             enable_alignment_controller=args.enable_alignment_controller,
             hydra_checkpoint_dir=args.hydra_checkpoint_dir,
             hydra_speculate_k=args.hydra_speculate_k,
@@ -678,7 +696,9 @@ def main():
         print(f"warmup_runs={args.warmup_runs}")
         print(f"stagger_ms={args.stagger_ms}")
         print(f"batching_window_ms={args.batching_window_ms}")
-        print(f"text_bucket_width={args.text_bucket_width}")
+        print(f"text_bucket_width={effective_text_bucket_width}")
+        if args.impl == "vllm_turbo_s3":
+            print(f"vllm_prompt_len_only_grouping={not args.allow_vllm_text_bucketing}")
         print(f"rounds_per_level={args.rounds_per_level}")
         print(f"save_mode={args.save_mode}")
         for note in describe_vllm_hydra_mode(
@@ -743,7 +763,7 @@ def main():
                         round_index=round_index,
                         stagger_ms=args.stagger_ms,
                         batching_window_ms=args.batching_window_ms,
-                        text_bucket_width=args.text_bucket_width,
+                        text_bucket_width=effective_text_bucket_width,
                         cfg_weight=args.cfg_weight,
                         temperature=args.temperature,
                         repetition_penalty=args.repetition_penalty,
@@ -869,8 +889,11 @@ def main():
             "rounds_per_level": args.rounds_per_level,
             "stagger_ms": args.stagger_ms,
             "batching_window_ms": args.batching_window_ms,
-            "text_bucket_width": args.text_bucket_width,
+            "text_bucket_width": effective_text_bucket_width,
             "vllm_enforce_eager": effective_vllm_enforce_eager,
+            "vllm_prompt_len_only_grouping": (
+                args.impl == "vllm_turbo_s3" and not args.allow_vllm_text_bucketing
+            ),
             "save_mode": args.save_mode,
             "levels": sanitize_level_summaries(level_summaries),
             "saved_audio": saved_audio,
