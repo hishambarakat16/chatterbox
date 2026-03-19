@@ -119,6 +119,228 @@ def histogram(values: list[int | str]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda item: item[0]))
 
 
+def estimate_vllm_text_len(model, text: str, language_id: str) -> int:
+    worker = getattr(model, "worker", None)
+    tokenizer = getattr(worker, "tokenizer", None)
+    if tokenizer is not None:
+        try:
+            tokens = tokenizer.text_to_tokens(
+                text,
+                language_id=language_id.lower() if language_id else None,
+            )
+            return int(tokens.numel())
+        except Exception:
+            pass
+    return max(1, len(text.split()))
+
+
+def estimate_vllm_prompt_len(session) -> int:
+    t3_cond = getattr(getattr(session, "conditionals", None), "t3", None)
+    prompt_tokens = getattr(t3_cond, "cond_prompt_speech_tokens", None)
+    if prompt_tokens is None:
+        return 0
+    return int(prompt_tokens.shape[-1])
+
+
+def group_vllm_pending_requests(
+    pending_requests: list[dict],
+    *,
+    text_bucket_width: int,
+) -> list[tuple[tuple[int, int], list[dict]]]:
+    if not pending_requests:
+        return []
+
+    grouped_by_prompt: dict[int, list[dict]] = {}
+    for item in pending_requests:
+        grouped_by_prompt.setdefault(item["prompt_len"], []).append(item)
+
+    grouped: list[tuple[tuple[int, int], list[dict]]] = []
+    width = max(1, int(text_bucket_width))
+    for prompt_len, items in sorted(grouped_by_prompt.items(), key=lambda item: item[0]):
+        ordered = sorted(items, key=lambda item: item["text_len"])
+        current_items: list[dict] = []
+        current_min = 0
+        current_max = 0
+        for item in ordered:
+            text_len = item["text_len"]
+            if not current_items:
+                current_items = [item]
+                current_min = text_len
+                current_max = text_len
+                continue
+
+            next_min = min(current_min, text_len)
+            next_max = max(current_max, text_len)
+            if (next_max - next_min) >= width:
+                grouped.append(((current_max, prompt_len), current_items))
+                current_items = [item]
+                current_min = text_len
+                current_max = text_len
+                continue
+
+            current_items.append(item)
+            current_min = next_min
+            current_max = next_max
+
+        if current_items:
+            grouped.append(((current_max, prompt_len), current_items))
+
+    return grouped
+
+
+def run_vllm_service_round(
+    *,
+    model,
+    sessions: list,
+    texts: list[str],
+    language_id: str,
+    device: str,
+    round_index: int,
+    stagger_ms: float,
+    batching_window_ms: float,
+    text_bucket_width: int,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+    max_new_tokens: int,
+) -> tuple[list[dict], float]:
+    scheduled_requests = []
+    for index, (session, text) in enumerate(zip(sessions, texts)):
+        scheduled_requests.append(
+            {
+                "round_index": round_index,
+                "request_index": index,
+                "session": session,
+                "text": text,
+                "arrival_offset_s": index * stagger_ms / 1000.0,
+                "text_len": estimate_vllm_text_len(model, text, language_id),
+                "prompt_len": estimate_vllm_prompt_len(session),
+            }
+        )
+
+    pending_requests: list[dict] = []
+    next_request_idx = 0
+    service_time_s = 0.0
+    batching_window_s = batching_window_ms / 1000.0
+    round_results: list[dict | None] = [None] * len(scheduled_requests)
+
+    while next_request_idx < len(scheduled_requests) or pending_requests:
+        if not pending_requests and next_request_idx < len(scheduled_requests):
+            service_time_s = max(
+                service_time_s,
+                scheduled_requests[next_request_idx]["arrival_offset_s"],
+            )
+
+        while (
+            next_request_idx < len(scheduled_requests)
+            and scheduled_requests[next_request_idx]["arrival_offset_s"] <= service_time_s
+        ):
+            pending_requests.append(scheduled_requests[next_request_idx])
+            next_request_idx += 1
+
+        batching_deadline_s = service_time_s + batching_window_s
+        while (
+            next_request_idx < len(scheduled_requests)
+            and scheduled_requests[next_request_idx]["arrival_offset_s"] <= batching_deadline_s
+        ):
+            pending_requests.append(scheduled_requests[next_request_idx])
+            next_request_idx += 1
+
+        grouped_pending = group_vllm_pending_requests(
+            pending_requests,
+            text_bucket_width=text_bucket_width,
+        )
+        if not grouped_pending:
+            continue
+
+        group_key, cohort = grouped_pending[0]
+        cohort_ids = {item["request_index"] for item in cohort}
+        pending_requests = [
+            item for item in pending_requests if item["request_index"] not in cohort_ids
+        ]
+        active_cohorts_at_admit = max(0, len(grouped_pending) - 1)
+        cohort_size = len(cohort)
+
+        batch_started = time.perf_counter()
+        batch_error = None
+        batch_results = []
+        try:
+            batch_results = model.generate_many_with_sessions(
+                [item["session"] for item in cohort],
+                [item["text"] for item in cohort],
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+            )
+            maybe_sync(device)
+        except Exception as exc:  # noqa: BLE001
+            batch_error = repr(exc)
+            maybe_sync(device)
+        batch_wall_s = time.perf_counter() - batch_started
+        batch_started_at_s = service_time_s
+        service_time_s = batch_started_at_s + batch_wall_s
+
+        if batch_error is not None:
+            for item in cohort:
+                queue_wait_s = max(0.0, batch_started_at_s - item["arrival_offset_s"])
+                round_results[item["request_index"]] = {
+                    "round_index": item["round_index"],
+                    "request_index": item["request_index"],
+                    "session_id": item["session"].session_id,
+                    "text": item["text"],
+                    "arrival_offset_s": round(item["arrival_offset_s"], 4),
+                    "started_at_s": round(batch_started_at_s, 4),
+                    "latency_s": round(queue_wait_s + batch_wall_s, 4),
+                    "num_samples": None,
+                    "error": batch_error,
+                    "wav": None,
+                    "profile": {},
+                }
+            continue
+
+        for item, batch_item in zip(cohort, batch_results):
+            wav = batch_item["wav"]
+            profile = dict(batch_item["profile"])
+            queue_wait_s = max(0.0, batch_started_at_s - item["arrival_offset_s"])
+            profile["t3_wait_s"] = float(profile.get("t3_wait_s", 0.0)) + queue_wait_s
+            profile["audio_ready_s"] = queue_wait_s + float(profile.get("audio_ready_s", batch_wall_s))
+            profile["t3_batch_text_len"] = float(item["text_len"])
+            profile["t3_batch_prompt_len"] = float(item["prompt_len"])
+            profile["t3_group_text_len"] = float(group_key[0])
+            profile["t3_group_prompt_len"] = float(group_key[1])
+            profile["t3_admission_cohort_size"] = float(cohort_size)
+            profile["t3_active_cohorts_at_admit"] = float(active_cohorts_at_admit)
+            profile["t3_admission_singleton"] = 1.0 if cohort_size == 1 else 0.0
+
+            round_results[item["request_index"]] = {
+                "round_index": item["round_index"],
+                "request_index": item["request_index"],
+                "session_id": item["session"].session_id,
+                "text": item["text"],
+                "arrival_offset_s": round(item["arrival_offset_s"], 4),
+                "started_at_s": round(batch_started_at_s, 4),
+                "latency_s": round(float(profile["audio_ready_s"]), 4),
+                "num_samples": None if wav is None else int(wav.shape[-1]),
+                "error": None,
+                "wav": wav,
+                "profile": profile,
+            }
+
+    finalized_results = [item for item in round_results if item is not None]
+    round_wall_s = 0.0
+    if finalized_results:
+        round_wall_s = max(
+            float(item["arrival_offset_s"]) + float(item["latency_s"])
+            for item in finalized_results
+        )
+    return finalized_results, round_wall_s
+
+
 def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_summary: dict) -> dict:
     ok = [item for item in requests if item["error"] is None]
     errors = [item["error"] for item in requests if item["error"] is not None]
@@ -479,6 +701,7 @@ def main():
             requests = []
             vram_state = begin_vram_measurement(args.device)
             level_wall_start = time.perf_counter()
+            simulated_level_wall_s = 0.0
 
             for round_index in range(args.rounds_per_level):
                 sessions = [
@@ -501,51 +724,75 @@ def main():
                     texts.append(sentences[sentence_cursor % len(sentences)])
                     sentence_cursor += 1
 
-                round_results = [None] * level
-                round_start = time.perf_counter()
+                if args.impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
+                    round_results, round_wall_s = run_vllm_service_round(
+                        model=model,
+                        sessions=sessions,
+                        texts=texts,
+                        language_id=args.language_id,
+                        device=args.device,
+                        round_index=round_index,
+                        stagger_ms=args.stagger_ms,
+                        batching_window_ms=args.batching_window_ms,
+                        text_bucket_width=args.text_bucket_width,
+                        cfg_weight=args.cfg_weight,
+                        temperature=args.temperature,
+                        repetition_penalty=args.repetition_penalty,
+                        min_p=args.min_p,
+                        top_p=args.top_p,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    simulated_level_wall_s += round_wall_s
+                    requests.extend(round_results)
+                else:
+                    round_results = [None] * level
+                    round_start = time.perf_counter()
 
-                def worker(index: int):
-                    scheduled_at = round_start + (index * args.stagger_ms / 1000.0)
-                    sleep_s = scheduled_at - time.perf_counter()
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
+                    def worker(index: int):
+                        scheduled_at = round_start + (index * args.stagger_ms / 1000.0)
+                        sleep_s = scheduled_at - time.perf_counter()
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
 
-                    session = sessions[index]
-                    text = texts[index]
-                    started = time.perf_counter()
-                    error = None
-                    wav = None
-                    try:
-                        wav = model.generate_with_session(session, text)
-                        maybe_sync(args.device)
-                    except Exception as exc:  # noqa: BLE001
-                        error = repr(exc)
-                        maybe_sync(args.device)
-                    ended = time.perf_counter()
-                    profile = get_last_profile(model) if error is None else {}
-                    round_results[index] = {
-                        "round_index": round_index,
-                        "request_index": index,
-                        "session_id": session.session_id,
-                        "text": text,
-                        "arrival_offset_s": round(index * args.stagger_ms / 1000.0, 4),
-                        "started_at_s": round(started - round_start, 4),
-                        "latency_s": round(ended - started, 4),
-                        "num_samples": None if wav is None else int(wav.shape[-1]),
-                        "error": error,
-                        "wav": wav,
-                        "profile": profile,
-                    }
+                        session = sessions[index]
+                        text = texts[index]
+                        started = time.perf_counter()
+                        error = None
+                        wav = None
+                        try:
+                            wav = model.generate_with_session(session, text)
+                            maybe_sync(args.device)
+                        except Exception as exc:  # noqa: BLE001
+                            error = repr(exc)
+                            maybe_sync(args.device)
+                        ended = time.perf_counter()
+                        profile = get_last_profile(model) if error is None else {}
+                        round_results[index] = {
+                            "round_index": round_index,
+                            "request_index": index,
+                            "session_id": session.session_id,
+                            "text": text,
+                            "arrival_offset_s": round(index * args.stagger_ms / 1000.0, 4),
+                            "started_at_s": round(started - round_start, 4),
+                            "latency_s": round(ended - started, 4),
+                            "num_samples": None if wav is None else int(wav.shape[-1]),
+                            "error": error,
+                            "wav": wav,
+                            "profile": profile,
+                        }
 
-                with ThreadPoolExecutor(max_workers=level) as executor:
-                    futures = [executor.submit(worker, idx) for idx in range(level)]
-                    for future in futures:
-                        future.result()
+                    with ThreadPoolExecutor(max_workers=level) as executor:
+                        futures = [executor.submit(worker, idx) for idx in range(level)]
+                        for future in futures:
+                            future.result()
 
-                requests.extend(round_results)
+                    requests.extend(round_results)
 
             maybe_sync(args.device)
-            level_wall_s = time.perf_counter() - level_wall_start
+            if args.impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
+                level_wall_s = simulated_level_wall_s
+            else:
+                level_wall_s = time.perf_counter() - level_wall_start
             vram_summary = finish_vram_measurement(args.device, vram_state)
             summary = summarize_requests(level, requests, level_wall_s, vram_summary)
             level_summaries.append(summary)
