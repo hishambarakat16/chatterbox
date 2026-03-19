@@ -124,21 +124,23 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 use_symlink=(not vllm_export_copy),
             )
 
-        vllm_engine = create_vllm_engine(
-            model_dir=vllm_model_dir,
-            tensor_parallel_size=vllm_tensor_parallel_size,
-            gpu_memory_utilization=vllm_gpu_memory_utilization,
-            enforce_eager=vllm_enforce_eager,
-            dtype=vllm_dtype,
-            max_model_len=vllm_max_model_len,
-            enable_prefix_caching=vllm_enable_prefix_caching,
-            enable_chunked_prefill=vllm_enable_chunked_prefill,
-        )
+        engine_kwargs = {
+            "model_dir": vllm_model_dir,
+            "tensor_parallel_size": vllm_tensor_parallel_size,
+            "gpu_memory_utilization": vllm_gpu_memory_utilization,
+            "enforce_eager": vllm_enforce_eager,
+            "dtype": vllm_dtype,
+            "max_model_len": vllm_max_model_len,
+            "enable_prefix_caching": vllm_enable_prefix_caching,
+            "enable_chunked_prefill": vllm_enable_chunked_prefill,
+        }
+        vllm_engine = create_vllm_engine(**engine_kwargs)
 
         worker = ChatterboxMultilingualVllmWorker(
             prompt_builder_t3=prompt_builder_t3,
             prompt_builder_device=vllm_prompt_builder_device,
             vllm_engine=vllm_engine,
+            vllm_engine_factory=lambda: create_vllm_engine(**engine_kwargs),
             s3gen=s3gen,
             ve=ve,
             tokenizer=tokenizer,

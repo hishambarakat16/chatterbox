@@ -1,3 +1,5 @@
+import gc
+import logging
 import time
 
 import torch
@@ -7,6 +9,8 @@ from ..runtime.session import apply_exaggeration, clone_conditionals
 from ..mtl_tts import SUPPORTED_LANGUAGES
 from .worker import ChatterboxMultilingualStreamingWorker
 from ..vllm_t3_bridge import build_prompt_embeds, make_sampling_params, prepare_vllm_text_tokens
+
+logger = logging.getLogger(__name__)
 
 
 def _find_repeated_suffix(
@@ -93,12 +97,64 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         prompt_builder_t3,
         prompt_builder_device: str,
         vllm_engine,
+        vllm_engine_factory=None,
+        recycle_engine_on_prompt_embed_growth: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.prompt_builder_t3 = prompt_builder_t3
         self.prompt_builder_device = prompt_builder_device
         self.vllm_engine = vllm_engine
+        self.vllm_engine_factory = vllm_engine_factory
+        self.recycle_engine_on_prompt_embed_growth = recycle_engine_on_prompt_embed_growth
+        self._prompt_embed_seq_len_high_watermark = 0
+        self._vllm_engine_generation = 0
+
+    def _get_prompt_embed_seq_len(self, prepared: dict) -> int:
+        return int(prepared["profile"].get("t3_prompt_embed_seq_len", 0.0))
+
+    def _shutdown_vllm_engine(self) -> None:
+        engine = getattr(self, "vllm_engine", None)
+        if engine is not None and hasattr(engine, "shutdown"):
+            try:
+                engine.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to cleanly shut down vLLM engine during recycle.")
+
+    def _recreate_vllm_engine(self) -> None:
+        if self.vllm_engine_factory is None:
+            raise RuntimeError("vLLM engine recycle requested without a factory.")
+        self._shutdown_vllm_engine()
+        gc.collect()
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.vllm_engine = self.vllm_engine_factory()
+        self._vllm_engine_generation += 1
+
+    def _ensure_engine_capacity(self, required_prompt_embed_seq_len: int) -> bool:
+        required = int(required_prompt_embed_seq_len)
+        if required <= 0:
+            return False
+        if self._prompt_embed_seq_len_high_watermark == 0:
+            self._prompt_embed_seq_len_high_watermark = required
+            return False
+        if required <= self._prompt_embed_seq_len_high_watermark:
+            return False
+        # The current custom prompt-embed path is only known to crash on
+        # upward shape transitions across a reused engine. Restarting here
+        # makes the larger request the first one on a fresh engine.
+        if not self.recycle_engine_on_prompt_embed_growth or self.vllm_engine_factory is None:
+            self._prompt_embed_seq_len_high_watermark = required
+            return False
+
+        logger.warning(
+            "Recycling vLLM engine before prompt-embed growth: %s -> %s",
+            self._prompt_embed_seq_len_high_watermark,
+            required,
+        )
+        self._recreate_vllm_engine()
+        self._prompt_embed_seq_len_high_watermark = required
+        return True
 
     def _prepare_request(self, *, session, text: str, options=None, request_start: float | None = None) -> dict:
         if request_start is None:
@@ -249,6 +305,12 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         prepared = self._prepare_request(session=session, text=text, options=options)
+        recycled = self._ensure_engine_capacity(self._get_prompt_embed_seq_len(prepared))
+        prepared["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
+        prepared["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
+        prepared["profile"]["t3_prompt_embed_high_watermark"] = float(
+            self._prompt_embed_seq_len_high_watermark
+        )
 
         with torch.inference_mode():
             t3_start = time.perf_counter()
@@ -285,29 +347,49 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             )
             for session, text, options in zip(sessions, texts, options_list)
         ]
+        ordered = sorted(
+            enumerate(prepared),
+            key=lambda item: self._get_prompt_embed_seq_len(item[1]),
+            reverse=True,
+        )
+        recycled = False
+        if ordered:
+            recycled = self._ensure_engine_capacity(
+                self._get_prompt_embed_seq_len(ordered[0][1])
+            )
+        ordered_prepared = [item for _, item in ordered]
+        for item in ordered_prepared:
+            item["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
+            item["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
+            item["profile"]["t3_prompt_embed_high_watermark"] = float(
+                self._prompt_embed_seq_len_high_watermark
+            )
 
         with torch.inference_mode():
             t3_start = time.perf_counter()
             outputs = self.vllm_engine.generate(
-                [item["prompt"] for item in prepared],
-                sampling_params=[item["sampling_params"] for item in prepared],
+                [item["prompt"] for item in ordered_prepared],
+                sampling_params=[item["sampling_params"] for item in ordered_prepared],
                 use_tqdm=False,
             )
             t3_duration_s = time.perf_counter() - t3_start
 
-            results = []
-            for item in prepared:
+            ordered_results = []
+            for item in ordered_prepared:
                 item["batch_size"] = len(prepared)
-            for item, output in zip(prepared, outputs):
+            for item, output in zip(ordered_prepared, outputs):
                 wav, profile = self._finalize_request(
                     prepared=item,
                     output=(output.outputs[0] if output.outputs else None),
                     t3_duration_s=t3_duration_s,
                 )
-                results.append(
+                ordered_results.append(
                     {
                         "wav": wav,
                         "profile": profile,
                     }
                 )
+        results = [None] * len(prepared)
+        for (original_index, _), result in zip(ordered, ordered_results):
+            results[original_index] = result
         return results
