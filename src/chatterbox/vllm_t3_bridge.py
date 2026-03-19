@@ -291,6 +291,7 @@ def build_prompt_embeds(
     t3_cond,
     text_tokens: torch.Tensor,
 ) -> torch.Tensor:
+    t3_cond = t3_cond.to(device=prompt_builder_t3.device)
     text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=prompt_builder_t3.device)
     initial_speech = prompt_builder_t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
     embeds, _ = prompt_builder_t3.prepare_input_embeds(
