@@ -25,7 +25,9 @@ def optional_import_vllm():
     except ImportError as exc:
         raise ImportError(
             "vLLM is not installed in the active environment. "
-            "Create the dedicated vLLM environment first and install `vllm`."
+            "Activate your dedicated vLLM env (for example `conda activate chatterbox-vllm`) "
+            "or install `vllm` into the current env. "
+            "See `GPU_MIGRATION_SERVING_PLAN.md`."
         ) from exc
     return LLM, ModelRegistry, SamplingParams
 
