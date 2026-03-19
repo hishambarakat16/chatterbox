@@ -26,6 +26,9 @@ dependencies = [
     "omegaconf"
 ]
 
+[project.entry-points."vllm.general_plugins"]
+chatterbox_t3 = "chatterbox.vllm_plugin:register_vllm_models"
+
 [project.urls]
 Homepage = "https://github.com/resemble-ai/chatterbox"
 Repository = "https://github.com/resemble-ai/chatterbox"
