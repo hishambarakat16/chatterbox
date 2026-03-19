@@ -80,7 +80,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
-        vllm_enable_prefix_caching: bool = True,
+        vllm_enable_prefix_caching: bool = False,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -160,7 +160,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
-        vllm_enable_prefix_caching: bool = True,
+        vllm_enable_prefix_caching: bool = False,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():

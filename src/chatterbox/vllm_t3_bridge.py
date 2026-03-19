@@ -239,7 +239,7 @@ def create_vllm_engine(
     enforce_eager: bool = False,
     dtype: str = "auto",
     max_model_len: int = 2048,
-    enable_prefix_caching: bool = True,
+    enable_prefix_caching: bool = False,
 ):
     LLM, _, _ = optional_import_vllm()
     register_vllm_t3_model()

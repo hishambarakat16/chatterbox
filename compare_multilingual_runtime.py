@@ -60,7 +60,7 @@ def load_model(
     vllm_enforce_eager: bool = False,
     vllm_dtype: str = "auto",
     vllm_max_model_len: int = 2048,
-    vllm_enable_prefix_caching: bool = True,
+    vllm_enable_prefix_caching: bool = False,
     vllm_export_copy: bool = False,
 ):
     model_cls = resolve_model_cls(impl)
@@ -206,6 +206,7 @@ def main():
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
+    parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
@@ -244,7 +245,9 @@ def main():
             vllm_enforce_eager=args.vllm_enforce_eager,
             vllm_dtype=args.vllm_dtype,
             vllm_max_model_len=args.vllm_max_model_len,
-            vllm_enable_prefix_caching=(not args.no_vllm_prefix_caching),
+            vllm_enable_prefix_caching=(
+                args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
+            ),
             vllm_export_copy=args.vllm_export_copy,
         )
         maybe_sync(args.device)
@@ -313,7 +316,10 @@ def main():
             print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
             print(f"vllm_dtype={args.vllm_dtype}")
             print(f"vllm_max_model_len={args.vllm_max_model_len}")
-            print(f"vllm_enable_prefix_caching={not args.no_vllm_prefix_caching}")
+            print(
+                "vllm_enable_prefix_caching="
+                f"{args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
+            )
             for note in describe_vllm_hydra_mode(
                 impl=args.impl,
                 hydra_checkpoint_dir=args.hydra_checkpoint_dir,
