@@ -365,6 +365,7 @@ def build_vllm_prompt(
         int(layout["conditioning_token_id"]),
         *[int(layout["text_token_offset"] + token_id) for token_id in text_token_ids],
         int(hp.start_speech_token),
+        int(hp.start_speech_token),
     ]
 
     conditioning = {
@@ -386,7 +387,7 @@ def build_vllm_prompt(
     prompt_speech_tokens = getattr(t3_cond, "cond_prompt_speech_tokens", None)
     prompt_speech_token_len = 0 if prompt_speech_tokens is None else int(prompt_speech_tokens.shape[-1])
     text_token_len = int(text_tokens.shape[-1])
-    initial_speech_len = 1
+    initial_speech_len = 2
     prompt_seq_len = int(layout["conditioning_seq_len"] + text_token_len + initial_speech_len)
     metadata = {
         "prompt_speech_token_len": prompt_speech_token_len,

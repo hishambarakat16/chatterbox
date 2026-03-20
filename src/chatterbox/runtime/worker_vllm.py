@@ -67,6 +67,13 @@ def _trim_length_capped_tail(
         return token_ids, diagnostics
 
     trim_index = repeated_suffix["trim_index"]
+    # Be conservative here: if trimming would discard more than half the utterance,
+    # keep the raw length-capped tokens and let downstream listening decide. The
+    # vLLM path can produce a valid sentence followed by a repetitive tail, and the
+    # old heuristic was clipping that valid prefix down to a tiny "hello"-style clip.
+    if trim_index < (len(token_ids) // 2):
+        return token_ids, diagnostics
+
     trimmed = token_ids[:trim_index]
     diagnostics["tail_trimmed"] = 1.0
     diagnostics["tail_trim_tokens"] = float(repeated_suffix["trim_tokens"])

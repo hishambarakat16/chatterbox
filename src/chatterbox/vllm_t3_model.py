@@ -110,7 +110,7 @@ class ChatterboxT3DummyInputsBuilder(BaseDummyInputsBuilder[ChatterboxT3Processi
         text_sot = f"tok_{TEXT_TOKEN_OFFSET + int(HP.start_text_token)}"
         text_eot = f"tok_{TEXT_TOKEN_OFFSET + int(HP.stop_text_token)}"
         speech_bos = f"tok_{int(HP.start_speech_token)}"
-        return " ".join([cond_tok, text_sot, text_eot, speech_bos])
+        return " ".join([cond_tok, text_sot, text_eot, speech_bos, speech_bos])
 
     def get_dummy_mm_data(
         self,
@@ -253,10 +253,26 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
         self.text_pos_emb = LearnedPositionEmbeddings(text_pos, config.hidden_size)
         self.speech_pos_emb = LearnedPositionEmbeddings(speech_pos, config.hidden_size)
         self.cond_enc = T3CondEnc(self.hp)
+        # Track the prompt-side speech-position offset for each active decode stream.
+        # vLLM decode passes absolute sequence positions, while the original T3 model
+        # uses speech-relative positions (BOS=0, first generated token=1, ...).
+        self._decode_offset_by_next_abs_pos: dict[int, list[int]] = {}
 
         with torch.no_grad():
             self.model.embed_tokens.weight.zero_()
             self.lm_head.weight.zero_()
+
+    def _remember_decode_offset(self, next_abs_pos: int, prompt_offset: int) -> None:
+        self._decode_offset_by_next_abs_pos.setdefault(int(next_abs_pos), []).append(int(prompt_offset))
+
+    def _consume_decode_offset(self, current_abs_pos: int) -> int | None:
+        offsets = self._decode_offset_by_next_abs_pos.get(int(current_abs_pos))
+        if not offsets:
+            return None
+        prompt_offset = offsets.pop(0)
+        if not offsets:
+            self._decode_offset_by_next_abs_pos.pop(int(current_abs_pos), None)
+        return int(prompt_offset)
 
     def _is_text_token(self, input_ids: torch.Tensor) -> torch.Tensor:
         return (input_ids >= self.text_token_offset) & (input_ids < self.text_token_end)
@@ -307,12 +323,22 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
             text_mask = self._is_text_token(seg_ids)
             speech_mask = self._is_speech_token(seg_ids) & ~cond_mask
 
-            # Decode-only segment: keep the current approximate absolute
-            # speech-position mapping used by the original vLLM spike.
+            # Decode-only segment: recover the speech-relative position that the
+            # original T3 decode path expects (BOS=0, first generated token=1, ...).
             if not bool(cond_mask.any() or text_mask.any()):
                 if bool(speech_mask.any()):
                     speech_ids = seg_ids[speech_mask]
-                    speech_pos = seg_pos[speech_mask].clamp_min(0).clamp_max(
+                    speech_abs_pos = seg_pos[speech_mask]
+                    prompt_offset = self._consume_decode_offset(int(speech_abs_pos[0].item()))
+                    if prompt_offset is None:
+                        speech_pos = speech_abs_pos
+                    else:
+                        speech_pos = speech_abs_pos - int(prompt_offset)
+                        self._remember_decode_offset(
+                            int(speech_abs_pos[-1].item()) + 1,
+                            prompt_offset,
+                        )
+                    speech_pos = speech_pos.clamp_min(0).clamp_max(
                         self.speech_pos_emb.emb.num_embeddings - 1
                     )
                     seg_embeds[speech_mask] = self._embed_speech_tokens(speech_ids, speech_pos)
@@ -330,7 +356,17 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
                     device=speech_ids.device,
                     dtype=torch.long,
                 )
+                if rel_speech_pos.numel() > 1:
+                    # The production T3 prefill path appends one extra BOS embed after
+                    # prepare_input_embeds(), so the two BOS rows both live at speech
+                    # position 0 before decode starts.
+                    rel_speech_pos = (rel_speech_pos - 1).clamp_min(0)
                 seg_embeds[speech_mask] = self._embed_speech_tokens(speech_ids, rel_speech_pos)
+                prompt_offset = int(seg_pos[speech_mask][-1].item())
+                self._remember_decode_offset(
+                    int(seg_pos[speech_mask][-1].item()) + 1,
+                    prompt_offset,
+                )
 
             full_embeds[start:end] = seg_embeds
 
