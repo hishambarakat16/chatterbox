@@ -52,6 +52,7 @@ def parse_args():
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
+    parser.add_argument("--vllm-prompt-embed-bucket-size", type=int, default=4)
     prefix_group = parser.add_mutually_exclusive_group()
     prefix_group.add_argument("--vllm-enable-prefix-caching", action="store_true")
     prefix_group.add_argument("--no-vllm-prefix-caching", action="store_true")
@@ -209,6 +210,12 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
                 "audio_ready_s": round(float(profile.get("audio_ready_s", 0.0)), 4) if profile else 0.0,
                 "t3_s": round(float(profile.get("t3_s", 0.0)), 4) if profile else 0.0,
                 "prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", row["t3_prompt_embed_seq_len"])),
+                "prompt_embed_bucket_seq_len": int(
+                    profile.get(
+                        "t3_prompt_embed_bucket_seq_len",
+                        row.get("t3_prompt_embed_bucket_seq_len", 0),
+                    )
+                ),
                 "cond_seq_len": int(profile.get("t3_cond_seq_len", row["t3_cond_seq_len"])),
             }
         )
@@ -256,6 +263,7 @@ def run_engine_replay_singletons(model, sessions, texts, inspect_rows, args, *, 
                 "wall_s": round(time.perf_counter() - started, 4),
                 "num_outputs": num_outputs,
                 "prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
+                "prompt_embed_bucket_seq_len": row.get("t3_prompt_embed_bucket_seq_len", 0),
                 "cond_seq_len": row["t3_cond_seq_len"],
             }
         )
@@ -352,6 +360,7 @@ def main():
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_dtype=args.vllm_dtype,
         vllm_max_model_len=args.vllm_max_model_len,
+        vllm_prompt_embed_bucket_size=args.vllm_prompt_embed_bucket_size,
         vllm_enable_prefix_caching=args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching,
         vllm_enable_chunked_prefill=args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill,
     )
@@ -380,6 +389,7 @@ def main():
     print(
         f"vllm_enable_prefix_caching={args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
     )
+    print(f"vllm_prompt_embed_bucket_size={args.vllm_prompt_embed_bucket_size}")
     print(
         f"vllm_enable_chunked_prefill={args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
     )
@@ -406,6 +416,7 @@ def main():
                     "t3_prompt_speech_token_len": row["t3_prompt_speech_token_len"],
                     "t3_cond_seq_len": row["t3_cond_seq_len"],
                     "t3_prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
+                    "t3_prompt_embed_bucket_seq_len": row.get("t3_prompt_embed_bucket_seq_len", 0),
                     "text": row["text"],
                 },
                 ensure_ascii=False,

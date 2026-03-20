@@ -82,6 +82,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
         vllm_enable_chunked_prefill: bool = True,
+        vllm_prompt_embed_bucket_size: int = 4,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -141,6 +142,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             prompt_builder_device=vllm_prompt_builder_device,
             vllm_engine=vllm_engine,
             vllm_engine_factory=lambda: create_vllm_engine(**engine_kwargs),
+            prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
             s3gen=s3gen,
             ve=ve,
             tokenizer=tokenizer,
@@ -166,6 +168,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
         vllm_enable_chunked_prefill: bool = True,
+        vllm_prompt_embed_bucket_size: int = 4,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():
@@ -200,6 +203,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
             vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
+            vllm_prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
             vllm_export_copy=vllm_export_copy,
         )
 

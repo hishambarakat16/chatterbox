@@ -99,6 +99,7 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         vllm_engine,
         vllm_engine_factory=None,
         recycle_engine_on_prompt_embed_growth: bool = True,
+        prompt_embed_bucket_size: int = 4,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -107,11 +108,19 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         self.vllm_engine = vllm_engine
         self.vllm_engine_factory = vllm_engine_factory
         self.recycle_engine_on_prompt_embed_growth = recycle_engine_on_prompt_embed_growth
+        self.prompt_embed_bucket_size = max(1, int(prompt_embed_bucket_size))
         self._prompt_embed_seq_len_high_watermark = 0
         self._vllm_engine_generation = 0
 
     def _get_prompt_embed_seq_len(self, prepared: dict) -> int:
         return int(prepared["profile"].get("t3_prompt_embed_seq_len", 0.0))
+
+    def _get_prompt_embed_bucket_seq_len(self, prepared: dict) -> int:
+        seq_len = self._get_prompt_embed_seq_len(prepared)
+        width = self.prompt_embed_bucket_size
+        if seq_len <= 0 or width <= 1:
+            return seq_len
+        return ((seq_len + width - 1) // width) * width
 
     def _shutdown_vllm_engine(self) -> None:
         engine = getattr(self, "vllm_engine", None)
@@ -148,9 +157,10 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             return False
 
         logger.warning(
-            "Recycling vLLM engine before prompt-embed growth: %s -> %s",
+            "Recycling vLLM engine before prompt-embed growth: %s -> %s (bucket=%s)",
             self._prompt_embed_seq_len_high_watermark,
             required,
+            self.prompt_embed_bucket_size,
         )
         self._recreate_vllm_engine()
         self._prompt_embed_seq_len_high_watermark = required
@@ -214,6 +224,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile["t3_cond_seq_len"] = float(prompt_embed_meta["cond_seq_len"])
         profile["t3_prompt_embed_seq_len"] = float(prompt_embed_meta["prompt_embed_seq_len"])
         profile["t3_prompt_embed_hidden_size"] = float(prompt_embed_meta["prompt_embed_hidden_size"])
+        bucket_seq_len = self._get_prompt_embed_bucket_seq_len({"profile": profile})
+        profile["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
+        profile["t3_prompt_embed_bucket_seq_len"] = float(bucket_seq_len)
 
         if float(active_options.cfg_weight) != 0.0:
             profile["t3_cfg_requested"] = float(active_options.cfg_weight)
@@ -247,6 +260,8 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             "t3_initial_speech_len": int(profile.get("t3_initial_speech_len", 0.0)),
             "t3_cond_seq_len": int(profile.get("t3_cond_seq_len", 0.0)),
             "t3_prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", 0.0)),
+            "t3_prompt_embed_bucket_size": int(profile.get("t3_prompt_embed_bucket_size", 0.0)),
+            "t3_prompt_embed_bucket_seq_len": int(profile.get("t3_prompt_embed_bucket_seq_len", 0.0)),
             "t3_prompt_embed_hidden_size": int(profile.get("t3_prompt_embed_hidden_size", 0.0)),
             "sampling_max_tokens": int(getattr(sampling_params, "max_tokens", 0) or 0),
             "sampling_stop_token_ids": [
@@ -305,9 +320,14 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         prepared = self._prepare_request(session=session, text=text, options=options)
-        recycled = self._ensure_engine_capacity(self._get_prompt_embed_seq_len(prepared))
+        prompt_embed_seq_len = self._get_prompt_embed_seq_len(prepared)
+        prompt_embed_bucket_seq_len = self._get_prompt_embed_bucket_seq_len(prepared)
+        recycled = self._ensure_engine_capacity(prompt_embed_bucket_seq_len)
         prepared["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
         prepared["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
+        prepared["profile"]["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
+        prepared["profile"]["t3_prompt_embed_bucket_seq_len"] = float(prompt_embed_bucket_seq_len)
+        prepared["profile"]["t3_prompt_embed_seq_len"] = float(prompt_embed_seq_len)
         prepared["profile"]["t3_prompt_embed_high_watermark"] = float(
             self._prompt_embed_seq_len_high_watermark
         )
@@ -349,18 +369,25 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         ]
         ordered = sorted(
             enumerate(prepared),
-            key=lambda item: self._get_prompt_embed_seq_len(item[1]),
+            key=lambda item: (
+                self._get_prompt_embed_bucket_seq_len(item[1]),
+                self._get_prompt_embed_seq_len(item[1]),
+            ),
             reverse=True,
         )
         recycled = False
         if ordered:
             recycled = self._ensure_engine_capacity(
-                self._get_prompt_embed_seq_len(ordered[0][1])
+                self._get_prompt_embed_bucket_seq_len(ordered[0][1])
             )
         ordered_prepared = [item for _, item in ordered]
         for item in ordered_prepared:
             item["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
             item["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
+            item["profile"]["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
+            item["profile"]["t3_prompt_embed_bucket_seq_len"] = float(
+                self._get_prompt_embed_bucket_seq_len(item)
+            )
             item["profile"]["t3_prompt_embed_high_watermark"] = float(
                 self._prompt_embed_seq_len_high_watermark
             )

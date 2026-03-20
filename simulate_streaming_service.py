@@ -626,6 +626,7 @@ def main():
     parser.add_argument("--allow-vllm-compiled-service-sim", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
+    parser.add_argument("--vllm-prompt-embed-bucket-size", type=int, default=4)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
     parser.add_argument("--vllm-export-copy", action="store_true")
@@ -687,6 +688,7 @@ def main():
             vllm_enforce_eager=effective_vllm_enforce_eager,
             vllm_dtype=args.vllm_dtype,
             vllm_max_model_len=args.vllm_max_model_len,
+            vllm_prompt_embed_bucket_size=args.vllm_prompt_embed_bucket_size,
             vllm_enable_prefix_caching=(
                 args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
             ),
@@ -702,6 +704,7 @@ def main():
             print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_max_model_len={args.vllm_max_model_len}")
+            print(f"vllm_prompt_embed_bucket_size={args.vllm_prompt_embed_bucket_size}")
             print(f"vllm_enforce_eager={effective_vllm_enforce_eager}")
             if effective_vllm_enforce_eager and not args.vllm_enforce_eager:
                 print("vllm_enforce_eager_reason=mixed_shape_service_sim_default")
