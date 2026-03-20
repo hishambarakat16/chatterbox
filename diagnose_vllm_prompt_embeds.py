@@ -27,7 +27,7 @@ def runtime_helpers():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Diagnose the custom Chatterbox prompt-embed path used by vLLM."
+        description="Diagnose the custom Chatterbox vLLM input path."
     )
     parser.add_argument(
         "--mode",
@@ -35,8 +35,6 @@ def parse_args():
             "inspect",
             "sequential_singletons",
             "batched",
-            "engine_replay_singletons",
-            "engine_replay_zero_singletons",
         ],
         default="inspect",
     )
@@ -46,13 +44,11 @@ def parse_args():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
-    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
-    parser.add_argument("--vllm-prompt-embed-bucket-size", type=int, default=4)
     prefix_group = parser.add_mutually_exclusive_group()
     prefix_group.add_argument("--vllm-enable-prefix-caching", action="store_true")
     prefix_group.add_argument("--no-vllm-prefix-caching", action="store_true")
@@ -111,7 +107,7 @@ def shape_key(metadata: dict) -> str:
         f"text_tok={metadata['t3_text_token_len']}"
         f"/prompt_speech={metadata['t3_prompt_speech_token_len']}"
         f"/cond={metadata['t3_cond_seq_len']}"
-        f"/embed={metadata['t3_prompt_embed_seq_len']}"
+        f"/prompt_seq={metadata['t3_prompt_seq_len']}"
     )
 
 
@@ -156,23 +152,6 @@ def build_request_options(session, args):
     )
 
 
-def prepare_engine_requests(model, sessions, texts, args) -> list[dict]:
-    worker = getattr(model, "worker", None)
-    if worker is None or not hasattr(worker, "_prepare_request"):
-        raise RuntimeError("The selected model does not expose the vLLM worker prepare path.")
-
-    prepared = []
-    for session, text in zip(sessions, texts):
-        prepared.append(
-            worker._prepare_request(
-                session=session,
-                text=text,
-                options=build_request_options(session, args),
-            )
-        )
-    return prepared
-
-
 def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> list[dict]:
     maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
@@ -209,62 +188,14 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
                 "wall_s": round(time.perf_counter() - started, 4),
                 "audio_ready_s": round(float(profile.get("audio_ready_s", 0.0)), 4) if profile else 0.0,
                 "t3_s": round(float(profile.get("t3_s", 0.0)), 4) if profile else 0.0,
-                "prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", row["t3_prompt_embed_seq_len"])),
-                "prompt_embed_bucket_seq_len": int(
+                "prompt_seq_len": int(profile.get("t3_prompt_seq_len", row["t3_prompt_seq_len"])),
+                "prompt_token_len_before_mm": int(
                     profile.get(
-                        "t3_prompt_embed_bucket_seq_len",
-                        row.get("t3_prompt_embed_bucket_seq_len", 0),
+                        "t3_prompt_token_len_before_mm",
+                        row["t3_prompt_token_len_before_mm"],
                     )
                 ),
                 "cond_seq_len": int(profile.get("t3_cond_seq_len", row["t3_cond_seq_len"])),
-            }
-        )
-    return results
-
-
-def run_engine_replay_singletons(model, sessions, texts, inspect_rows, args, *, zero_prompt_embeds: bool) -> list[dict]:
-    maybe_sync = runtime_helpers()["maybe_sync"]
-    worker = getattr(model, "worker", None)
-    if worker is None:
-        raise RuntimeError("The selected model does not expose the underlying worker.")
-
-    prepared_requests = prepare_engine_requests(model, sessions, texts, args)
-    results = []
-    for row, prepared in zip(inspect_rows, prepared_requests):
-        prompt = prepared["prompt"]
-        prompt_embeds = prompt["prompt_embeds"]
-        replay_prompt_embeds = prompt_embeds.clone()
-        if zero_prompt_embeds:
-            replay_prompt_embeds.zero_()
-        replay_prompt = {"prompt_embeds": replay_prompt_embeds}
-
-        started = time.perf_counter()
-        error = None
-        num_outputs = 0
-        try:
-            outputs = worker.vllm_engine.generate(
-                [replay_prompt],
-                sampling_params=prepared["sampling_params"],
-                use_tqdm=False,
-            )
-            maybe_sync(args.device)
-            num_outputs = len(outputs)
-        except Exception as exc:  # noqa: BLE001
-            error = repr(exc)
-            maybe_sync(args.device)
-
-        results.append(
-            {
-                "mode": "engine_replay_zero_singletons" if zero_prompt_embeds else "engine_replay_singletons",
-                "index": row["index"],
-                "shape_key": row["shape_key"],
-                "text": row["text"],
-                "error": error,
-                "wall_s": round(time.perf_counter() - started, 4),
-                "num_outputs": num_outputs,
-                "prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
-                "prompt_embed_bucket_seq_len": row.get("t3_prompt_embed_bucket_seq_len", 0),
-                "cond_seq_len": row["t3_cond_seq_len"],
             }
         )
     return results
@@ -354,13 +285,11 @@ def main():
         turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
         vllm_model_dir=args.vllm_model_dir,
         vllm_export_dir=args.vllm_export_dir,
-        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_dtype=args.vllm_dtype,
         vllm_max_model_len=args.vllm_max_model_len,
-        vllm_prompt_embed_bucket_size=args.vllm_prompt_embed_bucket_size,
         vllm_enable_prefix_caching=args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching,
         vllm_enable_chunked_prefill=args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill,
     )
@@ -389,7 +318,6 @@ def main():
     print(
         f"vllm_enable_prefix_caching={args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
     )
-    print(f"vllm_prompt_embed_bucket_size={args.vllm_prompt_embed_bucket_size}")
     print(
         f"vllm_enable_chunked_prefill={args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
     )
@@ -415,8 +343,9 @@ def main():
                     "t3_text_token_len": row["t3_text_token_len"],
                     "t3_prompt_speech_token_len": row["t3_prompt_speech_token_len"],
                     "t3_cond_seq_len": row["t3_cond_seq_len"],
-                    "t3_prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
-                    "t3_prompt_embed_bucket_seq_len": row.get("t3_prompt_embed_bucket_seq_len", 0),
+                    "t3_prompt_seq_len": row["t3_prompt_seq_len"],
+                    "t3_prompt_hidden_size": row["t3_prompt_hidden_size"],
+                    "t3_prompt_token_len_before_mm": row["t3_prompt_token_len_before_mm"],
                     "text": row["text"],
                 },
                 ensure_ascii=False,
@@ -427,24 +356,6 @@ def main():
         run_rows = []
     elif args.mode == "sequential_singletons":
         run_rows = run_sequential_singletons(model, sessions, texts, inspect_rows, args)
-    elif args.mode == "engine_replay_singletons":
-        run_rows = run_engine_replay_singletons(
-            model,
-            sessions,
-            texts,
-            inspect_rows,
-            args,
-            zero_prompt_embeds=False,
-        )
-    elif args.mode == "engine_replay_zero_singletons":
-        run_rows = run_engine_replay_singletons(
-            model,
-            sessions,
-            texts,
-            inspect_rows,
-            args,
-            zero_prompt_embeds=True,
-        )
     else:
         run_rows = run_batched(model, sessions, texts, inspect_rows, args)
 

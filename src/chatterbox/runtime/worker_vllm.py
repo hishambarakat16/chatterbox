@@ -1,5 +1,3 @@
-import gc
-import logging
 import time
 
 import torch
@@ -8,9 +6,7 @@ from ..models.s3tokenizer import drop_invalid_tokens
 from ..runtime.session import apply_exaggeration, clone_conditionals
 from ..mtl_tts import SUPPORTED_LANGUAGES
 from .worker import ChatterboxMultilingualStreamingWorker
-from ..vllm_t3_bridge import build_prompt_embeds, make_sampling_params, prepare_vllm_text_tokens
-
-logger = logging.getLogger(__name__)
+from ..vllm_t3_bridge import build_vllm_prompt, make_sampling_params, prepare_vllm_text_tokens
 
 
 def _find_repeated_suffix(
@@ -84,87 +80,21 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
     """
     Experimental vLLM T3 worker.
 
-    Design choices for the first spike:
+    Design choices for the current spike:
     - keep session creation and turbo S3 local
-    - build prompt embeddings locally
-    - let vLLM handle speech-token generation
+    - build token ids and conditioning payloads locally
+    - let the served vLLM model reconstruct the T3 prompt internally
     - Hydra and CFG are intentionally disabled
     """
 
     def __init__(
         self,
         *args,
-        prompt_builder_t3,
-        prompt_builder_device: str,
         vllm_engine,
-        vllm_engine_factory=None,
-        recycle_engine_on_prompt_embed_growth: bool = True,
-        prompt_embed_bucket_size: int = 4,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.prompt_builder_t3 = prompt_builder_t3
-        self.prompt_builder_device = prompt_builder_device
         self.vllm_engine = vllm_engine
-        self.vllm_engine_factory = vllm_engine_factory
-        self.recycle_engine_on_prompt_embed_growth = recycle_engine_on_prompt_embed_growth
-        self.prompt_embed_bucket_size = max(1, int(prompt_embed_bucket_size))
-        self._prompt_embed_seq_len_high_watermark = 0
-        self._vllm_engine_generation = 0
-
-    def _get_prompt_embed_seq_len(self, prepared: dict) -> int:
-        return int(prepared["profile"].get("t3_prompt_embed_seq_len", 0.0))
-
-    def _get_prompt_embed_bucket_seq_len(self, prepared: dict) -> int:
-        seq_len = self._get_prompt_embed_seq_len(prepared)
-        width = self.prompt_embed_bucket_size
-        if seq_len <= 0 or width <= 1:
-            return seq_len
-        return ((seq_len + width - 1) // width) * width
-
-    def _shutdown_vllm_engine(self) -> None:
-        engine = getattr(self, "vllm_engine", None)
-        if engine is not None and hasattr(engine, "shutdown"):
-            try:
-                engine.shutdown()
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to cleanly shut down vLLM engine during recycle.")
-
-    def _recreate_vllm_engine(self) -> None:
-        if self.vllm_engine_factory is None:
-            raise RuntimeError("vLLM engine recycle requested without a factory.")
-        self._shutdown_vllm_engine()
-        gc.collect()
-        if str(self.device).startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        self.vllm_engine = self.vllm_engine_factory()
-        self._vllm_engine_generation += 1
-
-    def _ensure_engine_capacity(self, required_prompt_embed_seq_len: int) -> bool:
-        required = int(required_prompt_embed_seq_len)
-        if required <= 0:
-            return False
-        if self._prompt_embed_seq_len_high_watermark == 0:
-            self._prompt_embed_seq_len_high_watermark = required
-            return False
-        if required <= self._prompt_embed_seq_len_high_watermark:
-            return False
-        # The current custom prompt-embed path is only known to crash on
-        # upward shape transitions across a reused engine. Restarting here
-        # makes the larger request the first one on a fresh engine.
-        if not self.recycle_engine_on_prompt_embed_growth or self.vllm_engine_factory is None:
-            self._prompt_embed_seq_len_high_watermark = required
-            return False
-
-        logger.warning(
-            "Recycling vLLM engine before prompt-embed growth: %s -> %s (bucket=%s)",
-            self._prompt_embed_seq_len_high_watermark,
-            required,
-            self.prompt_embed_bucket_size,
-        )
-        self._recreate_vllm_engine()
-        self._prompt_embed_seq_len_high_watermark = required
-        return True
 
     def _prepare_request(self, *, session, text: str, options=None, request_start: float | None = None) -> dict:
         if request_start is None:
@@ -198,35 +128,25 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         active_conds = clone_conditionals(session.conditionals)
         active_conds = apply_exaggeration(active_conds, active_options.exaggeration, self.device)
 
-        prompt_conds = clone_conditionals(active_conds)
-        prompt_conds = apply_exaggeration(
-            prompt_conds,
-            active_options.exaggeration,
-            self.prompt_builder_device,
-        )
-
         text_tokens = prepare_vllm_text_tokens(
             tokenizer=self.tokenizer,
             text=text,
             language_id=language_id,
-            device=self.prompt_builder_device,
+            device="cpu",
         )
-        prompt_embeds, prompt_embed_meta = build_prompt_embeds(
-            prompt_builder_t3=self.prompt_builder_t3,
-            t3_cond=prompt_conds.t3,
+        prompt, prompt_meta = build_vllm_prompt(
+            t3_cond=active_conds.t3,
             text_tokens=text_tokens,
             return_metadata=True,
         )
         profile["text_prep_s"] = time.perf_counter() - prep_start
-        profile["t3_text_token_len"] = float(prompt_embed_meta["text_token_len"])
-        profile["t3_prompt_speech_token_len"] = float(prompt_embed_meta["prompt_speech_token_len"])
-        profile["t3_initial_speech_len"] = float(prompt_embed_meta["initial_speech_len"])
-        profile["t3_cond_seq_len"] = float(prompt_embed_meta["cond_seq_len"])
-        profile["t3_prompt_embed_seq_len"] = float(prompt_embed_meta["prompt_embed_seq_len"])
-        profile["t3_prompt_embed_hidden_size"] = float(prompt_embed_meta["prompt_embed_hidden_size"])
-        bucket_seq_len = self._get_prompt_embed_bucket_seq_len({"profile": profile})
-        profile["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
-        profile["t3_prompt_embed_bucket_seq_len"] = float(bucket_seq_len)
+        profile["t3_text_token_len"] = float(prompt_meta["text_token_len"])
+        profile["t3_prompt_speech_token_len"] = float(prompt_meta["prompt_speech_token_len"])
+        profile["t3_initial_speech_len"] = float(prompt_meta["initial_speech_len"])
+        profile["t3_cond_seq_len"] = float(prompt_meta["cond_seq_len"])
+        profile["t3_prompt_seq_len"] = float(prompt_meta["prompt_seq_len"])
+        profile["t3_prompt_hidden_size"] = float(prompt_meta["prompt_hidden_size"])
+        profile["t3_prompt_token_len_before_mm"] = float(prompt_meta["prompt_token_len_before_mm"])
 
         if float(active_options.cfg_weight) != 0.0:
             profile["t3_cfg_requested"] = float(active_options.cfg_weight)
@@ -236,13 +156,13 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
 
         sampling_params = make_sampling_params(
             options=active_options,
-            hp=self.prompt_builder_t3.hp,
+            hp=self.t3.hp,
         )
         return {
             "request_start": request_start,
             "profile": profile,
             "active_conds": active_conds,
-            "prompt": {"prompt_embeds": prompt_embeds},
+            "prompt": prompt,
             "sampling_params": sampling_params,
         }
 
@@ -259,10 +179,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             "t3_prompt_speech_token_len": int(profile.get("t3_prompt_speech_token_len", 0.0)),
             "t3_initial_speech_len": int(profile.get("t3_initial_speech_len", 0.0)),
             "t3_cond_seq_len": int(profile.get("t3_cond_seq_len", 0.0)),
-            "t3_prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", 0.0)),
-            "t3_prompt_embed_bucket_size": int(profile.get("t3_prompt_embed_bucket_size", 0.0)),
-            "t3_prompt_embed_bucket_seq_len": int(profile.get("t3_prompt_embed_bucket_seq_len", 0.0)),
-            "t3_prompt_embed_hidden_size": int(profile.get("t3_prompt_embed_hidden_size", 0.0)),
+            "t3_prompt_seq_len": int(profile.get("t3_prompt_seq_len", 0.0)),
+            "t3_prompt_hidden_size": int(profile.get("t3_prompt_hidden_size", 0.0)),
+            "t3_prompt_token_len_before_mm": int(profile.get("t3_prompt_token_len_before_mm", 0.0)),
             "sampling_max_tokens": int(getattr(sampling_params, "max_tokens", 0) or 0),
             "sampling_stop_token_ids": [
                 int(token_id) for token_id in (getattr(sampling_params, "stop_token_ids", None) or [])
@@ -283,7 +202,7 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         token_ids = list(output.token_ids) if output is not None else []
         finish_reason = getattr(output, "finish_reason", None)
         stop_reason = getattr(output, "stop_reason", None)
-        stop_token_id = int(self.prompt_builder_t3.hp.stop_speech_token)
+        stop_token_id = int(self.t3.hp.stop_speech_token)
         token_ids, trim_diag = _trim_length_capped_tail(
             token_ids,
             finish_reason=finish_reason,
@@ -320,18 +239,6 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         prepared = self._prepare_request(session=session, text=text, options=options)
-        prompt_embed_seq_len = self._get_prompt_embed_seq_len(prepared)
-        prompt_embed_bucket_seq_len = self._get_prompt_embed_bucket_seq_len(prepared)
-        recycled = self._ensure_engine_capacity(prompt_embed_bucket_seq_len)
-        prepared["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
-        prepared["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
-        prepared["profile"]["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
-        prepared["profile"]["t3_prompt_embed_bucket_seq_len"] = float(prompt_embed_bucket_seq_len)
-        prepared["profile"]["t3_prompt_embed_seq_len"] = float(prompt_embed_seq_len)
-        prepared["profile"]["t3_prompt_embed_high_watermark"] = float(
-            self._prompt_embed_seq_len_high_watermark
-        )
-
         with torch.inference_mode():
             t3_start = time.perf_counter()
             outputs = self.vllm_engine.generate(
@@ -367,30 +274,8 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             )
             for session, text, options in zip(sessions, texts, options_list)
         ]
-        ordered = sorted(
-            enumerate(prepared),
-            key=lambda item: (
-                self._get_prompt_embed_bucket_seq_len(item[1]),
-                self._get_prompt_embed_seq_len(item[1]),
-            ),
-            reverse=True,
-        )
-        recycled = False
-        if ordered:
-            recycled = self._ensure_engine_capacity(
-                self._get_prompt_embed_bucket_seq_len(ordered[0][1])
-            )
+        ordered = list(enumerate(prepared))
         ordered_prepared = [item for _, item in ordered]
-        for item in ordered_prepared:
-            item["profile"]["t3_engine_recycled_for_prompt_growth"] = 1.0 if recycled else 0.0
-            item["profile"]["t3_engine_generation"] = float(self._vllm_engine_generation)
-            item["profile"]["t3_prompt_embed_bucket_size"] = float(self.prompt_embed_bucket_size)
-            item["profile"]["t3_prompt_embed_bucket_seq_len"] = float(
-                self._get_prompt_embed_bucket_seq_len(item)
-            )
-            item["profile"]["t3_prompt_embed_high_watermark"] = float(
-                self._prompt_embed_seq_len_high_watermark
-            )
 
         with torch.inference_mode():
             t3_start = time.perf_counter()

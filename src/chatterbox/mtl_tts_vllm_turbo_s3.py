@@ -1,12 +1,12 @@
 from pathlib import Path
 import os
+from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
 
 from .models.s3gen import S3Gen
-from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -41,19 +41,6 @@ def _resolve_turbo_s3_checkpoint_dir(turbo_s3_checkpoint_dir: str | None) -> Pat
     )
 
 
-def _load_prompt_builder_t3(ckpt_dir: Path, device: str) -> T3:
-    t3 = T3(T3Config.multilingual())
-    state = load_safetensors(ckpt_dir / "t3_mtl23ls_v2.safetensors")
-    if "model" in state.keys():
-        state = state["model"][0]
-    t3.load_state_dict(state)
-    t3.to(device).eval()
-    # Keep only the prompt-building pieces local. vLLM owns the decoder body.
-    del t3.tfmr
-    t3.compiled = False
-    return t3
-
-
 class ChatterboxMultilingualVllmTurboS3TTS:
     def __init__(self, worker: ChatterboxMultilingualVllmWorker):
         self.sr = worker.sr
@@ -74,7 +61,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         turbo_s3_checkpoint_dir: str | None = None,
         vllm_model_dir: str | None = None,
         vllm_export_dir: str | None = None,
-        vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
@@ -82,7 +68,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
         vllm_enable_chunked_prefill: bool = True,
-        vllm_prompt_embed_bucket_size: int = 4,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -98,11 +83,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             torch.load(base_ckpt_dir / "ve.pt", map_location=map_location, weights_only=True)
         )
         ve.to(device).eval()
-
-        prompt_builder_t3 = _load_prompt_builder_t3(
-            base_ckpt_dir,
-            vllm_prompt_builder_device,
-        )
 
         s3gen = S3Gen(meanflow=True)
         s3gen.load_state_dict(
@@ -138,17 +118,13 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_engine = create_vllm_engine(**engine_kwargs)
 
         worker = ChatterboxMultilingualVllmWorker(
-            prompt_builder_t3=prompt_builder_t3,
-            prompt_builder_device=vllm_prompt_builder_device,
             vllm_engine=vllm_engine,
-            vllm_engine_factory=lambda: create_vllm_engine(**engine_kwargs),
-            prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
             s3gen=s3gen,
             ve=ve,
             tokenizer=tokenizer,
             device=device,
             default_conds=default_conds,
-            t3=prompt_builder_t3,
+            t3=SimpleNamespace(hp=T3Config.multilingual()),
         )
         return cls(worker)
 
@@ -160,7 +136,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         turbo_s3_checkpoint_dir: str | None = None,
         vllm_model_dir: str | None = None,
         vllm_export_dir: str | None = None,
-        vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
@@ -168,7 +143,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
         vllm_enable_chunked_prefill: bool = True,
-        vllm_prompt_embed_bucket_size: int = 4,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():
@@ -195,7 +169,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             vllm_model_dir=vllm_model_dir,
             vllm_export_dir=vllm_export_dir,
-            vllm_prompt_builder_device=vllm_prompt_builder_device,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
@@ -203,7 +176,6 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
             vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
-            vllm_prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
             vllm_export_copy=vllm_export_copy,
         )
 

@@ -373,7 +373,7 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     t3_prompt_lens = [int(request_metric(item, "t3_batch_prompt_len")) for item in ok if "t3_batch_prompt_len" in item["profile"]]
     t3_group_text_lens = [int(request_metric(item, "t3_group_text_len")) for item in ok if "t3_group_text_len" in item["profile"]]
     t3_group_prompt_lens = [int(request_metric(item, "t3_group_prompt_len")) for item in ok if "t3_group_prompt_len" in item["profile"]]
-    t3_prompt_embed_seq_lens = [int(request_metric(item, "t3_prompt_embed_seq_len")) for item in ok if "t3_prompt_embed_seq_len" in item["profile"]]
+    t3_prompt_seq_lens = [int(request_metric(item, "t3_prompt_seq_len")) for item in ok if "t3_prompt_seq_len" in item["profile"]]
     t3_cond_seq_lens = [int(request_metric(item, "t3_cond_seq_len")) for item in ok if "t3_cond_seq_len" in item["profile"]]
     t3_text_token_lens = [int(request_metric(item, "t3_text_token_len")) for item in ok if "t3_text_token_len" in item["profile"]]
     s3_total = [request_metric(item, "s3_s") for item in ok]
@@ -383,7 +383,7 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
     total_audio_s = sum(num_samples) / 24000.0 if num_samples else 0.0
     batch_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_text_lens, t3_prompt_lens)])
     group_key_hist = histogram([f"{text_len}/{prompt_len}" for text_len, prompt_len in zip(t3_group_text_lens, t3_group_prompt_lens)])
-    prompt_embed_seq_len_hist = histogram(t3_prompt_embed_seq_lens)
+    prompt_seq_len_hist = histogram(t3_prompt_seq_lens)
     cond_seq_len_hist = histogram(t3_cond_seq_lens)
     text_token_len_hist = histogram(t3_text_token_lens)
     admission_cohort_hist = histogram(t3_cohort_sizes)
@@ -416,7 +416,7 @@ def summarize_requests(level: int, requests: list[dict], wall_s: float, vram_sum
         "admission_cohort_size_hist": admission_cohort_hist,
         "batch_key_hist": batch_key_hist,
         "group_key_hist": group_key_hist,
-        "prompt_embed_seq_len_hist": prompt_embed_seq_len_hist,
+        "prompt_seq_len_hist": prompt_seq_len_hist,
         "cond_seq_len_hist": cond_seq_len_hist,
         "text_token_len_hist": text_token_len_hist,
         "singleton_request_fraction": round(float(singleton_fraction), 4),
@@ -619,14 +619,12 @@ def main():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
-    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--allow-vllm-compiled-service-sim", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
-    parser.add_argument("--vllm-prompt-embed-bucket-size", type=int, default=4)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
     parser.add_argument("--vllm-export-copy", action="store_true")
@@ -682,13 +680,11 @@ def main():
             turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
             vllm_model_dir=args.vllm_model_dir,
             vllm_export_dir=args.vllm_export_dir,
-            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             vllm_enforce_eager=effective_vllm_enforce_eager,
             vllm_dtype=args.vllm_dtype,
             vllm_max_model_len=args.vllm_max_model_len,
-            vllm_prompt_embed_bucket_size=args.vllm_prompt_embed_bucket_size,
             vllm_enable_prefix_caching=(
                 args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
             ),
@@ -704,7 +700,6 @@ def main():
             print(f"base_checkpoint_dir={args.base_checkpoint_dir}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_max_model_len={args.vllm_max_model_len}")
-            print(f"vllm_prompt_embed_bucket_size={args.vllm_prompt_embed_bucket_size}")
             print(f"vllm_enforce_eager={effective_vllm_enforce_eager}")
             if effective_vllm_enforce_eager and not args.vllm_enforce_eager:
                 print("vllm_enforce_eager_reason=mixed_shape_service_sim_default")
@@ -867,7 +862,7 @@ def main():
             print(f"admission_cohort_size_hist={summary['admission_cohort_size_hist']}")
             print(f"batch_key_hist={summary['batch_key_hist']}")
             print(f"group_key_hist={summary['group_key_hist']}")
-            print(f"prompt_embed_seq_len_hist={summary['prompt_embed_seq_len_hist']}")
+            print(f"prompt_seq_len_hist={summary['prompt_seq_len_hist']}")
             print(f"cond_seq_len_hist={summary['cond_seq_len_hist']}")
             print(f"text_token_len_hist={summary['text_token_len_hist']}")
             print(f"mean_s3_s={summary['mean_s3_s']}")

@@ -64,7 +64,6 @@ def load_model(
     turbo_s3_checkpoint_dir: str | None = None,
     vllm_model_dir: str | None = None,
     vllm_export_dir: str | None = None,
-    vllm_prompt_builder_device: str = "cpu",
     vllm_tensor_parallel_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.5,
     vllm_enforce_eager: bool = False,
@@ -72,7 +71,6 @@ def load_model(
     vllm_max_model_len: int = 2048,
     vllm_enable_prefix_caching: bool = False,
     vllm_enable_chunked_prefill: bool = True,
-    vllm_prompt_embed_bucket_size: int = 4,
     vllm_export_copy: bool = False,
 ):
     model_cls = resolve_model_cls(impl)
@@ -106,7 +104,6 @@ def load_model(
                 turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
                 vllm_model_dir=vllm_model_dir,
                 vllm_export_dir=vllm_export_dir,
-                vllm_prompt_builder_device=vllm_prompt_builder_device,
                 vllm_tensor_parallel_size=vllm_tensor_parallel_size,
                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
                 vllm_enforce_eager=vllm_enforce_eager,
@@ -114,7 +111,6 @@ def load_model(
                 vllm_max_model_len=vllm_max_model_len,
                 vllm_enable_prefix_caching=vllm_enable_prefix_caching,
                 vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
-                vllm_prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
                 vllm_export_copy=vllm_export_copy,
             )
         return model_cls.from_local(checkpoint_dir, device)
@@ -143,7 +139,6 @@ def load_model(
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             vllm_model_dir=vllm_model_dir,
             vllm_export_dir=vllm_export_dir,
-            vllm_prompt_builder_device=vllm_prompt_builder_device,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
@@ -151,7 +146,6 @@ def load_model(
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
             vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
-            vllm_prompt_embed_bucket_size=vllm_prompt_embed_bucket_size,
             vllm_export_copy=vllm_export_copy,
         )
     return model_cls.from_pretrained(device)
@@ -562,13 +556,11 @@ def main():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
-    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--vllm-dtype", default="auto")
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
-    parser.add_argument("--vllm-prompt-embed-bucket-size", type=int, default=4)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
     parser.add_argument("--vllm-enable-chunked-prefill", action="store_true")
@@ -603,13 +595,11 @@ def main():
             turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
             vllm_model_dir=args.vllm_model_dir,
             vllm_export_dir=args.vllm_export_dir,
-            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             vllm_enforce_eager=args.vllm_enforce_eager,
             vllm_dtype=args.vllm_dtype,
             vllm_max_model_len=args.vllm_max_model_len,
-            vllm_prompt_embed_bucket_size=args.vllm_prompt_embed_bucket_size,
             vllm_enable_prefix_caching=(
                 args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
             ),
@@ -636,13 +626,11 @@ def main():
             print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
             print(f"vllm_model_dir={args.vllm_model_dir}")
             print(f"vllm_export_dir={args.vllm_export_dir}")
-            print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
             print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
             print(f"vllm_dtype={args.vllm_dtype}")
             print(f"vllm_max_model_len={args.vllm_max_model_len}")
-            print(f"vllm_prompt_embed_bucket_size={args.vllm_prompt_embed_bucket_size}")
             print(
                 "vllm_enable_prefix_caching="
                 f"{args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
