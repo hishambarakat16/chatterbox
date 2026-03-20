@@ -131,7 +131,7 @@ def build_vllm_t3_config(hp: T3Config | None = None) -> dict:
             "chatterbox_stop_text_token": hp.stop_text_token,
             "chatterbox_start_speech_token": hp.start_speech_token,
             "chatterbox_stop_speech_token": hp.stop_speech_token,
-            "chatterbox_text_pos_embeddings": hp.max_text_tokens + 4,
+            "chatterbox_text_pos_embeddings": hp.max_text_tokens + 2,
             "chatterbox_speech_pos_embeddings": hp.max_speech_tokens + 4,
             "chatterbox_prompt_embeds_required": False,
             "chatterbox_cfg_supported": False,
@@ -315,6 +315,7 @@ def create_vllm_engine(
         max_model_len=max_model_len,
         enable_prefix_caching=enable_prefix_caching,
         enable_chunked_prefill=enable_chunked_prefill,
+        enable_mm_embeds=True,
     )
 
 

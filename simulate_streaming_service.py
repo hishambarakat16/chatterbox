@@ -17,6 +17,7 @@ from benchmark_multilingual_concurrency import (
     load_model,
     maybe_sync,
     percentile,
+    resolve_repetition_penalty,
 )
 
 
@@ -647,12 +648,13 @@ def main():
     parser.add_argument("--warmup-text")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--repetition-penalty", type=float, default=2.0)
+    parser.add_argument("--repetition-penalty", type=float)
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
 
+    args.repetition_penalty = resolve_repetition_penalty(args.impl, args.repetition_penalty)
     sentences = [] if args.fixed_text else load_sentences(args.sentences_file)
     warmup_text = args.warmup_text or args.fixed_text or sentences[0]
     output_dir = Path(args.output_dir)

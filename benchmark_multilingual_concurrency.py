@@ -246,6 +246,14 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def resolve_repetition_penalty(impl: str, repetition_penalty: float | None) -> float:
+    if repetition_penalty is not None:
+        return repetition_penalty
+    if impl == "vllm_turbo_s3":
+        return 1.0
+    return 2.0
+
+
 def _call_with_supported_kwargs(fn, **kwargs):
     signature = inspect.signature(fn)
     accepted = {
@@ -568,7 +576,7 @@ def main():
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--repetition-penalty", type=float, default=2.0)
+    parser.add_argument("--repetition-penalty", type=float)
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=1000)
@@ -577,6 +585,7 @@ def main():
     parser.add_argument("--output-dir")
     args = parser.parse_args()
 
+    args.repetition_penalty = resolve_repetition_penalty(args.impl, args.repetition_penalty)
     configure_shape_logging(args.trace_shapes, trace_s3_shapes=args.trace_s3_shapes)
 
     model = None

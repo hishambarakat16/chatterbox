@@ -49,8 +49,25 @@ def _conditioning_field_config(_: Mapping[str, torch.Tensor]) -> Mapping[str, Mu
 
 
 class ChatterboxT3ProcessingInfo(BaseProcessingInfo):
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._hf_processor = None
+
     def get_hf_config(self):
         return self.ctx.get_hf_config()
+
+    def get_hf_processor(self, **kwargs):
+        del kwargs
+        if self._hf_processor is None:
+            from transformers import AutoTokenizer
+
+            self._hf_processor = ChatterboxT3TokenizerProcessor(
+                AutoTokenizer.from_pretrained(
+                    self.model_id,
+                    trust_remote_code=False,
+                )
+            )
+        return self._hf_processor
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"conditioning": 1}
@@ -113,6 +130,45 @@ class ChatterboxT3DummyInputsBuilder(BaseDummyInputsBuilder[ChatterboxT3Processi
                 "emotion_adv": 0.5 * torch.ones((num_items, 1, 1), dtype=torch.float32),
             }
         }
+
+
+class ChatterboxT3TokenizerProcessor:
+    """
+    Minimal text-only processor for the internal-prompt vLLM T3 path.
+
+    The Chatterbox multimodal tensors are passed through separately, so this
+    processor only needs to preserve the exact prompt token strings without
+    adding extra special tokens, padding, or truncation.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(
+        self,
+        text=None,
+        return_tensors: str = "pt",
+        **kwargs,
+    ):
+        from transformers.feature_extraction_utils import BatchFeature
+
+        if text is None:
+            raise ValueError("ChatterboxT3TokenizerProcessor requires `text`.")
+
+        kwargs.pop("add_special_tokens", None)
+        kwargs.pop("padding", None)
+        kwargs.pop("truncation", None)
+        kwargs.pop("max_length", None)
+
+        encoded = self.tokenizer(
+            text,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            return_tensors=return_tensors,
+            **kwargs,
+        )
+        return BatchFeature(dict(encoded))
 
 
 class ChatterboxT3MultiModalProcessor(
@@ -421,6 +477,7 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapped = []
+        loaded = set()
         embed_weight = self.model.embed_tokens.weight
         lm_head_weight = self.lm_head.weight
 
@@ -434,9 +491,11 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
                     continue
                 if name == "speech_emb.weight":
                     embed_weight[: tensor.shape[0]].copy_(tensor)
+                    loaded.add("model.embed_tokens.weight")
                     continue
                 if name == "speech_head.weight":
                     lm_head_weight[: tensor.shape[0]].copy_(tensor)
+                    loaded.add("lm_head.weight")
                     continue
                 if name in (
                     "text_emb.weight",
@@ -451,4 +510,4 @@ class ChatterboxT3ForCausalLM(LlamaForCausalLM):
                 lm_head_weight[self.speech_vocab_size :].zero_()
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(mapped)
+        return loader.load_weights(mapped) | loaded
