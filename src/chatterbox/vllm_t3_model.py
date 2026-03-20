@@ -14,9 +14,10 @@ try:
     from vllm.config import VllmConfig
     from vllm.config.multimodal import BaseDummyOptions
     from vllm.model_executor.models.llama import LlamaForCausalLM
+    from vllm.model_executor.models.interfaces import MultiModalEmbeddings
     from vllm.model_executor.models.utils import AutoWeightsLoader, _merge_multimodal_embeddings
     from vllm.multimodal import MULTIMODAL_REGISTRY
-    from vllm.multimodal.inputs import MultiModalDataDict, MultiModalFieldConfig, MultiModalEmbeddings
+    from vllm.multimodal.inputs import MultiModalDataDict, MultiModalFieldConfig
     from vllm.multimodal.parse import DictEmbeddingItems, MultiModalDataItems, MultiModalDataParser
     from vllm.multimodal.processing import (
         BaseDummyInputsBuilder,
