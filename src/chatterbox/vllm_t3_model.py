@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping
 
 import torch
@@ -9,6 +10,8 @@ from .models.t3.modules.cond_enc import T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .models.t3.modules.t3_config import T3Config
 from .vllm_t3_bridge import get_conditioning_seq_len, get_vllm_prompt_layout
+
+logger = logging.getLogger(__name__)
 
 try:
     from vllm.config import VllmConfig
@@ -27,10 +30,138 @@ try:
         PromptUpdate,
     )
     from vllm.sequence import IntermediateTensors
+    from vllm.v1.sample.logits_processor.interface import (
+        BatchUpdate,
+        LogitsProcessor as VllmBatchLogitsProcessor,
+        MoveDirectionality,
+    )
 except ImportError as exc:  # pragma: no cover - this file is imported only in a vLLM env.
     raise ImportError(
         "chatterbox.vllm_t3_model requires vLLM to be installed."
     ) from exc
+
+
+class T3CFGLogitsProcessor(VllmBatchLogitsProcessor):
+    """
+    Batch-level LogitsProcessor that implements Classifier-Free Guidance (CFG),
+    EOS suppression, and token-repetition detection for T3 speech generation.
+
+    For each CFG pair (cond, uncond) submitted to vLLM:
+    - Reads cfg_weight, is_uncond, pair_id, stop_token_id, min_speech_tokens
+      from SamplingParams.extra_args.
+    - In apply():
+        1. Applies CFG: cfg_logits = cond + w*(cond - uncond)
+        2. Suppresses stop token for the first min_speech_tokens steps
+        3. Forces EOS if the last 3 generated cond tokens are identical
+        4. Forces uncond to one-hot on cond's argmax (shared token trajectory)
+
+    Register by passing the class to LLM(logits_processors=[T3CFGLogitsProcessor]).
+    The processor is a no-op for requests that don't set extra_args.
+    """
+
+    def __init__(self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool):
+        # batch_idx → meta dict
+        self._batch_meta: dict[int, dict] = {}
+        # pair_id → {'cond_idx', 'uncond_idx', 'cond_output'}
+        self._pairs: dict[str, dict] = {}
+
+    def update_state(self, batch_update: "BatchUpdate | None") -> None:
+        if batch_update is None:
+            return
+
+        # 1. Process removed (must be first so indices are still valid)
+        for idx in batch_update.removed:
+            meta = self._batch_meta.pop(idx, None)
+            if meta:
+                pair = self._pairs.get(meta["pair_id"], {})
+                pair.pop("uncond_idx" if meta["is_uncond"] else "cond_idx", None)
+                if not pair:
+                    self._pairs.pop(meta["pair_id"], None)
+
+        # 2. Process added
+        for idx, sampling_params, _prompt_tok_ids, output_tok_ids in batch_update.added:
+            extra = getattr(sampling_params, "extra_args", None) or {}
+            cfg_weight = float(extra.get("cfg_weight", 0.0))
+            pair_id = str(extra.get("pair_id", ""))
+            if not pair_id or cfg_weight <= 0.0:
+                continue
+            is_uncond = bool(extra.get("is_uncond", False))
+            self._batch_meta[idx] = {
+                "cfg_weight": cfg_weight,
+                "is_uncond": is_uncond,
+                "pair_id": pair_id,
+                "stop_token_id": int(extra.get("stop_token_id", 0)),
+                "min_speech_tokens": int(extra.get("min_speech_tokens", 0)),
+            }
+            pair = self._pairs.setdefault(pair_id, {})
+            if is_uncond:
+                pair["uncond_idx"] = idx
+            else:
+                pair["cond_idx"] = idx
+                pair["cond_output"] = output_tok_ids  # live reference to generated tokens
+
+        # 3. Process moved
+        for old_idx, new_idx, direction in batch_update.moved:
+            if direction == MoveDirectionality.SWAP:
+                old_meta = self._batch_meta.pop(old_idx, None)
+                new_meta = self._batch_meta.pop(new_idx, None)
+                self._apply_move(old_idx, new_idx, old_meta)
+                self._apply_move(new_idx, old_idx, new_meta)
+            else:  # UNIDIRECTIONAL
+                meta = self._batch_meta.pop(old_idx, None)
+                self._apply_move(old_idx, new_idx, meta)
+
+    def _apply_move(self, old_idx: int, new_idx: int, meta: dict | None) -> None:
+        if meta is None:
+            return
+        self._batch_meta[new_idx] = meta
+        pair = self._pairs.get(meta["pair_id"], {})
+        pair["uncond_idx" if meta["is_uncond"] else "cond_idx"] = new_idx
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        for pair_id, pair in list(self._pairs.items()):
+            cond_idx = pair.get("cond_idx")
+            uncond_idx = pair.get("uncond_idx")
+            if cond_idx is None or uncond_idx is None:
+                continue
+            if cond_idx >= logits.shape[0] or uncond_idx >= logits.shape[0]:
+                continue
+            meta = self._batch_meta.get(cond_idx)
+            if meta is None:
+                continue
+
+            cfg_weight = meta["cfg_weight"]
+            stop_token_id = meta["stop_token_id"]
+            min_speech_tokens = meta["min_speech_tokens"]
+            cond_output: list[int] = pair.get("cond_output") or []
+            step = len(cond_output)
+
+            # 1. Apply CFG: cfg = cond + w*(cond - uncond)
+            cond_logits = logits[cond_idx].clone()
+            cfg_logits = cond_logits + cfg_weight * (cond_logits - logits[uncond_idx])
+
+            # 2. EOS suppression: prevent stop token before minimum speech length
+            if step < min_speech_tokens:
+                cfg_logits[stop_token_id] = -float(2**15)
+
+            # 3. Token repetition: 3x same token after enough output → force EOS
+            if step >= 3 and len(set(cond_output[-3:])) == 1:
+                repeated = cond_output[-1]
+                logger.warning("T3CFGLogitsProcessor: forcing EOS, 3x token repetition of %d at step %d", repeated, step)
+                cfg_logits = torch.full_like(cfg_logits, -float(2**15))
+                cfg_logits[stop_token_id] = float(2**15)
+
+            logits[cond_idx] = cfg_logits
+
+            # 4. Force uncond to mirror cond's argmax (shared token trajectory)
+            argmax_tok = int(cfg_logits.argmax().item())
+            logits[uncond_idx] = torch.full_like(logits[uncond_idx], float("-inf"))
+            logits[uncond_idx, argmax_tok] = 0.0
+
+        return logits
+
+    def is_argmax_invariant(self) -> bool:
+        return False
 
 
 HP = T3Config.multilingual()

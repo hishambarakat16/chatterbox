@@ -302,6 +302,9 @@ def create_vllm_engine(
 ):
     LLM, _, _ = optional_import_vllm()
     register_vllm_t3_model()
+    # Register CFG processor — it is a no-op for requests that don't set
+    # extra_args, so it is always safe to include regardless of cfg_weight.
+    from .vllm_t3_model import T3CFGLogitsProcessor
     return LLM(
         model=str(model_dir),
         skip_tokenizer_init=False,
@@ -316,21 +319,123 @@ def create_vllm_engine(
         enable_prefix_caching=enable_prefix_caching,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_mm_embeds=True,
+        logits_processors=[T3CFGLogitsProcessor],
     )
 
 
 def make_sampling_params(*, options, hp: T3Config):
+    # NOTE: vLLM's native repetition_penalty uses prompt_token_ids for scatter
+    # penalty computation (vocab_size = speech_vocab_size ~6563). The T3 prompt
+    # contains conditioning placeholder token IDs that are ABOVE that range
+    # (conditioning_token_id = speech_vocab + text_vocab), which causes an
+    # index-out-of-bounds crash in scatter_add_ whenever repetition_penalty != 1.0.
+    # Repetition control is handled instead by T3CFGLogitsProcessor.
+    # Always pass 1.0 here to disable the vLLM penalty path.
     _, _, SamplingParams = optional_import_vllm()
     return SamplingParams(
         temperature=float(options.temperature),
         top_p=float(options.top_p),
         min_p=float(options.min_p),
-        repetition_penalty=float(options.repetition_penalty),
+        repetition_penalty=1.0,
         max_tokens=int(options.max_new_tokens),
         stop_token_ids=[int(hp.stop_speech_token)],
         detokenize=False,
         skip_special_tokens=False,
     )
+
+
+def make_cfg_pair_sampling_params(
+    *,
+    options,
+    hp: T3Config,
+    pair_id: str,
+    min_speech_tokens: int,
+) -> tuple:
+    """
+    Build (cond_sampling_params, uncond_sampling_params) for a CFG pair.
+
+    Both share the same generation settings; they differ only in extra_args,
+    which T3CFGLogitsProcessor reads to identify and link the pair.
+
+    Returns a (cond_sp, uncond_sp) tuple. When cfg_weight == 0 returns
+    (plain_sp, None) so callers can skip submitting the uncond prompt.
+    """
+    _, _, SamplingParams = optional_import_vllm()
+    cfg_weight = float(getattr(options, "cfg_weight", 0.0))
+    stop_token_id = int(hp.stop_speech_token)
+    base_kwargs = dict(
+        temperature=float(options.temperature),
+        top_p=float(options.top_p),
+        min_p=float(options.min_p),
+        repetition_penalty=1.0,
+        max_tokens=int(options.max_new_tokens),
+        stop_token_ids=[stop_token_id],
+        detokenize=False,
+        skip_special_tokens=False,
+    )
+    if cfg_weight <= 0.0:
+        return SamplingParams(**base_kwargs), None
+
+    cond_sp = SamplingParams(
+        **base_kwargs,
+        extra_args={
+            "cfg_weight": cfg_weight,
+            "is_uncond": False,
+            "pair_id": pair_id,
+            "stop_token_id": stop_token_id,
+            "min_speech_tokens": min_speech_tokens,
+        },
+    )
+    uncond_sp = SamplingParams(
+        **base_kwargs,
+        extra_args={
+            "cfg_weight": cfg_weight,
+            "is_uncond": True,
+            "pair_id": pair_id,
+            "stop_token_id": stop_token_id,
+            "min_speech_tokens": min_speech_tokens,
+        },
+    )
+    return cond_sp, uncond_sp
+
+
+def build_vllm_uncond_prompt(*, t3_cond) -> dict:
+    """
+    Build the unconditional vLLM prompt for CFG.
+
+    Uses the same speaker / emotion conditioning as the cond prompt but
+    replaces the text sequence with just SOT + EOT (empty text).  This
+    mirrors the original HF-replay approach where text_emb[uncond].zero_()
+    was used: the model sees "no meaningful text" for the uncond half.
+    """
+    hp = T3Config.multilingual()
+    layout = get_vllm_prompt_layout(hp)
+
+    # Empty text: only the boundary tokens, no content tokens
+    empty_text_ids = [int(hp.start_text_token), int(hp.stop_text_token)]
+    prompt_token_ids = [
+        int(layout["conditioning_token_id"]),
+        *[int(layout["text_token_offset"] + tok) for tok in empty_text_ids],
+        int(hp.start_speech_token),
+        int(hp.start_speech_token),
+    ]
+    conditioning = {
+        "speaker_emb": t3_cond.speaker_emb.detach().cpu(),
+        "cond_prompt_speech_tokens": (
+            None
+            if getattr(t3_cond, "cond_prompt_speech_tokens", None) is None
+            else t3_cond.cond_prompt_speech_tokens.detach().cpu()
+        ),
+        "emotion_adv": (
+            None
+            if getattr(t3_cond, "emotion_adv", None) is None
+            else t3_cond.emotion_adv.detach().cpu()
+        ),
+    }
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "multi_modal_data": {"conditioning": conditioning},
+    }
 
 
 def prepare_vllm_text_tokens(*, tokenizer, text: str, language_id: str | None, device: str) -> torch.Tensor:
