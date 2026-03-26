@@ -92,9 +92,21 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         assert return_dict
         assert output_hidden_states
 
+        # transformers >= 4.38 expects a Cache object, not a raw tuple.
+        # Convert legacy tuple format so older calling code (scheduled_decode.py)
+        # still works without changes.
+        from transformers import DynamicCache
+        cache_input = past_key_values
+        is_legacy_tuple = isinstance(past_key_values, tuple) and (
+            len(past_key_values) == 0
+            or (len(past_key_values) > 0 and isinstance(past_key_values[0], tuple))
+        )
+        if is_legacy_tuple and past_key_values is not None and len(past_key_values) > 0:
+            cache_input = DynamicCache.from_legacy_cache(past_key_values)
+
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
-            past_key_values=past_key_values,
+            past_key_values=cache_input,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -108,9 +120,15 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         # NOTE: hallucination handler may modify logits to force emit an EOS token
         # logits = self.alignment_stream_analyzer.step(logits)
 
+        # Convert Cache back to legacy tuple format so callers expecting a tuple
+        # (scheduled_decode.py, replay, etc.) continue to work.
+        out_past = tfmr_out.past_key_values
+        if isinstance(out_past, DynamicCache):
+            out_past = out_past.to_legacy_cache()
+
         return CausalLMOutputWithCrossAttentions(
             logits=logits,
-            past_key_values=tfmr_out.past_key_values,
+            past_key_values=out_past,
             hidden_states=tfmr_out.hidden_states,
             attentions=tfmr_out.attentions,
         )

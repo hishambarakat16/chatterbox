@@ -30,7 +30,7 @@ class AlignmentAnalysisResult:
 
 
 class AlignmentStreamAnalyzer:
-    def __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0):
+    def __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0, batch_row: int = 0):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
         activation maps. This module exploits this to perform online integrity checks which streaming.
@@ -40,6 +40,7 @@ class AlignmentStreamAnalyzer:
         NOTE: currently requires no queues.
         """
         # self.queue = queue
+        self.batch_row = batch_row
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
         self.alignment = torch.zeros(0, j-i)
@@ -59,8 +60,11 @@ class AlignmentStreamAnalyzer:
         # Using `output_attentions=True` is incompatible with optimized attention kernels, so
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
+        self.tfmr = tfmr
+        self.hook_handles = []
+        self.original_output_attentions = None
         self.last_aligned_attns = []
-        for i, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
+        for i, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):  # noqa: B007
             self.last_aligned_attns += [None]
             self._add_attention_spy(tfmr, i, layer_idx, head_idx)
 
@@ -77,14 +81,27 @@ class AlignmentStreamAnalyzer:
             """
             if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
                 step_attention = output[1].cpu()  # (B, n_heads, T0, Ti)
-                self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]  # (T0, Ti)
+                self.last_aligned_attns[buffer_idx] = step_attention[self.batch_row, head_idx]  # (T0, Ti)
 
         target_layer = tfmr.layers[layer_idx].self_attn
         # Register hook and store the handle
-        target_layer.register_forward_hook(attention_forward_hook)
+        handle = target_layer.register_forward_hook(attention_forward_hook)
+        self.hook_handles.append(handle)
         if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
-            self.original_output_attentions = tfmr.config.output_attentions
+            if self.original_output_attentions is None:
+                self.original_output_attentions = tfmr.config.output_attentions
             tfmr.config.output_attentions = True
+
+    def close(self):
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+        if (
+            self.original_output_attentions is not None
+            and hasattr(self.tfmr, 'config')
+            and hasattr(self.tfmr.config, 'output_attentions')
+        ):
+            self.tfmr.config.output_attentions = self.original_output_attentions
 
     def step(self, logits, next_token=None):
         """
@@ -151,16 +168,20 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
             
-        # Check for excessive token repetition (3x same token in a row)
+        # Check for excessive token repetition (3x same token in a row).
+        # Only fire after text alignment is complete AND a settling buffer has
+        # passed (5 frames), so we don't cut the final phonemes of the sentence.
+        frames_since_complete = (T - self.completed_at) if self.completed_at is not None else 0
         token_repetition = (
-            # self.complete and 
+            self.complete and
+            frames_since_complete >= 5 and
             len(self.generated_tokens) >= 3 and
-            len(set(self.generated_tokens[-2:])) == 1
+            len(set(self.generated_tokens[-3:])) == 1
         )
-        
+
         if token_repetition:
             repeated_token = self.generated_tokens[-1]
-            logger.warning(f"🚨 Detected 2x repetition of token {repeated_token}")
+            logger.warning(f"🚨 Detected 3x repetition of token {repeated_token}")
             
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens

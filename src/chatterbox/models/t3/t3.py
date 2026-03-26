@@ -114,7 +114,7 @@ class T3(nn.Module):
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
         if cfg_weight > 0.0 and not self.is_gpt:
-            text_emb[1].zero_()  # CFG uncond
+            text_emb[1::2].zero_()  # CFG uncond (works for N-request batches: rows 1,3,5,…)
 
         speech_emb = self.speech_emb(speech_tokens)  # (B, len_speech, dim)
         if self.hp.input_pos_emb == "learned":
@@ -293,6 +293,19 @@ class T3(nn.Module):
             # Default to None for English models, only create for multilingual
             alignment_stream_analyzer = None
             if self.hp.is_multilingual:
+                # The analyzer requires `output_attentions=True`, which is rejected under SDPA.
+                # Force eager attention for this decode path to keep analyzer behavior stable.
+                tfmr_cfg = getattr(self.tfmr, "config", None)
+                if tfmr_cfg is not None:
+                    try:
+                        setattr(tfmr_cfg, "_attn_implementation", "eager")
+                    except Exception:
+                        pass
+                    try:
+                        setattr(tfmr_cfg, "attn_implementation", "eager")
+                    except Exception:
+                        pass
+
                 alignment_stream_analyzer = AlignmentStreamAnalyzer(
                     self.tfmr,
                     None,
@@ -350,10 +363,13 @@ class T3(nn.Module):
         predicted = []  # To store the predicted tokens
 
         # Instantiate the logits processors.
-        top_p_warper = TopPLogitsWarper(top_p=top_p)
+        deterministic = float(temperature) <= 0.0
         min_p_warper = MinPLogitsWarper(min_p=min_p)
         top_p_warper = TopPLogitsWarper(top_p=top_p)
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+        effective_temperature = float(temperature)
+        if deterministic:
+            logger.info("temperature=%s -> greedy decode (argmax)", temperature)
 
         # ---- Initial Forward Pass (no kv_cache yet) ----
         output = self.patched_model(
@@ -388,17 +404,21 @@ class T3(nn.Module):
             ids_for_proc = generated_ids[:1, ...]   # batch = 1
             logits = repetition_penalty_processor(ids_for_proc, logits)  # expects (B,V)
             
-            # Apply temperature scaling.
-            if temperature != 1.0:
-                logits = logits / temperature
-                
-            # Apply min_p and top_p filtering
-            logits = min_p_warper(ids_for_proc, logits)
-            logits = top_p_warper(ids_for_proc, logits)
+            if deterministic:
+                # Deterministic mode (temperature <= 0): avoid multinomial on degenerate probs.
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                # Apply temperature scaling.
+                if effective_temperature != 1.0:
+                    logits = logits / effective_temperature
 
-            # Convert logits to probabilities and sample the next token.
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+                # Apply min_p and top_p filtering
+                logits = min_p_warper(ids_for_proc, logits)
+                logits = top_p_warper(ids_for_proc, logits)
+
+                # Convert logits to probabilities and sample the next token.
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
             predicted.append(next_token)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)

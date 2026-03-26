@@ -1,12 +1,12 @@
 from pathlib import Path
 import os
-from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
 
 from .models.s3gen import S3Gen
+from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -36,7 +36,7 @@ def _resolve_turbo_s3_checkpoint_dir(turbo_s3_checkpoint_dir: str | None) -> Pat
         snapshot_download(
             repo_id=TURBO_REPO_ID,
             allow_patterns=["s3gen_meanflow.safetensors"],
-            token=os.getenv("HF_TOKEN") or True,
+            token=os.getenv("HF_TOKEN"),
         )
     )
 
@@ -93,6 +93,13 @@ class ChatterboxMultilingualVllmTurboS3TTS:
 
         tokenizer = MTLTokenizer(str(base_ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
 
+        t3 = T3(T3Config.multilingual())
+        t3_state = load_safetensors(base_ckpt_dir / "t3_mtl23ls_v2.safetensors")
+        if "model" in t3_state.keys():
+            t3_state = t3_state["model"][0]
+        t3.load_state_dict(t3_state)
+        t3.to(device).eval()
+
         default_conds = None
         if (builtin_voice := base_ckpt_dir / "conds.pt").exists():
             default_conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
@@ -124,7 +131,7 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             tokenizer=tokenizer,
             device=device,
             default_conds=default_conds,
-            t3=SimpleNamespace(hp=T3Config.multilingual()),
+            t3=t3,
         )
         return cls(worker)
 
