@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import shlex
 import shutil
 import statistics
@@ -44,6 +45,76 @@ def mean_or_zero(values: list[float]) -> float:
 
 def pstdev_or_zero(values: list[float]) -> float:
     return 0.0 if len(values) < 2 else float(statistics.pstdev(values))
+
+
+def resolve_model_tokenizer(model):
+    worker = getattr(model, "worker", None)
+    tokenizer = getattr(worker, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    return getattr(model, "tokenizer", None)
+
+
+def estimate_tokenizer_text_len(tokenizer, text: str, language_id: str) -> int:
+    if tokenizer is not None:
+        try:
+            tokens = tokenizer.text_to_tokens(
+                text,
+                language_id=language_id.lower() if language_id else None,
+            )
+            return int(tokens.numel())
+        except Exception:
+            pass
+    return max(1, len(text.split()))
+
+
+def split_text_for_token_budget(
+    *,
+    text: str,
+    tokenizer,
+    language_id: str,
+    max_text_tokens: int,
+) -> list[dict]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return []
+    if max_text_tokens <= 0:
+        return [
+            {
+                "text": normalized,
+                "text_len": estimate_tokenizer_text_len(tokenizer, normalized, language_id),
+            }
+        ]
+
+    segments = re.findall(r"\S+\s*", normalized)
+    if not segments:
+        return [
+            {
+                "text": normalized,
+                "text_len": estimate_tokenizer_text_len(tokenizer, normalized, language_id),
+            }
+        ]
+
+    chunks: list[dict] = []
+    current_text = ""
+    current_len = 0
+
+    for segment in segments:
+        candidate = f"{current_text}{segment}".strip()
+        candidate_len = estimate_tokenizer_text_len(tokenizer, candidate, language_id)
+        if not current_text or candidate_len <= max_text_tokens:
+            current_text = candidate
+            current_len = candidate_len
+            continue
+
+        chunks.append({"text": current_text, "text_len": current_len})
+        current_text = segment.strip()
+        current_len = estimate_tokenizer_text_len(tokenizer, current_text, language_id)
+
+    if current_text:
+        chunks.append({"text": current_text, "text_len": current_len})
+
+    return chunks
 
 
 def build_session(
@@ -120,18 +191,95 @@ def histogram(values: list[int | str]) -> dict[str, int]:
 
 
 def estimate_vllm_text_len(model, text: str, language_id: str) -> int:
-    worker = getattr(model, "worker", None)
-    tokenizer = getattr(worker, "tokenizer", None)
-    if tokenizer is not None:
-        try:
-            tokens = tokenizer.text_to_tokens(
-                text,
-                language_id=language_id.lower() if language_id else None,
-            )
-            return int(tokens.numel())
-        except Exception:
-            pass
-    return max(1, len(text.split()))
+    return estimate_tokenizer_text_len(resolve_model_tokenizer(model), text, language_id)
+
+
+def prepare_request_text_plan(
+    *,
+    model,
+    fixed_text: str | None,
+    sentences: list[str],
+    language_id: str,
+    fixed_text_token_budget: int,
+    fixed_text_chunk_mode: str,
+    warmup_text_arg: str | None,
+) -> dict:
+    if not fixed_text:
+        return {
+            "request_text_mode": "rotating_sentences",
+            "fixed_request_text": None,
+            "text_pool": list(sentences),
+            "warmup_text": warmup_text_arg or sentences[0],
+            "fixed_text_source": None,
+            "ingestion_chunks": [],
+            "cycle_enabled": False,
+            "cycle_fallback_reason": None,
+        }
+
+    tokenizer = resolve_model_tokenizer(model)
+    if fixed_text_token_budget <= 0:
+        fixed_request_text = " ".join(fixed_text.split())
+        return {
+            "request_text_mode": "fixed",
+            "fixed_request_text": fixed_request_text,
+            "text_pool": [],
+            "warmup_text": warmup_text_arg or fixed_request_text,
+            "fixed_text_source": fixed_text,
+            "ingestion_chunks": [
+                {
+                    "text": fixed_request_text,
+                    "text_len": estimate_tokenizer_text_len(tokenizer, fixed_request_text, language_id),
+                }
+            ],
+            "cycle_enabled": False,
+            "cycle_fallback_reason": None,
+        }
+
+    ingestion_chunks = split_text_for_token_budget(
+        text=fixed_text,
+        tokenizer=tokenizer,
+        language_id=language_id,
+        max_text_tokens=fixed_text_token_budget,
+    )
+    if not ingestion_chunks:
+        raise ValueError("Fixed-text ingestion produced no chunks.")
+
+    if fixed_text_chunk_mode == "cycle":
+        unique_chunk_lens = sorted({int(item["text_len"]) for item in ingestion_chunks})
+        if len(unique_chunk_lens) == 1:
+            return {
+                "request_text_mode": "fixed_chunk_cycle",
+                "fixed_request_text": None,
+                "text_pool": [item["text"] for item in ingestion_chunks],
+                "warmup_text": warmup_text_arg or ingestion_chunks[0]["text"],
+                "fixed_text_source": fixed_text,
+                "ingestion_chunks": ingestion_chunks,
+                "cycle_enabled": True,
+                "cycle_fallback_reason": None,
+            }
+        fixed_request_text = ingestion_chunks[0]["text"]
+        return {
+            "request_text_mode": "fixed_first_chunk",
+            "fixed_request_text": fixed_request_text,
+            "text_pool": [],
+            "warmup_text": warmup_text_arg or fixed_request_text,
+            "fixed_text_source": fixed_text,
+            "ingestion_chunks": ingestion_chunks,
+            "cycle_enabled": False,
+            "cycle_fallback_reason": "non_uniform_chunk_token_lengths",
+        }
+
+    fixed_request_text = ingestion_chunks[0]["text"]
+    return {
+        "request_text_mode": "fixed_first_chunk",
+        "fixed_request_text": fixed_request_text,
+        "text_pool": [],
+        "warmup_text": warmup_text_arg or fixed_request_text,
+        "fixed_text_source": fixed_text,
+        "ingestion_chunks": ingestion_chunks,
+        "cycle_enabled": False,
+        "cycle_fallback_reason": None,
+    }
 
 
 def estimate_vllm_prompt_len(session) -> int:
@@ -488,9 +636,19 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `impl`: `{report['impl']}`")
     lines.append(f"- `device`: `{report['device']}`")
     lines.append(f"- `language_id`: `{report['language_id']}`")
-    lines.append(f"- `request_text_mode`: `{'fixed' if report.get('fixed_text') else 'rotating_sentences'}`")
+    lines.append(f"- `request_text_mode`: `{report.get('request_text_mode', 'rotating_sentences')}`")
     if report.get("fixed_text"):
         lines.append(f"- `fixed_text`: `{report['fixed_text']}`")
+    if report.get("fixed_text_source") and report.get("fixed_text_source") != report.get("fixed_text"):
+        lines.append(f"- `fixed_text_source`: `{report['fixed_text_source']}`")
+    if report.get("fixed_text_token_budget", 0) > 0:
+        lines.append(f"- `fixed_text_token_budget`: `{report['fixed_text_token_budget']}`")
+        lines.append(f"- `fixed_text_chunk_mode`: `{report.get('fixed_text_chunk_mode', 'first')}`")
+        lines.append(f"- `ingestion_num_chunks`: `{report.get('ingestion_num_chunks', 0)}`")
+        lines.append(f"- `ingestion_chunk_token_lens`: `{report.get('ingestion_chunk_token_lens', [])}`")
+        lines.append(f"- `fixed_text_cycle_enabled`: `{report.get('fixed_text_cycle_enabled', False)}`")
+        if report.get("fixed_text_cycle_fallback_reason"):
+            lines.append(f"- `fixed_text_cycle_fallback_reason`: `{report['fixed_text_cycle_fallback_reason']}`")
     lines.append(f"- `stagger_ms`: `{report['stagger_ms']}`")
     lines.append(f"- `batching_window_ms`: `{report['batching_window_ms']}`")
     lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
@@ -637,6 +795,8 @@ def main():
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--sentences-file")
     parser.add_argument("--fixed-text")
+    parser.add_argument("--fixed-text-token-budget", type=int, default=0)
+    parser.add_argument("--fixed-text-chunk-mode", choices=["first", "cycle"], default="first")
     parser.add_argument("--concurrency-levels", nargs="+", type=int, default=[1, 2, 4, 6, 8])
     parser.add_argument("--rounds-per-level", type=int, default=2)
     parser.add_argument("--stagger-ms", type=float, default=250.0)
@@ -655,7 +815,6 @@ def main():
     args = parser.parse_args()
 
     sentences = [] if args.fixed_text else load_sentences(args.sentences_file)
-    warmup_text = args.warmup_text or args.fixed_text or sentences[0]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_vllm_enforce_eager = args.vllm_enforce_eager
@@ -695,6 +854,23 @@ def main():
         maybe_sync(args.device)
         load_s = time.perf_counter() - load_start
 
+        text_plan = prepare_request_text_plan(
+            model=model,
+            fixed_text=args.fixed_text,
+            sentences=sentences,
+            language_id=args.language_id,
+            fixed_text_token_budget=args.fixed_text_token_budget,
+            fixed_text_chunk_mode=args.fixed_text_chunk_mode,
+            warmup_text_arg=args.warmup_text,
+        )
+        request_text_mode = text_plan["request_text_mode"]
+        fixed_request_text = text_plan["fixed_request_text"]
+        text_pool = text_plan["text_pool"]
+        warmup_text = text_plan["warmup_text"]
+        ingestion_chunks = text_plan["ingestion_chunks"]
+        cycle_enabled = bool(text_plan.get("cycle_enabled", False))
+        cycle_fallback_reason = text_plan.get("cycle_fallback_reason")
+
         print(f"impl={args.impl}")
         print(f"device={args.device}")
         print(f"load_s={load_s:.4f}")
@@ -713,7 +889,15 @@ def main():
         print(f"stagger_ms={args.stagger_ms}")
         print(f"batching_window_ms={args.batching_window_ms}")
         print(f"text_bucket_width={effective_text_bucket_width}")
-        print(f"request_text_mode={'fixed' if args.fixed_text else 'rotating_sentences'}")
+        print(f"request_text_mode={request_text_mode}")
+        if args.fixed_text_token_budget > 0:
+            print(f"fixed_text_token_budget={args.fixed_text_token_budget}")
+            print(f"fixed_text_chunk_mode={args.fixed_text_chunk_mode}")
+            print(f"ingestion_num_chunks={len(ingestion_chunks)}")
+            print(f"ingestion_chunk_token_lens={[int(item['text_len']) for item in ingestion_chunks]}")
+            print(f"fixed_text_cycle_enabled={cycle_enabled}")
+            if cycle_fallback_reason:
+                print(f"fixed_text_cycle_fallback_reason={cycle_fallback_reason}")
         if args.impl == "vllm_turbo_s3":
             print(f"vllm_prompt_len_only_grouping={not args.allow_vllm_text_bucketing}")
         print(f"rounds_per_level={args.rounds_per_level}")
@@ -765,12 +949,12 @@ def main():
                     for _ in range(level)
                 ]
 
-                if args.fixed_text:
-                    texts = [args.fixed_text] * level
+                if fixed_request_text is not None:
+                    texts = [fixed_request_text] * level
                 else:
                     texts = []
                     for _ in range(level):
-                        texts.append(sentences[sentence_cursor % len(sentences)])
+                        texts.append(text_pool[sentence_cursor % len(text_pool)])
                         sentence_cursor += 1
 
                 if args.impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
@@ -907,7 +1091,15 @@ def main():
             "language_id": args.language_id,
             "audio_prompt_path": args.audio_prompt_path,
             "sentences_file": str(DEFAULT_SENTENCES_FILE if args.sentences_file is None else Path(args.sentences_file)),
-            "fixed_text": args.fixed_text,
+            "fixed_text": fixed_request_text,
+            "fixed_text_source": text_plan["fixed_text_source"],
+            "fixed_text_token_budget": args.fixed_text_token_budget,
+            "fixed_text_chunk_mode": args.fixed_text_chunk_mode,
+            "ingestion_num_chunks": len(ingestion_chunks),
+            "ingestion_chunk_token_lens": [int(item["text_len"]) for item in ingestion_chunks],
+            "fixed_text_cycle_enabled": cycle_enabled,
+            "fixed_text_cycle_fallback_reason": cycle_fallback_reason,
+            "request_text_mode": request_text_mode,
             "warmup_runs": args.warmup_runs,
             "warmup_text": warmup_text,
             "rounds_per_level": args.rounds_per_level,
