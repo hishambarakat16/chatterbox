@@ -76,6 +76,34 @@ def _trim_length_capped_tail(
     return trimmed, diagnostics
 
 
+def _resolve_effective_max_new_tokens(
+    *,
+    requested_max_new_tokens: int,
+    text_token_len: int,
+    auto_enabled: bool,
+    auto_cap: int,
+) -> int:
+    requested = max(1, int(requested_max_new_tokens))
+    if not auto_enabled:
+        return requested
+
+    cap = max(1, int(auto_cap))
+    content_tokens = max(1, int(text_token_len) - 2)
+
+    if content_tokens <= 8:
+        dynamic = 32
+    elif content_tokens <= 16:
+        dynamic = 48
+    elif content_tokens <= 32:
+        dynamic = 64
+    elif content_tokens <= 64:
+        dynamic = 96
+    else:
+        dynamic = cap
+
+    return max(1, min(requested, cap, dynamic))
+
+
 class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
     """
     Experimental vLLM T3 worker.
@@ -159,14 +187,26 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile["t3_prompt_embed_seq_len"] = float(prompt_embed_meta["prompt_embed_seq_len"])
         profile["t3_prompt_embed_hidden_size"] = float(prompt_embed_meta["prompt_embed_hidden_size"])
 
+        effective_max_new_tokens = _resolve_effective_max_new_tokens(
+            requested_max_new_tokens=active_options.max_new_tokens,
+            text_token_len=prompt_embed_meta["text_token_len"],
+            auto_enabled=bool(getattr(active_options, "auto_max_new_tokens", False)),
+            auto_cap=int(getattr(active_options, "auto_max_new_tokens_cap", 128)),
+        )
+        profile["t3_max_new_tokens_requested"] = float(active_options.max_new_tokens)
+        profile["t3_auto_max_new_tokens_enabled"] = 1.0 if bool(getattr(active_options, "auto_max_new_tokens", False)) else 0.0
+        profile["t3_auto_max_new_tokens_cap"] = float(int(getattr(active_options, "auto_max_new_tokens_cap", 128)))
+        profile["t3_max_new_tokens_effective"] = float(effective_max_new_tokens)
+
         if float(active_options.cfg_weight) != 0.0:
             profile["t3_cfg_requested"] = float(active_options.cfg_weight)
         profile["t3_cfg_supported"] = 0.0
         profile["t3_hydra_supported"] = 0.0
         profile["t3_engine_vllm"] = 1.0
 
+        sampling_options = active_options.merged(max_new_tokens=effective_max_new_tokens)
         sampling_params = make_sampling_params(
-            options=active_options,
+            options=sampling_options,
             hp=self.prompt_builder_t3.hp,
         )
         return {
@@ -193,6 +233,10 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             "t3_prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", 0.0)),
             "t3_prompt_embed_hidden_size": int(profile.get("t3_prompt_embed_hidden_size", 0.0)),
             "sampling_max_tokens": int(getattr(sampling_params, "max_tokens", 0) or 0),
+            "t3_max_new_tokens_requested": int(profile.get("t3_max_new_tokens_requested", 0.0)),
+            "t3_max_new_tokens_effective": int(profile.get("t3_max_new_tokens_effective", 0.0)),
+            "t3_auto_max_new_tokens_enabled": bool(profile.get("t3_auto_max_new_tokens_enabled", 0.0)),
+            "t3_auto_max_new_tokens_cap": int(profile.get("t3_auto_max_new_tokens_cap", 0.0)),
             "sampling_stop_token_ids": [
                 int(token_id) for token_id in (getattr(sampling_params, "stop_token_ids", None) or [])
             ],

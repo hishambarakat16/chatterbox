@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import re
 import shlex
@@ -117,6 +118,16 @@ def split_text_for_token_budget(
     return chunks
 
 
+def _call_with_supported_kwargs(fn, **kwargs):
+    signature = inspect.signature(fn)
+    accepted = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters and value is not None
+    }
+    return fn(**accepted)
+
+
 def build_session(
     *,
     model,
@@ -128,8 +139,11 @@ def build_session(
     min_p: float,
     top_p: float,
     max_new_tokens: int,
+    auto_max_new_tokens: bool,
+    auto_max_new_tokens_cap: int,
 ):
-    return model.create_session(
+    return _call_with_supported_kwargs(
+        model.create_session,
         audio_prompt_path=audio_prompt_path,
         language_id=language_id,
         cfg_weight=cfg_weight,
@@ -138,6 +152,8 @@ def build_session(
         min_p=min_p,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        auto_max_new_tokens=auto_max_new_tokens,
+        auto_max_new_tokens_cap=auto_max_new_tokens_cap,
     )
 
 
@@ -155,6 +171,8 @@ def run_warmup(
     min_p: float,
     top_p: float,
     max_new_tokens: int,
+    auto_max_new_tokens: bool,
+    auto_max_new_tokens_cap: int,
 ):
     if warmup_runs <= 0:
         return
@@ -170,6 +188,8 @@ def run_warmup(
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         if impl not in SESSION_IMPLS:
             raise ValueError(f"Unsupported impl for service simulator: {impl}")
@@ -658,6 +678,8 @@ def write_markdown_report(path: Path, report: dict):
             f"- `vllm_prompt_len_only_grouping`: `{report.get('vllm_prompt_len_only_grouping', False)}`"
         )
     lines.append(f"- `rounds_per_level`: `{report['rounds_per_level']}`")
+    lines.append(f"- `auto_max_new_tokens`: `{report.get('auto_max_new_tokens', False)}`")
+    lines.append(f"- `auto_max_new_tokens_cap`: `{report.get('auto_max_new_tokens_cap', 128)}`")
     lines.append(f"- `warmup_runs`: `{report['warmup_runs']}`")
     lines.append("")
     lines.append("Important note:")
@@ -812,6 +834,8 @@ def main():
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--auto-max-new-tokens", action="store_true")
+    parser.add_argument("--auto-max-new-tokens-cap", type=int, default=128)
     args = parser.parse_args()
 
     sentences = [] if args.fixed_text else load_sentences(args.sentences_file)
@@ -901,6 +925,8 @@ def main():
         if args.impl == "vllm_turbo_s3":
             print(f"vllm_prompt_len_only_grouping={not args.allow_vllm_text_bucketing}")
         print(f"rounds_per_level={args.rounds_per_level}")
+        print(f"auto_max_new_tokens={args.auto_max_new_tokens}")
+        print(f"auto_max_new_tokens_cap={args.auto_max_new_tokens_cap}")
         print(f"save_mode={args.save_mode}")
         for note in describe_vllm_hydra_mode(
             impl=args.impl,
@@ -922,6 +948,8 @@ def main():
             min_p=args.min_p,
             top_p=args.top_p,
             max_new_tokens=args.max_new_tokens,
+            auto_max_new_tokens=args.auto_max_new_tokens,
+            auto_max_new_tokens_cap=args.auto_max_new_tokens_cap,
         )
 
         sentence_cursor = 0
@@ -945,6 +973,8 @@ def main():
                         min_p=args.min_p,
                         top_p=args.top_p,
                         max_new_tokens=args.max_new_tokens,
+                        auto_max_new_tokens=args.auto_max_new_tokens,
+                        auto_max_new_tokens_cap=args.auto_max_new_tokens_cap,
                     )
                     for _ in range(level)
                 ]
@@ -1111,6 +1141,8 @@ def main():
                 args.impl == "vllm_turbo_s3" and not args.allow_vllm_text_bucketing
             ),
             "save_mode": args.save_mode,
+            "auto_max_new_tokens": args.auto_max_new_tokens,
+            "auto_max_new_tokens_cap": args.auto_max_new_tokens_cap,
             "levels": sanitize_level_summaries(level_summaries),
             "saved_audio": saved_audio,
         }

@@ -217,6 +217,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=0.05,
         top_p=1.0,
         max_new_tokens=1000,
+        auto_max_new_tokens=False,
+        auto_max_new_tokens_cap=128,
         session_id=None,
     ) -> StreamingSession:
         options = GenerationOptions(
@@ -228,6 +230,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.create_session(
             audio_prompt_path=audio_prompt_path,
@@ -248,6 +252,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> torch.Tensor:
         options = session.options.merged(
             language_id=language_id,
@@ -258,6 +264,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.generate(session=session, text=text, options=options)
 
@@ -273,6 +281,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=0.05,
         top_p=1.0,
         max_new_tokens=1000,
+        auto_max_new_tokens=False,
+        auto_max_new_tokens_cap=128,
         session: StreamingSession | None = None,
     ) -> torch.Tensor:
         if session is None:
@@ -286,6 +296,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 min_p=min_p,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
+                auto_max_new_tokens=auto_max_new_tokens,
+                auto_max_new_tokens_cap=auto_max_new_tokens_cap,
             )
 
         return self.generate_with_session(
@@ -299,6 +311,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
 
     def generate_many_with_sessions(
@@ -314,6 +328,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> list[dict]:
         options_list = [
             session.options.merged(
@@ -325,6 +341,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 min_p=min_p,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
+                auto_max_new_tokens=auto_max_new_tokens,
+                auto_max_new_tokens_cap=auto_max_new_tokens_cap,
             )
             for session in sessions
         ]
@@ -347,6 +365,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> dict:
         options = session.options.merged(
             language_id=language_id,
@@ -357,6 +377,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.inspect_prompt_embed(
             session=session,
