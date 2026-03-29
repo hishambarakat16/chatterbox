@@ -88,7 +88,9 @@ def _resolve_effective_max_new_tokens(
         return requested
 
     cap = max(1, int(auto_cap))
-    content_tokens = max(1, int(text_token_len) - 2)
+    # Small slack avoids clipping borderline endings near tier thresholds.
+    text_token_slack = 7
+    content_tokens = max(1, int(text_token_len) - 2 + text_token_slack)
 
     if content_tokens <= 8:
         dynamic = 32
