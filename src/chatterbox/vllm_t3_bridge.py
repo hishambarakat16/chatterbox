@@ -264,7 +264,14 @@ def make_sampling_params(*, options, hp: T3Config):
         temperature=float(options.temperature),
         top_p=float(options.top_p),
         min_p=float(options.min_p),
-        repetition_penalty=float(options.repetition_penalty),
+        # repetition_penalty is intentionally fixed at 1.0 (disabled).
+        # vLLM's penalty path calls _make_prompt_token_ids_tensor(), which reads
+        # token_ids_cpu for prompt tokens that were never written for embed-only
+        # requests (prompt_token_ids=None). In mixed prefill+decode batches the
+        # stale values exceed vocab_size and cause a CUDA device-side assert in
+        # scatter_add_. Speech-token repetition is already guarded by the stop
+        # token id; further suppression happens upstream in the T3 bridge.
+        repetition_penalty=1.0,
         max_tokens=int(options.max_new_tokens),
         stop_token_ids=[int(hp.stop_speech_token)],
         detokenize=False,
