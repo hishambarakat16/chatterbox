@@ -338,6 +338,28 @@ class S3Token2Wav(S3Token2Mel):
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
         self.estimator_dtype = "fp32"
 
+        if not os.getenv("S3_DISABLE_COMPILE"):
+            # Compile the two heavy inference kernels.
+            #
+            # solve_euler() calls self.estimator.forward(...) directly (bypassing
+            # nn.Module.__call__), so we patch the bound .forward attribute rather
+            # than wrapping the whole module — the latter only compiles __call__.
+            #
+            # hift_inference() calls self.mel2wav.decode(...) so we patch .decode.
+            #
+            # dynamic=True avoids recompilation across variable mel frame lengths
+            # (chunk lengths differ per request).  S3_DISABLE_COMPILE=1 to opt out.
+            self.flow.decoder.estimator.forward = torch.compile(
+                self.flow.decoder.estimator.forward,
+                mode="reduce-overhead",
+                dynamic=True,
+            )
+            self.mel2wav.decode = torch.compile(
+                self.mel2wav.decode,
+                mode="reduce-overhead",
+                dynamic=True,
+            )
+
     def forward(
         self,
         speech_tokens,
