@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-max-new-tokens-cap", type=int, default=128)
     p.add_argument("--chunk-target-words", type=int, default=5)
     p.add_argument("--chunk-max-words", type=int, default=8)
-    p.add_argument("--chunk-auto-max-new-tokens-cap", type=int, default=64)
+    p.add_argument("--chunk-auto-max-new-tokens-cap", type=int, default=128)
     p.add_argument("--timeout-s", type=float, default=180.0)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--summary-json", default=None)

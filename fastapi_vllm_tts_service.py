@@ -102,19 +102,67 @@ def _extract_stage_meta(profile: dict[str, Any]) -> dict[str, float]:
 _HARD_PUNCT = frozenset('.!?؟！')
 _SOFT_PUNCT = frozenset(',،;؛:')
 
+# Words that are "bad chunk endings" — splitting just before these leaves the
+# previous chunk ending mid-thought (prepositions, conjunctions, connectives).
+# When the word-count cap fires and the *next* word starts with one of these,
+# we extend the current chunk by one extra word so the split lands after the
+# connective instead of before it.
+#
+# Arabic standalone connectives (single words):
+_AR_CONNECTIVES = frozenset({
+    'و', 'ف', 'أو', 'أم', 'ثم', 'لكن', 'بل', 'لا', 'ولا',
+    'لأن', 'لأنه', 'لأنها', 'حتى', 'إذا', 'إذ', 'مع', 'بين',
+    'من', 'إلى', 'في', 'على', 'عن', 'مع', 'عند', 'حول', 'خلال',
+    'كما', 'كأن', 'كأنه', 'مما', 'مثل', 'غير', 'إلا',
+})
+
+# Arabic attached prefixes that signal a connective-led word:
+_AR_CONNECTIVE_PREFIXES = ('وَ', 'وَال', 'فَ', 'فال', 'وال', 'فال', 'بال', 'كال')
+
+# English conjunctions/prepositions that also make bad split points:
+_EN_CONNECTIVES = frozenset({
+    'and', 'or', 'but', 'so', 'yet', 'nor', 'for',
+    'to', 'of', 'in', 'on', 'at', 'by', 'as',
+    'if', 'although', 'because', 'when', 'while', 'that',
+})
+
+
+def _is_connective(word: str) -> bool:
+    """Return True if *word* looks like a connective/preposition that would
+    sound unnatural at the start of a chunk."""
+    w = word.strip().rstrip(''.join(_HARD_PUNCT | _SOFT_PUNCT))
+    if not w:
+        return False
+    # Standalone Arabic connective
+    if w in _AR_CONNECTIVES:
+        return True
+    # Arabic word starting with attached و / ف connector and short enough to
+    # be a function word (واو العطف attached to next word, e.g. والنظام)
+    if len(w) <= 6 and (w.startswith('و') or w.startswith('ف')):
+        return True
+    # English connective (case-insensitive)
+    if w.lower() in _EN_CONNECTIVES:
+        return True
+    return False
+
 
 def split_text_for_streaming(
     text: str,
     *,
-    target_words: int = 6,
-    max_words: int = 10,
+    target_words: int = 5,
+    max_words: int = 8,
 ) -> list[str]:
-    """Split *text* into synthesisable chunks on natural boundaries.
+    """Split *text* into synthesisable chunks on natural speech boundaries.
 
     Priority order:
-    1. Hard punctuation (.!?؟) with ≥ 2 accumulated words.
+    1. Hard punctuation (.!?؟) — always split immediately, even at n=1.
     2. Soft punctuation (,،;؛:) with ≥ target_words accumulated words.
-    3. Word-count cap (max_words).
+    3. Word-count cap (max_words), with two quality adjustments:
+       a. If the *next* word after the cap is a connective/preposition,
+          absorb one more word so we don't end mid-clause (e.g. avoid
+          cutting at "ينتقل من" leaving "سؤال إلى جواب" as the next chunk).
+       b. If that absorption pushes us to max_words+1, we still emit — the
+          slight overrun is better than an orphaned connective fragment.
 
     Trailing fragments shorter than 2 words are merged into the previous chunk.
     Punctuation is preserved in the emitted chunk text.
@@ -126,20 +174,37 @@ def split_text_for_streaming(
     chunks: list[str] = []
     current: list[str] = []
 
-    for word in words:
+    i = 0
+    while i < len(words):
+        word = words[i]
         current.append(word)
+        i += 1
+
         last = word.rstrip()
         if not last:
             continue
         ch = last[-1]
         n = len(current)
-        if ch in _HARD_PUNCT and n >= 2:
+
+        if ch in _HARD_PUNCT and n >= 1:
+            # Split on ANY hard-punctuation word, even if it is the first word
+            # in a new chunk (n=1). This prevents sentence-final marks like ؟
+            # or . from sitting in the interior of a chunk where the TTS model
+            # treats them as mid-utterance EOS signals and suppresses the text
+            # that follows. A 1-word hard-punct chunk (e.g. "جواب؟") is
+            # synthesisable and preferable to the continuation being silenced.
             chunks.append(' '.join(current))
             current = []
         elif ch in _SOFT_PUNCT and n >= target_words:
             chunks.append(' '.join(current))
             current = []
         elif n >= max_words:
+            # Before emitting, check if the next word is a connective.
+            # If so, absorb it so we don't leave it orphaned at the start
+            # of the next chunk.
+            if i < len(words) and _is_connective(words[i]):
+                current.append(words[i])
+                i += 1
             chunks.append(' '.join(current))
             current = []
 
@@ -150,6 +215,14 @@ def split_text_for_streaming(
             chunks[-1] = chunks[-1] + ' ' + remainder
         else:
             chunks.append(remainder)
+
+    # Post-processing: if the last emitted chunk is a single word (possible
+    # when n>=1 hard-punct fires on the final word after a word-count cap),
+    # merge it into the previous chunk so it is not synthesised in isolation.
+    # Example: "...والفواصل بين" | "الجمل." -> "...والفواصل بين الجمل."
+    if len(chunks) >= 2 and len(chunks[-1].split()) < 2:
+        chunks[-2] = chunks[-2] + ' ' + chunks[-1]
+        chunks.pop()
 
     return chunks if chunks else [text]
 
@@ -178,9 +251,9 @@ class TTSRequest(BaseModel):
 
     # Chunked-streaming options (used by /v1/tts/stream_chunks).
     chunked_streaming: bool = False
-    chunk_target_words: int = 6
-    chunk_max_words: int = 10
-    chunk_auto_max_new_tokens_cap: int = 80
+    chunk_target_words: int = 5
+    chunk_max_words: int = 8
+    chunk_auto_max_new_tokens_cap: int = 128
 
 
 class TTSResponseMeta(BaseModel):
@@ -554,9 +627,17 @@ class _BatchScheduler:
                     repetition_penalty=req.repetition_penalty,
                     min_p=req.min_p,
                     top_p=req.top_p,
-                    max_new_tokens=req.max_new_tokens,
-                    auto_max_new_tokens=req.auto_max_new_tokens,
-                    auto_max_new_tokens_cap=state.chunk_cap,
+                    # Use a flat per-chunk token ceiling instead of the
+                    # auto_max_new_tokens dynamic tier. The dynamic tier
+                    # calibrates based on text-token length and can cap Arabic
+                    # chunks at 48 tokens even for 7-9 word phrases, because
+                    # Arabic words are morphologically dense (~7 speech tokens
+                    # each). Setting auto_max_new_tokens=False gives every
+                    # chunk a flat ceiling of chunk_cap tokens. Short chunks
+                    # still stop at EOS early (no latency cost); longer Arabic
+                    # phrases now have room to finish their last word.
+                    max_new_tokens=state.chunk_cap,
+                    auto_max_new_tokens=False,
                 )
                 created_s = time.perf_counter() - session_create_started
                 session_create_chunk_s += created_s
