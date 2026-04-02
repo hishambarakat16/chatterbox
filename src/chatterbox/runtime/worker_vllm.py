@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -385,6 +386,7 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             for session, text, options in zip(sessions, texts, options_list)
         ]
 
+        # T3 decode: batched vLLM generate (must stay in inference_mode)
         with torch.inference_mode():
             t3_start = time.perf_counter()
             outputs = self.vllm_engine.generate(
@@ -393,28 +395,49 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
                 use_tqdm=False,
             )
             t3_duration_s = time.perf_counter() - t3_start
-            t3_batch_end = time.perf_counter()
 
-            results = []
-            s3_finalize_loop_start = time.perf_counter()
-            for item in prepared:
-                item["batch_size"] = len(prepared)
-            for finalize_order, (item, output) in enumerate(zip(prepared, outputs)):
-                finalize_start = time.perf_counter()
-                item["s3_finalize_order"] = finalize_order
-                item["s3_finalize_queue_delay_s"] = finalize_start - t3_batch_end
+        t3_batch_end = time.perf_counter()
+        n = len(prepared)
+        for i, item in enumerate(prepared):
+            item["batch_size"] = n
+            item["s3_finalize_order"] = i
+
+        # S3 finalize: one CUDA stream per request, all run in parallel.
+        # S3 methods are decorated @torch.inference_mode() internally so no
+        # outer context is needed here.
+        use_streams = torch.cuda.is_available() and n > 1
+        streams = [torch.cuda.Stream() for _ in range(n)] if use_streams else [None] * n
+
+        def _finalize_one(args):
+            item, raw_output, stream = args
+            item["s3_finalize_queue_delay_s"] = time.perf_counter() - t3_batch_end
+            vllm_output = raw_output.outputs[0] if raw_output.outputs else None
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    wav, profile = self._finalize_request(
+                        prepared=item,
+                        output=vllm_output,
+                        t3_duration_s=t3_duration_s,
+                    )
+                stream.synchronize()
+            else:
                 wav, profile = self._finalize_request(
                     prepared=item,
-                    output=(output.outputs[0] if output.outputs else None),
+                    output=vllm_output,
                     t3_duration_s=t3_duration_s,
                 )
-                results.append(
-                    {
-                        "wav": wav,
-                        "profile": profile,
-                    }
-                )
-            s3_finalize_loop_s = time.perf_counter() - s3_finalize_loop_start
-            for result in results:
-                result["profile"]["batch_s3_finalize_loop_s"] = s3_finalize_loop_s
+            return wav, profile
+
+        s3_finalize_loop_start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=min(n, 4)) as executor:
+            finalize_results = list(executor.map(
+                _finalize_one,
+                [(item, output, stream) for item, output, stream in zip(prepared, outputs, streams)],
+            ))
+        s3_finalize_loop_s = time.perf_counter() - s3_finalize_loop_start
+
+        results = [{"wav": wav, "profile": profile} for wav, profile in finalize_results]
+        for result in results:
+            result["profile"]["batch_s3_finalize_loop_s"] = s3_finalize_loop_s
+            result["profile"]["s3_parallel_workers"] = float(n)
         return results
