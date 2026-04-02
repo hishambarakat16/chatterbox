@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import io
 import json
+import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from typing import Any
 
 import soundfile as sf
@@ -37,6 +39,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from benchmark_multilingual_concurrency import load_model
+
+
+LOGGER = logging.getLogger("chatterbox.fastapi_vllm_tts")
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +60,39 @@ def _tensor_to_wav_bytes(wav_tensor, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav_np, samplerate=sample_rate, format="WAV")
     return buf.getvalue()
+
+
+def _extract_stage_timings(profile: dict[str, Any]) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    for key, value in profile.items():
+        if isinstance(value, (int, float)) and key.endswith("_s"):
+            timings[key] = float(value)
+    return timings
+
+
+def _extract_stage_meta(profile: dict[str, Any]) -> dict[str, float]:
+    keys = (
+        "t3_alignment_analyzer_supported",
+        "t3_alignment_analyzer_active",
+        "t3_batch_size",
+        "t3_text_token_len",
+        "t3_prompt_speech_token_len",
+        "t3_initial_speech_len",
+        "t3_cond_seq_len",
+        "t3_prompt_embed_seq_len",
+        "t3_prompt_embed_hidden_size",
+        "t3_generated_tokens",
+        "t3_max_new_tokens_requested",
+        "t3_max_new_tokens_effective",
+        "s3_finalize_order",
+        "s3_finalize_batch_size",
+    )
+    meta: dict[str, float] = {}
+    for key in keys:
+        value = profile.get(key)
+        if isinstance(value, (int, float)):
+            meta[key] = float(value)
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +213,8 @@ class _StreamingRequestState:
     session: Any            # StreamingSession; None until first chunk runs
     result_queue: asyncio.Queue
     enqueued_at: float
+    first_chunk_emitted_at: float | None = None
+    chunks_emitted: int = 0
 
 
 @dataclass
@@ -229,6 +269,16 @@ class _BatchScheduler:
         self._work_queue: asyncio.Queue[_WorkItem] = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
+        self._batch_seq = 0
+        self._trace_enabled = _env_bool("API_TRACE_ENABLED", True)
+        self._trace_stdout = _env_bool("API_TRACE_STDOUT", False)
+        self._recent_batches: collections.deque[dict[str, Any]] = collections.deque(
+            maxlen=max(1, int(os.getenv("API_TRACE_RECENT_BATCHES", "200")))
+        )
+
+    def get_recent_batch_traces(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, int(limit))
+        return list(self._recent_batches)[-limit:]
 
     async def start(self) -> None:
         if self._runner_task is None:
@@ -326,10 +376,15 @@ class _BatchScheduler:
                     break
 
             started = time.perf_counter()
+            batch_id = self._batch_seq
+            self._batch_seq += 1
+            queue_depth_after_pick = self._work_queue.qsize()
             try:
-                whole_results, chunk_results = await asyncio.to_thread(
-                    self._infer_mixed_batch, batch
+                infer_start = time.perf_counter()
+                whole_results, chunk_results, infer_meta = await asyncio.to_thread(
+                    self._infer_mixed_batch, batch, batch_id
                 )
+                infer_end = time.perf_counter()
             except Exception as exc:  # noqa: BLE001
                 for item in batch:
                     if item.kind == "whole" and not item.whole.future.done():
@@ -343,6 +398,23 @@ class _BatchScheduler:
                         })
                 continue
 
+            batch_trace = {
+                "batch_id": batch_id,
+                "batch_size": len(batch),
+                "whole_count": int(infer_meta.get("whole_count", 0)),
+                "chunk_count": int(infer_meta.get("chunk_count", 0)),
+                "queue_depth_after_pick": queue_depth_after_pick,
+                "batch_wait_window_s": self.batch_window_s,
+                "infer_wall_s": infer_end - infer_start,
+                "model_generate_many_s": float(infer_meta.get("model_generate_many_s", 0.0)),
+                "session_create_whole_s": float(infer_meta.get("session_create_whole_s", 0.0)),
+                "session_create_chunk_s": float(infer_meta.get("session_create_chunk_s", 0.0)),
+            }
+            if self._trace_enabled:
+                self._recent_batches.append(batch_trace)
+            if self._trace_stdout:
+                LOGGER.info("trace_batch %s", json.dumps(batch_trace, sort_keys=True))
+
             # Resolve whole-request futures.
             whole_items = [b for b in batch if b.kind == "whole"]
             for w_item, result in zip(whole_items, whole_results):
@@ -351,6 +423,12 @@ class _BatchScheduler:
                     continue
                 result["request_id"] = item.request_id
                 result["queue_wait_s"] = started - item.enqueued_at
+                result["trace"] = {
+                    **batch_trace,
+                    "request_elapsed_s": time.perf_counter() - item.enqueued_at,
+                    "stage_timings": _extract_stage_timings(result.get("profile", {})),
+                    "stage_meta": _extract_stage_meta(result.get("profile", {})),
+                }
                 item.future.set_result(result)
 
             # Push chunk events and enqueue next chunks.
@@ -358,6 +436,12 @@ class _BatchScheduler:
             for c_item, result in zip(chunk_items, chunk_results):
                 chunk = c_item.chunk
                 profile = result["profile"]
+                emit_now = time.perf_counter()
+                if chunk.state.first_chunk_emitted_at is None:
+                    chunk.state.first_chunk_emitted_at = emit_now
+                chunk.state.chunks_emitted += 1
+                first_chunk_latency_s = chunk.state.first_chunk_emitted_at - chunk.state.enqueued_at
+
                 event: dict[str, Any] = {
                     "event": "chunk",
                     "request_id": chunk.request_id,
@@ -365,11 +449,23 @@ class _BatchScheduler:
                     "text": chunk.chunk_text,
                     "audio_wav_b64": result["audio_wav_b64"],
                     "sample_rate": result["sample_rate"],
-                    "queue_wait_s": time.perf_counter() - chunk.enqueued_at,
+                    "queue_wait_s": started - chunk.enqueued_at,
                     "t3_s": float(profile.get("t3_s", 0.0)),
                     "s3_s": float(profile.get("s3_s", 0.0)),
-                    "chunk_total_s": result["batch_total_s"],
+                    "chunk_total_s": float(profile.get("audio_ready_s", 0.0)) or result["batch_total_s"],
                     "is_final": chunk.is_final,
+                    "trace": {
+                        **batch_trace,
+                        "request_elapsed_s": emit_now - chunk.state.enqueued_at,
+                        "first_chunk_latency_s": first_chunk_latency_s,
+                        "session_create_s": float(result.get("session_create_s", 0.0)),
+                        "text_prep_s": float(profile.get("text_prep_s", 0.0)),
+                        "t3_wait_s": float(profile.get("t3_wait_s", 0.0)),
+                        "t3_active_s": float(profile.get("t3_active_s", 0.0)),
+                        "audio_ready_s": float(profile.get("audio_ready_s", 0.0)),
+                        "stage_timings": _extract_stage_timings(profile),
+                        "stage_meta": _extract_stage_meta(profile),
+                    },
                 }
                 await chunk.result_queue.put(event)
 
@@ -391,6 +487,11 @@ class _BatchScheduler:
                     await chunk.result_queue.put({
                         "event": "done",
                         "request_id": chunk.request_id,
+                        "trace": {
+                            "request_total_s": time.perf_counter() - chunk.state.enqueued_at,
+                            "first_chunk_latency_s": first_chunk_latency_s,
+                            "chunks_emitted": chunk.state.chunks_emitted,
+                        },
                     })
 
     # ------------------------------------------------------------------
@@ -398,8 +499,8 @@ class _BatchScheduler:
     # ------------------------------------------------------------------
 
     def _infer_mixed_batch(
-        self, batch: list[_WorkItem]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        self, batch: list[_WorkItem], batch_id: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         """
         Handle a mixed batch of whole-request and chunk jobs.
 
@@ -408,6 +509,8 @@ class _BatchScheduler:
         """
         whole_items = [b for b in batch if b.kind == "whole"]
         chunk_items = [b for b in batch if b.kind == "chunk"]
+        session_create_whole_s = 0.0
+        session_create_chunk_s = 0.0
 
         all_sessions: list[Any] = []
         all_texts: list[str] = []
@@ -416,6 +519,7 @@ class _BatchScheduler:
         for w in whole_items:
             req = w.whole.payload
             audio_prompt_path = req.audio_prompt_path or self.default_audio_prompt_path
+            session_create_started = time.perf_counter()
             session = self.model.create_session(
                 audio_prompt_path=audio_prompt_path,
                 language_id=req.language_id,
@@ -429,15 +533,18 @@ class _BatchScheduler:
                 auto_max_new_tokens=req.auto_max_new_tokens,
                 auto_max_new_tokens_cap=req.auto_max_new_tokens_cap,
             )
+            session_create_whole_s += time.perf_counter() - session_create_started
             all_sessions.append(session)
             all_texts.append(req.text)
 
         # Sessions for chunk jobs (create once on first chunk, reuse thereafter).
+        chunk_session_create_map: dict[tuple[str, int], float] = {}
         for c in chunk_items:
             state = c.chunk.state
             if state.session is None:
                 req = state.payload
                 audio_prompt_path = req.audio_prompt_path or self.default_audio_prompt_path
+                session_create_started = time.perf_counter()
                 state.session = self.model.create_session(
                     audio_prompt_path=audio_prompt_path,
                     language_id=req.language_id,
@@ -451,6 +558,9 @@ class _BatchScheduler:
                     auto_max_new_tokens=req.auto_max_new_tokens,
                     auto_max_new_tokens_cap=state.chunk_cap,
                 )
+                created_s = time.perf_counter() - session_create_started
+                session_create_chunk_s += created_s
+                chunk_session_create_map[(c.chunk.request_id, c.chunk.chunk_index)] = created_s
             all_sessions.append(state.session)
             all_texts.append(c.chunk.chunk_text)
 
@@ -484,8 +594,22 @@ class _BatchScheduler:
                 "profile": r.get("profile", {}),
                 "batch_total_s": batch_total_s,
             })
+        for chunk, chunk_result in zip(chunk_items, chunk_results):
+            chunk_result["session_create_s"] = chunk_session_create_map.get(
+                (chunk.chunk.request_id, chunk.chunk.chunk_index),
+                0.0,
+            )
 
-        return whole_results, chunk_results
+        infer_meta = {
+            "batch_id": batch_id,
+            "whole_count": len(whole_items),
+            "chunk_count": len(chunk_items),
+            "model_generate_many_s": batch_total_s,
+            "session_create_whole_s": session_create_whole_s,
+            "session_create_chunk_s": session_create_chunk_s,
+        }
+
+        return whole_results, chunk_results, infer_meta
 
 
 # ---------------------------------------------------------------------------
@@ -566,12 +690,17 @@ async def synthesize(req: TTSRequest) -> Response:
 
     total_s = time.perf_counter() - started
     profile = out.get("profile", {})
+    trace = out.get("trace", {})
     headers = {
         "X-Request-Id": out["request_id"],
         "X-Queue-Wait-S": f"{out.get('queue_wait_s', 0.0):.4f}",
         "X-Total-S": f"{total_s:.4f}",
         "X-T3-S": f"{float(profile.get('t3_s', 0.0)):.4f}",
         "X-S3-S": f"{float(profile.get('s3_s', 0.0)):.4f}",
+        "X-Batch-Id": str(trace.get("batch_id", "")),
+        "X-Batch-Size": str(trace.get("batch_size", "")),
+        "X-Batch-Infer-S": f"{float(trace.get('infer_wall_s', 0.0)):.4f}",
+        "X-Batch-Queue-Depth": str(trace.get("queue_depth_after_pick", "")),
     }
     return Response(content=out["audio_wav"], media_type="audio/wav", headers=headers)
 
@@ -595,12 +724,17 @@ async def synthesize_stream(req: TTSRequest) -> StreamingResponse:
 
     total_s = time.perf_counter() - started
     profile = out.get("profile", {})
+    trace = out.get("trace", {})
     headers = {
         "X-Request-Id": out["request_id"],
         "X-Queue-Wait-S": f"{out.get('queue_wait_s', 0.0):.4f}",
         "X-Total-S": f"{total_s:.4f}",
         "X-T3-S": f"{float(profile.get('t3_s', 0.0)):.4f}",
         "X-S3-S": f"{float(profile.get('s3_s', 0.0)):.4f}",
+        "X-Batch-Id": str(trace.get("batch_id", "")),
+        "X-Batch-Size": str(trace.get("batch_size", "")),
+        "X-Batch-Infer-S": f"{float(trace.get('infer_wall_s', 0.0)):.4f}",
+        "X-Batch-Queue-Depth": str(trace.get("queue_depth_after_pick", "")),
     }
     return StreamingResponse(iterator(), media_type="audio/wav", headers=headers)
 
@@ -614,11 +748,15 @@ async def synthesize_meta(req: TTSRequest) -> TTSResponseMeta:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {exc!r}") from exc
     total_s = time.perf_counter() - started
+    profile = dict(out.get("profile", {}))
+    trace = out.get("trace", {})
+    if trace:
+        profile["_trace"] = trace
     return TTSResponseMeta(
         request_id=out["request_id"],
         queue_wait_s=float(out.get("queue_wait_s", 0.0)),
         total_s=total_s,
-        profile=out.get("profile", {}),
+        profile=profile,
     )
 
 
@@ -691,6 +829,17 @@ async def split_preview(req: TTSRequest) -> dict[str, Any]:
         "chunk_target_words": req.chunk_target_words,
         "chunk_max_words": req.chunk_max_words,
         "chunk_auto_max_new_tokens_cap": req.chunk_auto_max_new_tokens_cap,
+    }
+
+
+@app.get("/v1/tts/trace/recent")
+async def trace_recent(limit: int = 50) -> dict[str, Any]:
+    """Return recent scheduler batch traces to diagnose queueing and stage timing."""
+    scheduler: _BatchScheduler = app.state.scheduler
+    return {
+        "limit": max(1, int(limit)),
+        "queue_depth_now": scheduler._work_queue.qsize(),
+        "batches": scheduler.get_recent_batch_traces(limit=limit),
     }
 
 

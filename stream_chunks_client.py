@@ -127,42 +127,44 @@ def run_stream_request(
     # Read NDJSON stream line by line.
     first_chunk_s: float | None = None
     chunks: list[dict[str, Any]] = []
-    buf = b""
+    done_trace: dict[str, Any] = {}
 
     while True:
-        data = resp.read(4096)
-        if not data:
+        line = resp.readline()
+        if not line:
             break
-        buf += data
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-            evt = event.get("event")
-            if evt == "chunk":
-                if first_chunk_s is None:
-                    first_chunk_s = time.perf_counter() - wall_start
-                chunks.append(event)
-                # Save chunk WAV if requested.
-                if save_dir and event.get("audio_wav_b64"):
-                    os.makedirs(save_dir, exist_ok=True)
-                    wav_bytes = base64.b64decode(event["audio_wav_b64"])
-                    path_wav = os.path.join(
-                        save_dir,
-                        f"req_{request_index:03d}_chunk_{event['chunk_index']:03d}.wav",
-                    )
-                    with open(path_wav, "wb") as fh:
-                        fh.write(wav_bytes)
-            elif evt in ("done", "error"):
-                if evt == "error":
-                    chunks.append(event)
-                break
+        evt = event.get("event")
+        if evt == "chunk":
+            if first_chunk_s is None:
+                first_chunk_s = time.perf_counter() - wall_start
+            chunks.append(event)
+            # Save chunk WAV if requested.
+            if save_dir and event.get("audio_wav_b64"):
+                os.makedirs(save_dir, exist_ok=True)
+                wav_bytes = base64.b64decode(event["audio_wav_b64"])
+                path_wav = os.path.join(
+                    save_dir,
+                    f"req_{request_index:03d}_chunk_{event['chunk_index']:03d}.wav",
+                )
+                with open(path_wav, "wb") as fh:
+                    fh.write(wav_bytes)
+            continue
+
+        if evt == "done":
+            done_trace = event.get("trace", {}) or {}
+            break
+
+        if evt == "error":
+            chunks.append(event)
+            break
 
     conn.close()
     total_s = time.perf_counter() - wall_start
@@ -190,6 +192,7 @@ def run_stream_request(
         "chunk_count": len([c for c in chunks if c.get("event") == "chunk"]),
         "audio_duration_s": audio_duration_s,
         "rtf": (audio_duration_s / total_s) if total_s > 0 else 0.0,
+        "request_trace": done_trace,
         "per_chunk": [
             {
                 "chunk_index": c.get("chunk_index"),
@@ -199,6 +202,21 @@ def run_stream_request(
                 "s3_s": c.get("s3_s", 0.0),
                 "chunk_total_s": c.get("chunk_total_s", 0.0),
                 "is_final": c.get("is_final", False),
+                "trace": {
+                    "batch_id": (c.get("trace") or {}).get("batch_id"),
+                    "batch_size": (c.get("trace") or {}).get("batch_size"),
+                    "batch_infer_wall_s": (c.get("trace") or {}).get("infer_wall_s", 0.0),
+                    "model_generate_many_s": (c.get("trace") or {}).get("model_generate_many_s", 0.0),
+                    "session_create_s": (c.get("trace") or {}).get("session_create_s", 0.0),
+                    "text_prep_s": (c.get("trace") or {}).get("text_prep_s", 0.0),
+                    "t3_wait_s": (c.get("trace") or {}).get("t3_wait_s", 0.0),
+                    "t3_active_s": (c.get("trace") or {}).get("t3_active_s", 0.0),
+                    "audio_ready_s": (c.get("trace") or {}).get("audio_ready_s", 0.0),
+                    "request_elapsed_s": (c.get("trace") or {}).get("request_elapsed_s", 0.0),
+                    "first_chunk_latency_s": (c.get("trace") or {}).get("first_chunk_latency_s", 0.0),
+                    "stage_timings": (c.get("trace") or {}).get("stage_timings", {}),
+                    "stage_meta": (c.get("trace") or {}).get("stage_meta", {}),
+                },
             }
             for c in chunks
             if c.get("event") == "chunk"
@@ -290,18 +308,31 @@ def main() -> None:
             chunks_n = r.get("chunk_count", 0)
             rtf = r.get("rtf", 0.0)
             total = r.get("total_s", 0.0)
+            req_trace = r.get("request_trace", {}) or {}
+            server_first = req_trace.get("first_chunk_latency_s")
+            server_first_str = (
+                f"{float(server_first):.3f}s" if server_first is not None else "N/A"
+            )
             print(
                 f"[req {idx}] OK  headers={r['headers_s']:.3f}s  "
-                f"first_chunk={first_str}  chunks={chunks_n}  "
-                f"total={total:.3f}s  RTF={rtf:.2f}x"
+                f"first_chunk={first_str}  server_first={server_first_str}  "
+                f"chunks={chunks_n}  total={total:.3f}s  RTF={rtf:.2f}x"
             )
             if not args.quiet:
                 for c in r.get("per_chunk", []):
                     fin = " [final]" if c["is_final"] else ""
+                    trace = c.get("trace", {}) or {}
+                    stages = trace.get("stage_timings", {}) or {}
+                    stage_meta = trace.get("stage_meta", {}) or {}
                     print(
                         f"         chunk[{c['chunk_index']}] "
-                        f"t3={c['t3_s']:.3f}s s3={c['s3_s']:.3f}s "
-                        f"total={c['chunk_total_s']:.3f}s "
+                        f"queue={c['queue_wait_s']:.3f}s t3={c['t3_s']:.3f}s "
+                        f"s3={c['s3_s']:.3f}s total={c['chunk_total_s']:.3f}s "
+                        f"gap={float(stages.get('s3_finalize_queue_delay_s', 0.0)):.3f}s "
+                        f"tok2mel={float(stages.get('s3_token2mel_s', 0.0)):.3f}s "
+                        f"hift={float(stages.get('s3_hift_s', 0.0)):.3f}s "
+                        f"analyzer={int(stage_meta.get('t3_alignment_analyzer_active', 0.0))} "
+                        f"batch_id={trace.get('batch_id')} size={trace.get('batch_size')} "
                         f"text={c['text'][:40]!r}{fin}"
                     )
         print()
@@ -310,15 +341,49 @@ def main() -> None:
         first_chunks = [r["first_chunk_s"] for r in ok if r.get("first_chunk_s") is not None]
         totals = [r["total_s"] for r in ok]
         rtfs = [r["rtf"] for r in ok]
+        server_firsts = [
+            float((r.get("request_trace", {}) or {}).get("first_chunk_latency_s", 0.0))
+            for r in ok
+            if (r.get("request_trace", {}) or {}).get("first_chunk_latency_s") is not None
+        ]
+        all_chunks = [c for r in ok for c in r.get("per_chunk", [])]
+        first_chunks_only = [c for c in all_chunks if c.get("chunk_index") == 0]
+        queue_waits = [float(c.get("queue_wait_s", 0.0)) for c in all_chunks]
+        t3_waits = [float((c.get("trace", {}) or {}).get("t3_wait_s", 0.0)) for c in all_chunks]
+        t3_actives = [float((c.get("trace", {}) or {}).get("t3_active_s", 0.0)) for c in all_chunks]
+        session_conditioning = [float(((c.get("trace", {}) or {}).get("stage_timings", {}) or {}).get("session_conditioning_s", 0.0)) for c in first_chunks_only]
+        prompt_embeds = [float(((c.get("trace", {}) or {}).get("stage_timings", {}) or {}).get("t3_prompt_embed_s", 0.0)) for c in all_chunks]
+        s3_finalize_waits = [float(((c.get("trace", {}) or {}).get("stage_timings", {}) or {}).get("s3_finalize_queue_delay_s", 0.0)) for c in all_chunks]
+        token2mel = [float(((c.get("trace", {}) or {}).get("stage_timings", {}) or {}).get("s3_token2mel_s", 0.0)) for c in all_chunks]
+        hift = [float(((c.get("trace", {}) or {}).get("stage_timings", {}) or {}).get("s3_hift_s", 0.0)) for c in all_chunks]
 
         print("=== Summary ===")
         print(f"  requests OK / total      : {len(ok)} / {num_requests}")
         if first_chunks:
-            print(_fmt("first_chunk_s (mean)", _mean(first_chunks)))
-            print(_fmt("first_chunk_s (p50)", _p50(first_chunks)))
+            print(_fmt("first_chunk_s(client mean)", _mean(first_chunks)))
+            print(_fmt("first_chunk_s(client p50)", _p50(first_chunks)))
+        if server_firsts:
+            print(_fmt("first_chunk_s(server mean)", _mean(server_firsts)))
+            print(_fmt("first_chunk_s(server p50)", _p50(server_firsts)))
         print(_fmt("total_s (mean)", _mean(totals)))
         print(_fmt("total_s (p50)", _p50(totals)))
         print(_fmt("RTF (mean)", _mean(rtfs)))
+        if queue_waits:
+            print(_fmt("chunk_queue_wait_s (mean)", _mean(queue_waits)))
+        if t3_waits:
+            print(_fmt("chunk_t3_wait_s (mean)", _mean(t3_waits)))
+        if t3_actives:
+            print(_fmt("chunk_t3_active_s (mean)", _mean(t3_actives)))
+        if session_conditioning:
+            print(_fmt("session_conditioning_s", _mean(session_conditioning)))
+        if prompt_embeds:
+            print(_fmt("prompt_embed_s (mean)", _mean(prompt_embeds)))
+        if s3_finalize_waits:
+            print(_fmt("s3_finalize_wait_s (mean)", _mean(s3_finalize_waits)))
+        if token2mel:
+            print(_fmt("s3_token2mel_s (mean)", _mean(token2mel)))
+        if hift:
+            print(_fmt("s3_hift_s (mean)", _mean(hift)))
         print(f"  wall_s                   : {wall_total_s:.4f}s")
 
     if err:

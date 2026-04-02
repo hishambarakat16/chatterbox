@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -279,13 +280,34 @@ def make_sampling_params(*, options, hp: T3Config):
     )
 
 
-def prepare_vllm_text_tokens(*, tokenizer, text: str, language_id: str | None, device: str) -> torch.Tensor:
+def _maybe_sync(device: str):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def prepare_vllm_text_tokens(
+    *,
+    tokenizer,
+    text: str,
+    language_id: str | None,
+    device: str,
+    return_metadata: bool = False,
+) -> torch.Tensor:
+    total_start = time.perf_counter()
+    normalize_start = time.perf_counter()
     normalized = punc_norm(text)
+    normalize_s = time.perf_counter() - normalize_start
+
+    tokenize_start = time.perf_counter()
     text_tokens = tokenizer.text_to_tokens(
         normalized,
         language_id=language_id.lower() if language_id else None,
     ).to(device)
-    return torch.nn.functional.pad(
+    _maybe_sync(device)
+    tokenize_s = time.perf_counter() - tokenize_start
+
+    pad_start = time.perf_counter()
+    text_tokens = torch.nn.functional.pad(
         torch.nn.functional.pad(
             text_tokens,
             (1, 0),
@@ -294,6 +316,18 @@ def prepare_vllm_text_tokens(*, tokenizer, text: str, language_id: str | None, d
         (0, 1),
         value=int(T3Config.multilingual().stop_text_token),
     )
+    _maybe_sync(device)
+    pad_s = time.perf_counter() - pad_start
+
+    if not return_metadata:
+        return text_tokens
+
+    return text_tokens, {
+        "text_normalize_s": normalize_s,
+        "text_tokenize_s": tokenize_s,
+        "text_pad_s": pad_s,
+        "text_tokens_total_s": time.perf_counter() - total_start,
+    }
 
 
 def build_prompt_embeds(
@@ -303,16 +337,28 @@ def build_prompt_embeds(
     text_tokens: torch.Tensor,
     return_metadata: bool = False,
 ) -> torch.Tensor:
+    total_start = time.perf_counter()
+    cond_to_device_start = time.perf_counter()
     t3_cond = t3_cond.to(device=prompt_builder_t3.device)
     text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=prompt_builder_t3.device)
     initial_speech = prompt_builder_t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+    _maybe_sync(prompt_builder_t3.device)
+    cond_to_device_s = time.perf_counter() - cond_to_device_start
+
+    prepare_start = time.perf_counter()
     embeds, _ = prompt_builder_t3.prepare_input_embeds(
         t3_cond=t3_cond,
         text_tokens=text_tokens,
         speech_tokens=initial_speech,
         cfg_weight=0.0,
     )
+    _maybe_sync(prompt_builder_t3.device)
+    prepare_s = time.perf_counter() - prepare_start
+
+    cpu_copy_start = time.perf_counter()
     prompt_embeds = embeds.squeeze(0).detach().cpu()
+    _maybe_sync(prompt_builder_t3.device)
+    cpu_copy_s = time.perf_counter() - cpu_copy_start
     if not return_metadata:
         return prompt_embeds
 
@@ -330,5 +376,9 @@ def build_prompt_embeds(
         "prompt_embed_seq_len": prompt_embed_seq_len,
         "prompt_embed_hidden_size": prompt_embed_hidden_size,
         "cond_seq_len": cond_seq_len,
+        "prompt_embed_cond_to_device_s": cond_to_device_s,
+        "prompt_embed_prepare_s": prepare_s,
+        "prompt_embed_cpu_s": cpu_copy_s,
+        "prompt_embed_total_s": time.perf_counter() - total_start,
     }
     return prompt_embeds, metadata

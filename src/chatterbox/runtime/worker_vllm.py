@@ -139,10 +139,32 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile.update(
             {
                 "text_prep_s": 0.0,
+                "request_conditionals_clone_s": 0.0,
+                "request_prompt_conditionals_s": 0.0,
+                "t3_text_normalize_s": 0.0,
+                "t3_text_tokenize_s": 0.0,
+                "t3_text_pad_s": 0.0,
+                "t3_text_tokens_total_s": 0.0,
+                "t3_prompt_embed_cond_to_device_s": 0.0,
+                "t3_prompt_embed_prepare_s": 0.0,
+                "t3_prompt_embed_cpu_s": 0.0,
+                "t3_prompt_embed_s": 0.0,
+                "t3_sampling_params_s": 0.0,
                 "t3_first_token_s": 0.0,
                 "t3_wait_s": 0.0,
                 "t3_active_s": 0.0,
                 "t3_s": 0.0,
+                "t3_vllm_generate_s": 0.0,
+                "t3_alignment_analyzer_supported": 0.0,
+                "t3_alignment_analyzer_active": 0.0,
+                "t3_alignment_analyzer_s": 0.0,
+                "t3_output_extract_s": 0.0,
+                "t3_tail_trim_s": 0.0,
+                "t3_to_s3_tokens_s": 0.0,
+                "s3_finalize_queue_delay_s": 0.0,
+                "s3_finalize_order": 0.0,
+                "s3_finalize_batch_size": 0.0,
+                "batch_s3_finalize_loop_s": 0.0,
                 "s3_s": 0.0,
                 "audio_ready_s": 0.0,
                 "watermark_s": 0.0,
@@ -159,28 +181,42 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
             )
 
         prep_start = time.perf_counter()
+        active_conds_start = time.perf_counter()
         active_conds = clone_conditionals(session.conditionals)
         active_conds = apply_exaggeration(active_conds, active_options.exaggeration, self.device)
+        profile["request_conditionals_clone_s"] = time.perf_counter() - active_conds_start
 
+        prompt_conds_start = time.perf_counter()
         prompt_conds = clone_conditionals(active_conds)
         prompt_conds = apply_exaggeration(
             prompt_conds,
             active_options.exaggeration,
             self.prompt_builder_device,
         )
+        profile["request_prompt_conditionals_s"] = time.perf_counter() - prompt_conds_start
 
-        text_tokens = prepare_vllm_text_tokens(
+        text_tokens, text_token_meta = prepare_vllm_text_tokens(
             tokenizer=self.tokenizer,
             text=text,
             language_id=language_id,
             device=self.prompt_builder_device,
+            return_metadata=True,
         )
+        profile["t3_text_normalize_s"] = float(text_token_meta["text_normalize_s"])
+        profile["t3_text_tokenize_s"] = float(text_token_meta["text_tokenize_s"])
+        profile["t3_text_pad_s"] = float(text_token_meta["text_pad_s"])
+        profile["t3_text_tokens_total_s"] = float(text_token_meta["text_tokens_total_s"])
+
         prompt_embeds, prompt_embed_meta = build_prompt_embeds(
             prompt_builder_t3=self.prompt_builder_t3,
             t3_cond=prompt_conds.t3,
             text_tokens=text_tokens,
             return_metadata=True,
         )
+        profile["t3_prompt_embed_cond_to_device_s"] = float(prompt_embed_meta["prompt_embed_cond_to_device_s"])
+        profile["t3_prompt_embed_prepare_s"] = float(prompt_embed_meta["prompt_embed_prepare_s"])
+        profile["t3_prompt_embed_cpu_s"] = float(prompt_embed_meta["prompt_embed_cpu_s"])
+        profile["t3_prompt_embed_s"] = float(prompt_embed_meta["prompt_embed_total_s"])
         profile["text_prep_s"] = time.perf_counter() - prep_start
         profile["t3_text_token_len"] = float(prompt_embed_meta["text_token_len"])
         profile["t3_prompt_speech_token_len"] = float(prompt_embed_meta["prompt_speech_token_len"])
@@ -207,10 +243,12 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile["t3_engine_vllm"] = 1.0
 
         sampling_options = active_options.merged(max_new_tokens=effective_max_new_tokens)
+        sampling_start = time.perf_counter()
         sampling_params = make_sampling_params(
             options=sampling_options,
             hp=self.prompt_builder_t3.hp,
         )
+        profile["t3_sampling_params_s"] = time.perf_counter() - sampling_start
         return {
             "request_start": request_start,
             "profile": profile,
@@ -253,17 +291,27 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
     ) -> tuple[torch.Tensor, dict]:
         profile = prepared["profile"]
         profile["t3_s"] = t3_duration_s
+        profile["t3_vllm_generate_s"] = t3_duration_s
         profile["t3_active_s"] = t3_duration_s
         profile["t3_batch_size"] = float(prepared.get("batch_size", 1))
+        profile["s3_finalize_order"] = float(prepared.get("s3_finalize_order", 0))
+        profile["s3_finalize_batch_size"] = float(prepared.get("batch_size", 1))
+        profile["s3_finalize_queue_delay_s"] = float(prepared.get("s3_finalize_queue_delay_s", 0.0))
+
+        extract_start = time.perf_counter()
         token_ids = list(output.token_ids) if output is not None else []
         finish_reason = getattr(output, "finish_reason", None)
         stop_reason = getattr(output, "stop_reason", None)
+        profile["t3_output_extract_s"] = time.perf_counter() - extract_start
+
         stop_token_id = int(self.prompt_builder_t3.hp.stop_speech_token)
+        trim_start = time.perf_counter()
         token_ids, trim_diag = _trim_length_capped_tail(
             token_ids,
             finish_reason=finish_reason,
             stop_token_id=stop_token_id,
         )
+        profile["t3_tail_trim_s"] = time.perf_counter() - trim_start
         profile["t3_finish_reason_stop"] = trim_diag["finish_reason_stop"]
         profile["t3_finish_reason_length"] = trim_diag["finish_reason_length"]
         profile["t3_output_has_stop_token"] = trim_diag["output_has_stop_token"]
@@ -274,10 +322,12 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile["t3_tail_trim_repeats"] = trim_diag["tail_trim_repeats"]
         profile["t3_stop_reason_is_stop_token"] = 1.0 if stop_reason == stop_token_id else 0.0
 
+        token_prep_start = time.perf_counter()
         speech_tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device)
         if speech_tokens.ndim == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
         speech_tokens = drop_invalid_tokens(speech_tokens[0]).to(self.device)
+        profile["t3_to_s3_tokens_s"] = time.perf_counter() - token_prep_start
 
         s3_start = time.perf_counter()
         wav, _ = self.s3gen.inference(
@@ -295,6 +345,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
 
     def generate(self, *, session, text: str, options=None) -> torch.Tensor:
         prepared = self._prepare_request(session=session, text=text, options=options)
+        prepared["batch_size"] = 1
+        prepared["s3_finalize_order"] = 0
+        prepared["s3_finalize_queue_delay_s"] = 0.0
 
         with torch.inference_mode():
             t3_start = time.perf_counter()
@@ -340,11 +393,16 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
                 use_tqdm=False,
             )
             t3_duration_s = time.perf_counter() - t3_start
+            t3_batch_end = time.perf_counter()
 
             results = []
+            s3_finalize_loop_start = time.perf_counter()
             for item in prepared:
                 item["batch_size"] = len(prepared)
-            for item, output in zip(prepared, outputs):
+            for finalize_order, (item, output) in enumerate(zip(prepared, outputs)):
+                finalize_start = time.perf_counter()
+                item["s3_finalize_order"] = finalize_order
+                item["s3_finalize_queue_delay_s"] = finalize_start - t3_batch_end
                 wav, profile = self._finalize_request(
                     prepared=item,
                     output=(output.outputs[0] if output.outputs else None),
@@ -356,4 +414,7 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
                         "profile": profile,
                     }
                 )
+            s3_finalize_loop_s = time.perf_counter() - s3_finalize_loop_start
+            for result in results:
+                result["profile"]["batch_s3_finalize_loop_s"] = s3_finalize_loop_s
         return results
