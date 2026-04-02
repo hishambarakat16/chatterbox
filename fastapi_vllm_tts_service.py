@@ -106,8 +106,8 @@ _SOFT_PUNCT = frozenset(',،;؛:')
 def split_text_for_streaming(
     text: str,
     *,
-    target_words: int = 5,
-    max_words: int = 8,
+    target_words: int = 6,
+    max_words: int = 10,
 ) -> list[str]:
     """Split *text* into synthesisable chunks on natural boundaries.
 
@@ -178,9 +178,9 @@ class TTSRequest(BaseModel):
 
     # Chunked-streaming options (used by /v1/tts/stream_chunks).
     chunked_streaming: bool = False
-    chunk_target_words: int = 5
-    chunk_max_words: int = 8
-    chunk_auto_max_new_tokens_cap: int = 64
+    chunk_target_words: int = 6
+    chunk_max_words: int = 10
+    chunk_auto_max_new_tokens_cap: int = 80
 
 
 class TTSResponseMeta(BaseModel):
@@ -659,15 +659,27 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    LOGGER.info("shutdown: stopping batch scheduler")
     scheduler: _BatchScheduler | None = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         await scheduler.close()
+
+    LOGGER.info("shutdown: closing vLLM engine")
     model = getattr(app.state, "model", None)
     if model is not None and hasattr(model, "close"):
         try:
-            await asyncio.to_thread(model.close)
-        except Exception:
-            pass
+            # Give the engine a bounded window to shut down cleanly.
+            # If it hangs, _force_kill_vllm_children() in the __main__ finally
+            # block will clean up whatever is left.
+            await asyncio.wait_for(
+                asyncio.to_thread(model.close),
+                timeout=float(os.getenv("API_SHUTDOWN_TIMEOUT_S", "15.0")),
+            )
+            LOGGER.info("shutdown: vLLM engine closed cleanly")
+        except asyncio.TimeoutError:
+            LOGGER.warning("shutdown: engine.close() timed out — child processes will be force-killed")
+        except Exception as exc:
+            LOGGER.warning("shutdown: engine.close() raised %r — continuing", exc)
 
 
 @app.get("/health")
@@ -843,9 +855,97 @@ async def trace_recent(limit: int = 50) -> dict[str, Any]:
     }
 
 
+def _force_kill_vllm_children(timeout_s: float = 5.0) -> None:
+    """
+    Kill any surviving child processes that look like vLLM engine workers.
+
+    vLLM v1 spawns a separate EngineCore process (name contains "EngineCore"
+    or "vllm"). After engine.shutdown() we give it a short grace period, then
+    SIGKILL anything that is still alive so VRAM is released before the parent
+    exits.
+    """
+    import signal as _signal
+
+    try:
+        import psutil
+        current = psutil.Process()
+        children = current.children(recursive=True)
+        if not children:
+            return
+        # Polite SIGTERM first.
+        for child in children:
+            try:
+                child.terminate()
+            except Exception:
+                pass
+        _, alive = psutil.wait_procs(children, timeout=timeout_s)
+        for child in alive:
+            try:
+                LOGGER.warning("force-killing vLLM child pid=%d", child.pid)
+                child.kill()
+            except Exception:
+                pass
+    except ImportError:
+        # psutil not available — fall back to os.kill on known child PIDs via
+        # /proc (Linux only).
+        import signal as _signal
+        import glob
+
+        current_pid = os.getpid()
+        for stat_path in glob.glob("/proc/*/stat"):
+            try:
+                with open(stat_path) as f:
+                    fields = f.read().split()
+                ppid = int(fields[3])
+                child_pid = int(fields[0])
+                if ppid == current_pid and child_pid != current_pid:
+                    os.kill(child_pid, _signal.SIGKILL)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
+    import signal
     import uvicorn
 
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
-    uvicorn.run("fastapi_vllm_tts_service:app", host=host, port=port, reload=False)
+    shutdown_timeout = float(os.getenv("API_SHUTDOWN_TIMEOUT_S", "15.0"))
+
+    config = uvicorn.Config(
+        "fastapi_vllm_tts_service:app",
+        host=host,
+        port=port,
+        reload=False,
+        # Give in-flight requests time to drain before hard exit.
+        timeout_graceful_shutdown=int(shutdown_timeout),
+    )
+    server = uvicorn.Server(config)
+
+    # Register signal handlers so Ctrl+C / SIGTERM triggers uvicorn's own
+    # graceful shutdown, which in turn fires FastAPI's on_event("shutdown").
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _graceful_exit(sig, frame):
+        LOGGER.info("signal %d received — requesting graceful shutdown", sig)
+        server.handle_exit(sig, frame)
+
+    signal.signal(signal.SIGINT, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
+
+    import atexit
+
+    def _atexit_cleanup():
+        """Last-resort cleanup: kill any surviving vLLM child processes."""
+        LOGGER.info("atexit: cleaning up vLLM child processes")
+        _force_kill_vllm_children(timeout_s=3.0)
+
+    atexit.register(_atexit_cleanup)
+
+    try:
+        server.run()
+    finally:
+        # Runs even if uvicorn exits abnormally (unhandled exception, OOM, …).
+        # _shutdown() may have already cleaned up; this is defense-in-depth.
+        _force_kill_vllm_children(timeout_s=5.0)
