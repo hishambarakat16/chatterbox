@@ -353,13 +353,12 @@ class S3Token2Wav(S3Token2Mel):
             #
             # dynamic=True avoids recompilation across variable mel frame lengths
             # (chunk lengths differ per request).  S3_DISABLE_COMPILE=1 to opt out.
+            # HiFiGAN decode is excluded: stft_window.to(x.device) causes
+            # DeviceCopy graph breaks, inductor fails on source_downs conv
+            # (aten._local_scalar_dense), and ResBlock hits recompile limit
+            # from channel-size variation inside the U-Net decode loop.
             self.flow.decoder.estimator.forward = torch.compile(
                 self.flow.decoder.estimator.forward,
-                mode="default",
-                dynamic=True,
-            )
-            self.mel2wav.decode = torch.compile(
-                self.mel2wav.decode,
                 mode="default",
                 dynamic=True,
             )
