@@ -5,22 +5,30 @@ FastAPI wrapper for the vLLM Turbo S3 multilingual TTS path.
 Design goals:
 - Keep one shared model instance.
 - Queue requests and batch them over a short admission window.
-- Expose one normal WAV endpoint and one chunked streaming WAV endpoint.
+- Expose one normal WAV endpoint, one transport-streaming WAV endpoint, and
+  one true chunked-streaming NDJSON endpoint.
+
+Chunked streaming (/v1/tts/stream_chunks):
+  Text is split on punctuation / word-count boundaries before inference.
+  Each chunk is synthesised as an independent vLLM call.  Chunk jobs from
+  multiple concurrent requests are batched together so the engine stays busy
+  across requests.  Results are streamed as NDJSON events as soon as each
+  chunk finishes — well before the full text is done.
 
 Note:
-This service streams WAV bytes after synthesis finishes. The current runtime
-returns full audio at the end, so this is transport streaming, not token-level
-incremental speech generation.
+/v1/tts and /v1/tts/stream still wait for full synthesis; they are unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
+import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from typing import Any
 
 import soundfile as sf
@@ -30,6 +38,10 @@ from pydantic import BaseModel, Field
 
 from benchmark_multilingual_concurrency import load_model
 
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -44,6 +56,69 @@ def _tensor_to_wav_bytes(wav_tensor, sample_rate: int) -> bytes:
     sf.write(buf, wav_np, samplerate=sample_rate, format="WAV")
     return buf.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Text chunking
+# ---------------------------------------------------------------------------
+
+_HARD_PUNCT = frozenset('.!?؟！')
+_SOFT_PUNCT = frozenset(',،;؛:')
+
+
+def split_text_for_streaming(
+    text: str,
+    *,
+    target_words: int = 5,
+    max_words: int = 8,
+) -> list[str]:
+    """Split *text* into synthesisable chunks on natural boundaries.
+
+    Priority order:
+    1. Hard punctuation (.!?؟) with ≥ 2 accumulated words.
+    2. Soft punctuation (,،;؛:) with ≥ target_words accumulated words.
+    3. Word-count cap (max_words).
+
+    Trailing fragments shorter than 2 words are merged into the previous chunk.
+    Punctuation is preserved in the emitted chunk text.
+    """
+    words = text.split()
+    if not words:
+        return [text] if text.strip() else []
+
+    chunks: list[str] = []
+    current: list[str] = []
+
+    for word in words:
+        current.append(word)
+        last = word.rstrip()
+        if not last:
+            continue
+        ch = last[-1]
+        n = len(current)
+        if ch in _HARD_PUNCT and n >= 2:
+            chunks.append(' '.join(current))
+            current = []
+        elif ch in _SOFT_PUNCT and n >= target_words:
+            chunks.append(' '.join(current))
+            current = []
+        elif n >= max_words:
+            chunks.append(' '.join(current))
+            current = []
+
+    if current:
+        remainder = ' '.join(current)
+        if chunks and len(current) < 2:
+            # Merge tiny trailing fragment into previous chunk.
+            chunks[-1] = chunks[-1] + ' ' + remainder
+        else:
+            chunks.append(remainder)
+
+    return chunks if chunks else [text]
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -63,6 +138,12 @@ class TTSRequest(BaseModel):
 
     stream_chunk_bytes: int = 32768
 
+    # Chunked-streaming options (used by /v1/tts/stream_chunks).
+    chunked_streaming: bool = False
+    chunk_target_words: int = 5
+    chunk_max_words: int = 8
+    chunk_auto_max_new_tokens_cap: int = 64
+
 
 class TTSResponseMeta(BaseModel):
     request_id: str
@@ -71,15 +152,68 @@ class TTSResponseMeta(BaseModel):
     profile: dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# Scheduler internals
+# ---------------------------------------------------------------------------
+
 @dataclass
 class _QueuedItem:
+    """A whole-text synthesis request."""
     request_id: str
     payload: TTSRequest
     enqueued_at: float
     future: asyncio.Future
 
 
+@dataclass
+class _StreamingRequestState:
+    """Mutable state for one /v1/tts/stream_chunks request."""
+    request_id: str
+    payload: TTSRequest
+    chunks: list[str]
+    chunk_cap: int          # effective auto_max_new_tokens_cap for each chunk
+    session: Any            # StreamingSession; None until first chunk runs
+    result_queue: asyncio.Queue
+    enqueued_at: float
+
+
+@dataclass
+class _ChunkJob:
+    """One pending chunk synthesis job."""
+    request_id: str
+    chunk_text: str
+    chunk_index: int
+    chunk_count: int
+    is_final: bool
+    enqueued_at: float
+    result_queue: asyncio.Queue
+    state: _StreamingRequestState   # back-ref so runner can enqueue next chunk
+
+
+@dataclass
+class _WorkItem:
+    """Union of whole-request and chunk jobs, sharing one queue."""
+    kind: str                       # "whole" | "chunk"
+    whole: _QueuedItem | None = None
+    chunk: _ChunkJob | None = None
+
+
+# ---------------------------------------------------------------------------
+# Batch scheduler
+# ---------------------------------------------------------------------------
+
 class _BatchScheduler:
+    """
+    Single runner loop that services both whole-request and chunk jobs.
+
+    Whole-request jobs resolve asyncio Futures.
+    Chunk jobs push NDJSON event dicts to per-request asyncio Queues and
+    enqueue the next chunk back into the work queue when done.
+
+    All inference runs inside one asyncio.to_thread() call so the engine
+    is never driven from two threads simultaneously.
+    """
+
     def __init__(
         self,
         *,
@@ -92,13 +226,15 @@ class _BatchScheduler:
         self.default_audio_prompt_path = default_audio_prompt_path
         self.batch_window_s = max(0.0, float(batch_window_ms) / 1000.0)
         self.max_batch_size = max(1, int(max_batch_size))
-        self.queue: asyncio.Queue[_QueuedItem] = asyncio.Queue()
+        self._work_queue: asyncio.Queue[_WorkItem] = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         if self._runner_task is None:
-            self._runner_task = asyncio.create_task(self._runner(), name="tts-batch-runner")
+            self._runner_task = asyncio.create_task(
+                self._runner(), name="tts-batch-runner"
+            )
 
     async def close(self) -> None:
         self._stop_event.set()
@@ -110,6 +246,10 @@ class _BatchScheduler:
                 pass
             self._runner_task = None
 
+    # ------------------------------------------------------------------
+    # Public: whole-request submission (used by /v1/tts and /v1/tts/stream)
+    # ------------------------------------------------------------------
+
     async def submit(self, payload: TTSRequest) -> dict[str, Any]:
         request_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
@@ -120,45 +260,161 @@ class _BatchScheduler:
             enqueued_at=time.perf_counter(),
             future=fut,
         )
-        await self.queue.put(item)
+        await self._work_queue.put(_WorkItem(kind="whole", whole=item))
         return await fut
+
+    # ------------------------------------------------------------------
+    # Public: chunked streaming submission (used by /v1/tts/stream_chunks)
+    # ------------------------------------------------------------------
+
+    async def submit_chunked(self, payload: TTSRequest) -> _StreamingRequestState:
+        """Split text, enqueue first chunk, return state with result_queue."""
+        request_id = uuid.uuid4().hex
+        chunks = split_text_for_streaming(
+            payload.text,
+            target_words=payload.chunk_target_words,
+            max_words=payload.chunk_max_words,
+        )
+        if not chunks:
+            chunks = [payload.text]
+
+        chunk_cap = min(
+            int(payload.auto_max_new_tokens_cap),
+            int(payload.chunk_auto_max_new_tokens_cap),
+        )
+
+        result_queue: asyncio.Queue = asyncio.Queue()
+        state = _StreamingRequestState(
+            request_id=request_id,
+            payload=payload,
+            chunks=chunks,
+            chunk_cap=chunk_cap,
+            session=None,
+            result_queue=result_queue,
+            enqueued_at=time.perf_counter(),
+        )
+
+        first_job = _ChunkJob(
+            request_id=request_id,
+            chunk_text=chunks[0],
+            chunk_index=0,
+            chunk_count=len(chunks),
+            is_final=(len(chunks) == 1),
+            enqueued_at=time.perf_counter(),
+            result_queue=result_queue,
+            state=state,
+        )
+        await self._work_queue.put(_WorkItem(kind="chunk", chunk=first_job))
+        return state
+
+    # ------------------------------------------------------------------
+    # Runner loop
+    # ------------------------------------------------------------------
 
     async def _runner(self) -> None:
         while not self._stop_event.is_set():
-            first = await self.queue.get()
-            batch = [first]
+            first = await self._work_queue.get()
+            batch: list[_WorkItem] = [first]
 
             if self.batch_window_s > 0:
                 await asyncio.sleep(self.batch_window_s)
 
             while len(batch) < self.max_batch_size:
                 try:
-                    batch.append(self.queue.get_nowait())
+                    batch.append(self._work_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
             started = time.perf_counter()
             try:
-                outputs = await asyncio.to_thread(self._infer_batch, batch)
+                whole_results, chunk_results = await asyncio.to_thread(
+                    self._infer_mixed_batch, batch
+                )
             except Exception as exc:  # noqa: BLE001
                 for item in batch:
-                    if not item.future.done():
-                        item.future.set_exception(exc)
+                    if item.kind == "whole" and not item.whole.future.done():
+                        item.whole.future.set_exception(exc)
+                    elif item.kind == "chunk":
+                        await item.chunk.result_queue.put({
+                            "event": "error",
+                            "request_id": item.chunk.request_id,
+                            "chunk_index": item.chunk.chunk_index,
+                            "detail": repr(exc),
+                        })
                 continue
 
-            for item, output in zip(batch, outputs):
+            # Resolve whole-request futures.
+            whole_items = [b for b in batch if b.kind == "whole"]
+            for w_item, result in zip(whole_items, whole_results):
+                item = w_item.whole
                 if item.future.done():
                     continue
-                queue_wait_s = started - item.enqueued_at
-                output["request_id"] = item.request_id
-                output["queue_wait_s"] = queue_wait_s
-                item.future.set_result(output)
+                result["request_id"] = item.request_id
+                result["queue_wait_s"] = started - item.enqueued_at
+                item.future.set_result(result)
 
-    def _infer_batch(self, batch: list[_QueuedItem]) -> list[dict[str, Any]]:
-        sessions = []
-        texts = []
-        for item in batch:
-            req = item.payload
+            # Push chunk events and enqueue next chunks.
+            chunk_items = [b for b in batch if b.kind == "chunk"]
+            for c_item, result in zip(chunk_items, chunk_results):
+                chunk = c_item.chunk
+                profile = result["profile"]
+                event: dict[str, Any] = {
+                    "event": "chunk",
+                    "request_id": chunk.request_id,
+                    "chunk_index": chunk.chunk_index,
+                    "text": chunk.chunk_text,
+                    "audio_wav_b64": result["audio_wav_b64"],
+                    "sample_rate": result["sample_rate"],
+                    "queue_wait_s": time.perf_counter() - chunk.enqueued_at,
+                    "t3_s": float(profile.get("t3_s", 0.0)),
+                    "s3_s": float(profile.get("s3_s", 0.0)),
+                    "chunk_total_s": result["batch_total_s"],
+                    "is_final": chunk.is_final,
+                }
+                await chunk.result_queue.put(event)
+
+                if not chunk.is_final:
+                    state = chunk.state
+                    next_idx = chunk.chunk_index + 1
+                    next_job = _ChunkJob(
+                        request_id=chunk.request_id,
+                        chunk_text=state.chunks[next_idx],
+                        chunk_index=next_idx,
+                        chunk_count=chunk.chunk_count,
+                        is_final=(next_idx == chunk.chunk_count - 1),
+                        enqueued_at=time.perf_counter(),
+                        result_queue=chunk.result_queue,
+                        state=state,
+                    )
+                    await self._work_queue.put(_WorkItem(kind="chunk", chunk=next_job))
+                else:
+                    await chunk.result_queue.put({
+                        "event": "done",
+                        "request_id": chunk.request_id,
+                    })
+
+    # ------------------------------------------------------------------
+    # Inference — runs inside asyncio.to_thread()
+    # ------------------------------------------------------------------
+
+    def _infer_mixed_batch(
+        self, batch: list[_WorkItem]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """
+        Handle a mixed batch of whole-request and chunk jobs.
+
+        Both job types are collapsed into a single generate_many() call so the
+        vLLM engine sees one batch regardless of source.
+        """
+        whole_items = [b for b in batch if b.kind == "whole"]
+        chunk_items = [b for b in batch if b.kind == "chunk"]
+
+        all_sessions: list[Any] = []
+        all_texts: list[str] = []
+
+        # Sessions for whole requests (create fresh each time).
+        for w in whole_items:
+            req = w.whole.payload
             audio_prompt_path = req.audio_prompt_path or self.default_audio_prompt_path
             session = self.model.create_session(
                 audio_prompt_path=audio_prompt_path,
@@ -173,25 +429,68 @@ class _BatchScheduler:
                 auto_max_new_tokens=req.auto_max_new_tokens,
                 auto_max_new_tokens_cap=req.auto_max_new_tokens_cap,
             )
-            sessions.append(session)
-            texts.append(req.text)
+            all_sessions.append(session)
+            all_texts.append(req.text)
 
+        # Sessions for chunk jobs (create once on first chunk, reuse thereafter).
+        for c in chunk_items:
+            state = c.chunk.state
+            if state.session is None:
+                req = state.payload
+                audio_prompt_path = req.audio_prompt_path or self.default_audio_prompt_path
+                state.session = self.model.create_session(
+                    audio_prompt_path=audio_prompt_path,
+                    language_id=req.language_id,
+                    exaggeration=req.exaggeration,
+                    cfg_weight=req.cfg_weight,
+                    temperature=req.temperature,
+                    repetition_penalty=req.repetition_penalty,
+                    min_p=req.min_p,
+                    top_p=req.top_p,
+                    max_new_tokens=req.max_new_tokens,
+                    auto_max_new_tokens=req.auto_max_new_tokens,
+                    auto_max_new_tokens_cap=state.chunk_cap,
+                )
+            all_sessions.append(state.session)
+            all_texts.append(c.chunk.chunk_text)
+
+        # Single batched inference call via the underlying worker.
         batch_started = time.perf_counter()
-        results = self.model.generate_many_with_sessions(sessions, texts)
+        raw_results = self.model.worker.generate_many(
+            sessions=all_sessions,
+            texts=all_texts,
+        )
         batch_total_s = time.perf_counter() - batch_started
 
-        output_rows: list[dict[str, Any]] = []
-        for result in results:
-            wav_bytes = _tensor_to_wav_bytes(result["wav"], self.model.sr)
-            output_rows.append(
-                {
-                    "audio_wav": wav_bytes,
-                    "profile": result.get("profile", {}),
-                    "batch_total_s": batch_total_s,
-                }
-            )
-        return output_rows
+        n_whole = len(whole_items)
 
+        # Whole-request results.
+        whole_results: list[dict[str, Any]] = []
+        for r in raw_results[:n_whole]:
+            wav_bytes = _tensor_to_wav_bytes(r["wav"], self.model.sr)
+            whole_results.append({
+                "audio_wav": wav_bytes,
+                "profile": r.get("profile", {}),
+                "batch_total_s": batch_total_s,
+            })
+
+        # Chunk results.
+        chunk_results: list[dict[str, Any]] = []
+        for r in raw_results[n_whole:]:
+            wav_bytes = _tensor_to_wav_bytes(r["wav"], self.model.sr)
+            chunk_results.append({
+                "audio_wav_b64": base64.b64encode(wav_bytes).decode(),
+                "sample_rate": self.model.sr,
+                "profile": r.get("profile", {}),
+                "batch_total_s": batch_total_s,
+            })
+
+        return whole_results, chunk_results
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 def _load_service_model():
     return load_model(
@@ -213,7 +512,11 @@ def _load_service_model():
     )
 
 
-app = FastAPI(title="Chatterbox vLLM Turbo S3 API", version="0.1.0")
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Chatterbox vLLM Turbo S3 API", version="0.2.0")
 
 
 @app.on_event("startup")
@@ -247,6 +550,10 @@ async def _shutdown() -> None:
 async def health() -> dict[str, Any]:
     return {"ok": True}
 
+
+# ---------------------------------------------------------------------------
+# Existing endpoints — behaviour unchanged
+# ---------------------------------------------------------------------------
 
 @app.post("/v1/tts", response_class=Response)
 async def synthesize(req: TTSRequest) -> Response:
@@ -313,6 +620,78 @@ async def synthesize_meta(req: TTSRequest) -> TTSResponseMeta:
         total_s=total_s,
         profile=out.get("profile", {}),
     )
+
+
+# ---------------------------------------------------------------------------
+# New chunked-streaming endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/tts/stream_chunks")
+async def synthesize_stream_chunks(req: TTSRequest) -> StreamingResponse:
+    """
+    True text-chunk streaming endpoint.
+
+    Text is split into natural-boundary chunks (punctuation → word count) and
+    each chunk is synthesised independently.  Chunk jobs from concurrent
+    requests are batched together by the shared scheduler.
+
+    Response: application/x-ndjson — one JSON object per line.
+
+    Event shapes:
+      {"event": "chunk", "request_id": "...", "chunk_index": 0,
+       "text": "...", "audio_wav_b64": "<base64 WAV>", "sample_rate": 24000,
+       "queue_wait_s": 0.0, "t3_s": 1.2, "s3_s": 0.3,
+       "chunk_total_s": 1.6, "is_final": false}
+
+      {"event": "done",  "request_id": "..."}
+
+      {"event": "error", "request_id": "...", "chunk_index": 0, "detail": "..."}
+    """
+    scheduler: _BatchScheduler = app.state.scheduler
+
+    async def ndjson_gen():
+        try:
+            state = await scheduler.submit_chunked(req)
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        state.result_queue.get(), timeout=180.0
+                    )
+                except asyncio.TimeoutError:
+                    yield json.dumps({
+                        "event": "error",
+                        "request_id": "unknown",
+                        "detail": "timeout waiting for chunk",
+                    }) + "\n"
+                    return
+                yield json.dumps(event) + "\n"
+                if event.get("event") in ("done", "error"):
+                    return
+        except Exception as exc:  # noqa: BLE001
+            yield json.dumps({"event": "error", "detail": repr(exc)}) + "\n"
+
+    return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# Debug / introspection
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/tts/split_preview")
+async def split_preview(req: TTSRequest) -> dict[str, Any]:
+    """Return the chunk split that would be used for stream_chunks, without synthesising."""
+    chunks = split_text_for_streaming(
+        req.text,
+        target_words=req.chunk_target_words,
+        max_words=req.chunk_max_words,
+    )
+    return {
+        "chunk_count": len(chunks),
+        "chunks": chunks,
+        "chunk_target_words": req.chunk_target_words,
+        "chunk_max_words": req.chunk_max_words,
+        "chunk_auto_max_new_tokens_cap": req.chunk_auto_max_new_tokens_cap,
+    }
 
 
 if __name__ == "__main__":
