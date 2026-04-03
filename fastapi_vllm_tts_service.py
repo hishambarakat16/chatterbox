@@ -713,6 +713,13 @@ class _BatchScheduler:
 # ---------------------------------------------------------------------------
 
 def _load_service_model():
+    if _env_bool("VLLM_ENABLE_PREFIX_CACHING", False):
+        raise RuntimeError(
+            "VLLM_ENABLE_PREFIX_CACHING=true is incompatible with the embed-only "
+            "prompt path used by this service. Rows 1..N in a batch hit max_new_tokens "
+            "instead of emitting stop tokens, producing noisy tails. "
+            "Set VLLM_ENABLE_PREFIX_CACHING=false."
+        )
     model = load_model(
         "vllm_turbo_s3",
         device=os.getenv("API_DEVICE", "cuda"),
@@ -724,7 +731,7 @@ def _load_service_model():
         vllm_prompt_builder_device=os.getenv("VLLM_PROMPT_BUILDER_DEVICE", "cpu"),
         vllm_tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         vllm_gpu_memory_utilization=float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.5")),
-        vllm_enforce_eager=_env_bool("VLLM_ENFORCE_EAGER", True),
+        vllm_enforce_eager=_env_bool("VLLM_ENFORCE_EAGER", False),
         vllm_dtype=os.getenv("VLLM_DTYPE", "auto"),
         vllm_max_model_len=int(os.getenv("VLLM_MAX_MODEL_LEN", "2048")),
         vllm_enable_prefix_caching=_env_bool("VLLM_ENABLE_PREFIX_CACHING", False),
