@@ -198,12 +198,45 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         )
 
     def close(self):
+        import gc
+        import torch
+
         engine = getattr(self.worker, "vllm_engine", None)
-        if engine is not None and hasattr(engine, "shutdown"):
+        if engine is not None:
+            # 1. Ask vLLM to shut down its EngineCore process cleanly.
+            if hasattr(engine, "shutdown"):
+                try:
+                    engine.shutdown()
+                except Exception:
+                    pass
+            # 2. Drop the engine reference so Python can GC its resources.
             try:
-                engine.shutdown()
+                self.worker.vllm_engine = None
             except Exception:
                 pass
+            del engine
+
+        # 3. Destroy distributed process group if one was created (tp > 1 or
+        #    vLLM initialised torch.distributed internally).
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+
+        # 4. Destroy vLLM model-parallel groups if the symbol exists
+        #    (older vLLM versions; safe no-op on newer ones).
+        try:
+            from vllm.distributed.parallel_state import destroy_model_parallel
+            destroy_model_parallel()
+        except Exception:
+            pass
+
+        # 5. Release any CUDA memory still cached by PyTorch's allocator.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def create_session(
         self,
