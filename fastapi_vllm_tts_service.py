@@ -86,6 +86,21 @@ def _extract_stage_meta(profile: dict[str, Any]) -> dict[str, float]:
         "t3_max_new_tokens_effective",
         "s3_finalize_order",
         "s3_finalize_batch_size",
+        "s3_token2mel_batch_size",
+        "s3_token2mel_speech_token_len",
+        "s3_token2mel_prompt_token_len",
+        "s3_token2mel_total_token_len",
+        "s3_token2mel_prompt_mel_frames",
+        "s3_token2mel_generated_mel_frames",
+        "s3_token2mel_total_mel_frames",
+        "s3_token2mel_mel_channels",
+        "s3_token2mel_embedding_dim",
+        "s3_token2mel_ratio",
+        "s3_token2mel_finalize",
+        "s3_hift_input_batch_size",
+        "s3_hift_input_mel_channels",
+        "s3_hift_input_mel_frames",
+        "s3_hift_output_samples",
     )
     meta: dict[str, float] = {}
     for key in keys:
@@ -698,7 +713,7 @@ class _BatchScheduler:
 # ---------------------------------------------------------------------------
 
 def _load_service_model():
-    return load_model(
+    model = load_model(
         "vllm_turbo_s3",
         device=os.getenv("API_DEVICE", "cuda"),
         checkpoint_dir=os.getenv("CHECKPOINT_DIR"),
@@ -715,6 +730,7 @@ def _load_service_model():
         vllm_enable_prefix_caching=_env_bool("VLLM_ENABLE_PREFIX_CACHING", False),
         vllm_export_copy=_env_bool("VLLM_EXPORT_COPY", False),
     )
+    return model
 
 
 # ---------------------------------------------------------------------------
