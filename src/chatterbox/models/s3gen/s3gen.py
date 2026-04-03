@@ -338,61 +338,6 @@ class S3Token2Wav(S3Token2Mel):
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
         self.estimator_dtype = "fp32"
 
-        if not os.getenv("S3_DISABLE_COMPILE"):
-            # Compile the two heavy inference kernels.
-            #
-            # solve_euler() calls self.estimator.forward(...) directly (bypassing
-            # nn.Module.__call__), so we patch the bound .forward attribute rather
-            # than wrapping the whole module — the latter only compiles __call__.
-            #
-            # hift_inference() calls self.mel2wav.decode(...) so we patch .decode.
-            #
-            # mode="default": kernel fusion via inductor WITHOUT CUDA graphs.
-            # reduce-overhead uses CUDA graphs which crash when multiple CUDA
-            # streams (parallel S3 finalize) try to replay graphs concurrently.
-            #
-            # dynamic=True avoids recompilation across variable mel frame lengths
-            # (chunk lengths differ per request).  S3_DISABLE_COMPILE=1 to opt out.
-            # HiFiGAN decode is excluded: stft_window.to(x.device) causes
-            # DeviceCopy graph breaks, inductor fails on source_downs conv
-            # (aten._local_scalar_dense), and ResBlock hits recompile limit
-            # from channel-size variation inside the U-Net decode loop.
-            self.flow.decoder.estimator.forward = torch.compile(
-                self.flow.decoder.estimator.forward,
-                mode="default",
-                dynamic=True,
-            )
-
-    @torch.inference_mode()
-    def warmup_compile(self):
-        """Trigger torch.compile JIT compilation eagerly at model-load time.
-
-        Must be called after the model has been moved to its target device.
-        Runs two dummy forward passes (different speech token lengths) so that
-        inductor sees both a short and a longer sequence, giving dynamic=True
-        a head start on symbolic shape coverage.
-
-        No-op when S3_DISABLE_COMPILE=1.
-        """
-        if os.getenv("S3_DISABLE_COMPILE"):
-            return
-        device = self.device
-        dtype = self.dtype
-        # CAMPPlus embedding_size=192; prompt_feat last dim=80 (mel bins)
-        n_prompt_tokens = 50
-        ref_dict = {
-            "prompt_token": torch.zeros(1, n_prompt_tokens, dtype=torch.long, device=device),
-            "prompt_token_len": torch.tensor([n_prompt_tokens], dtype=torch.long, device=device),
-            "prompt_feat": torch.zeros(1, n_prompt_tokens * 2, 80, device=device, dtype=dtype),
-            "prompt_feat_len": None,
-            "embedding": torch.zeros(1, 192, device=device, dtype=dtype),
-        }
-        for n_tokens in (30, 60):
-            self.inference(
-                speech_tokens=torch.zeros(1, n_tokens, dtype=torch.long, device=device),
-                ref_dict=ref_dict,
-            )
-
     def forward(
         self,
         speech_tokens,
