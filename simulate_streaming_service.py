@@ -1,5 +1,7 @@
 import argparse
+import inspect
 import json
+import re
 import shlex
 import shutil
 import statistics
@@ -47,6 +49,86 @@ def pstdev_or_zero(values: list[float]) -> float:
     return 0.0 if len(values) < 2 else float(statistics.pstdev(values))
 
 
+def resolve_model_tokenizer(model):
+    worker = getattr(model, "worker", None)
+    tokenizer = getattr(worker, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    return getattr(model, "tokenizer", None)
+
+
+def estimate_tokenizer_text_len(tokenizer, text: str, language_id: str) -> int:
+    if tokenizer is not None:
+        try:
+            tokens = tokenizer.text_to_tokens(
+                text,
+                language_id=language_id.lower() if language_id else None,
+            )
+            return int(tokens.numel())
+        except Exception:
+            pass
+    return max(1, len(text.split()))
+
+
+def split_text_for_token_budget(
+    *,
+    text: str,
+    tokenizer,
+    language_id: str,
+    max_text_tokens: int,
+) -> list[dict]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return []
+    if max_text_tokens <= 0:
+        return [
+            {
+                "text": normalized,
+                "text_len": estimate_tokenizer_text_len(tokenizer, normalized, language_id),
+            }
+        ]
+
+    segments = re.findall(r"\S+\s*", normalized)
+    if not segments:
+        return [
+            {
+                "text": normalized,
+                "text_len": estimate_tokenizer_text_len(tokenizer, normalized, language_id),
+            }
+        ]
+
+    chunks: list[dict] = []
+    current_text = ""
+    current_len = 0
+
+    for segment in segments:
+        candidate = f"{current_text}{segment}".strip()
+        candidate_len = estimate_tokenizer_text_len(tokenizer, candidate, language_id)
+        if not current_text or candidate_len <= max_text_tokens:
+            current_text = candidate
+            current_len = candidate_len
+            continue
+
+        chunks.append({"text": current_text, "text_len": current_len})
+        current_text = segment.strip()
+        current_len = estimate_tokenizer_text_len(tokenizer, current_text, language_id)
+
+    if current_text:
+        chunks.append({"text": current_text, "text_len": current_len})
+
+    return chunks
+
+
+def _call_with_supported_kwargs(fn, **kwargs):
+    signature = inspect.signature(fn)
+    accepted = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters and value is not None
+    }
+    return fn(**accepted)
+
+
 def build_session(
     *,
     model,
@@ -58,8 +140,11 @@ def build_session(
     min_p: float,
     top_p: float,
     max_new_tokens: int,
+    auto_max_new_tokens: bool,
+    auto_max_new_tokens_cap: int,
 ):
-    return model.create_session(
+    return _call_with_supported_kwargs(
+        model.create_session,
         audio_prompt_path=audio_prompt_path,
         language_id=language_id,
         cfg_weight=cfg_weight,
@@ -68,6 +153,8 @@ def build_session(
         min_p=min_p,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        auto_max_new_tokens=auto_max_new_tokens,
+        auto_max_new_tokens_cap=auto_max_new_tokens_cap,
     )
 
 
@@ -85,6 +172,8 @@ def run_warmup(
     min_p: float,
     top_p: float,
     max_new_tokens: int,
+    auto_max_new_tokens: bool,
+    auto_max_new_tokens_cap: int,
 ):
     if warmup_runs <= 0:
         return
@@ -100,6 +189,8 @@ def run_warmup(
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         if impl not in SESSION_IMPLS:
             raise ValueError(f"Unsupported impl for service simulator: {impl}")
@@ -121,18 +212,95 @@ def histogram(values: list[int | str]) -> dict[str, int]:
 
 
 def estimate_vllm_text_len(model, text: str, language_id: str) -> int:
-    worker = getattr(model, "worker", None)
-    tokenizer = getattr(worker, "tokenizer", None)
-    if tokenizer is not None:
-        try:
-            tokens = tokenizer.text_to_tokens(
-                text,
-                language_id=language_id.lower() if language_id else None,
-            )
-            return int(tokens.numel())
-        except Exception:
-            pass
-    return max(1, len(text.split()))
+    return estimate_tokenizer_text_len(resolve_model_tokenizer(model), text, language_id)
+
+
+def prepare_request_text_plan(
+    *,
+    model,
+    fixed_text: str | None,
+    sentences: list[str],
+    language_id: str,
+    fixed_text_token_budget: int,
+    fixed_text_chunk_mode: str,
+    warmup_text_arg: str | None,
+) -> dict:
+    if not fixed_text:
+        return {
+            "request_text_mode": "rotating_sentences",
+            "fixed_request_text": None,
+            "text_pool": list(sentences),
+            "warmup_text": warmup_text_arg or sentences[0],
+            "fixed_text_source": None,
+            "ingestion_chunks": [],
+            "cycle_enabled": False,
+            "cycle_fallback_reason": None,
+        }
+
+    tokenizer = resolve_model_tokenizer(model)
+    if fixed_text_token_budget <= 0:
+        fixed_request_text = " ".join(fixed_text.split())
+        return {
+            "request_text_mode": "fixed",
+            "fixed_request_text": fixed_request_text,
+            "text_pool": [],
+            "warmup_text": warmup_text_arg or fixed_request_text,
+            "fixed_text_source": fixed_text,
+            "ingestion_chunks": [
+                {
+                    "text": fixed_request_text,
+                    "text_len": estimate_tokenizer_text_len(tokenizer, fixed_request_text, language_id),
+                }
+            ],
+            "cycle_enabled": False,
+            "cycle_fallback_reason": None,
+        }
+
+    ingestion_chunks = split_text_for_token_budget(
+        text=fixed_text,
+        tokenizer=tokenizer,
+        language_id=language_id,
+        max_text_tokens=fixed_text_token_budget,
+    )
+    if not ingestion_chunks:
+        raise ValueError("Fixed-text ingestion produced no chunks.")
+
+    if fixed_text_chunk_mode == "cycle":
+        unique_chunk_lens = sorted({int(item["text_len"]) for item in ingestion_chunks})
+        if len(unique_chunk_lens) == 1:
+            return {
+                "request_text_mode": "fixed_chunk_cycle",
+                "fixed_request_text": None,
+                "text_pool": [item["text"] for item in ingestion_chunks],
+                "warmup_text": warmup_text_arg or ingestion_chunks[0]["text"],
+                "fixed_text_source": fixed_text,
+                "ingestion_chunks": ingestion_chunks,
+                "cycle_enabled": True,
+                "cycle_fallback_reason": None,
+            }
+        fixed_request_text = ingestion_chunks[0]["text"]
+        return {
+            "request_text_mode": "fixed_first_chunk",
+            "fixed_request_text": fixed_request_text,
+            "text_pool": [],
+            "warmup_text": warmup_text_arg or fixed_request_text,
+            "fixed_text_source": fixed_text,
+            "ingestion_chunks": ingestion_chunks,
+            "cycle_enabled": False,
+            "cycle_fallback_reason": "non_uniform_chunk_token_lengths",
+        }
+
+    fixed_request_text = ingestion_chunks[0]["text"]
+    return {
+        "request_text_mode": "fixed_first_chunk",
+        "fixed_request_text": fixed_request_text,
+        "text_pool": [],
+        "warmup_text": warmup_text_arg or fixed_request_text,
+        "fixed_text_source": fixed_text,
+        "ingestion_chunks": ingestion_chunks,
+        "cycle_enabled": False,
+        "cycle_fallback_reason": None,
+    }
 
 
 def estimate_vllm_prompt_len(session) -> int:
@@ -489,9 +657,19 @@ def write_markdown_report(path: Path, report: dict):
     lines.append(f"- `impl`: `{report['impl']}`")
     lines.append(f"- `device`: `{report['device']}`")
     lines.append(f"- `language_id`: `{report['language_id']}`")
-    lines.append(f"- `request_text_mode`: `{'fixed' if report.get('fixed_text') else 'rotating_sentences'}`")
+    lines.append(f"- `request_text_mode`: `{report.get('request_text_mode', 'rotating_sentences')}`")
     if report.get("fixed_text"):
         lines.append(f"- `fixed_text`: `{report['fixed_text']}`")
+    if report.get("fixed_text_source") and report.get("fixed_text_source") != report.get("fixed_text"):
+        lines.append(f"- `fixed_text_source`: `{report['fixed_text_source']}`")
+    if report.get("fixed_text_token_budget", 0) > 0:
+        lines.append(f"- `fixed_text_token_budget`: `{report['fixed_text_token_budget']}`")
+        lines.append(f"- `fixed_text_chunk_mode`: `{report.get('fixed_text_chunk_mode', 'first')}`")
+        lines.append(f"- `ingestion_num_chunks`: `{report.get('ingestion_num_chunks', 0)}`")
+        lines.append(f"- `ingestion_chunk_token_lens`: `{report.get('ingestion_chunk_token_lens', [])}`")
+        lines.append(f"- `fixed_text_cycle_enabled`: `{report.get('fixed_text_cycle_enabled', False)}`")
+        if report.get("fixed_text_cycle_fallback_reason"):
+            lines.append(f"- `fixed_text_cycle_fallback_reason`: `{report['fixed_text_cycle_fallback_reason']}`")
     lines.append(f"- `stagger_ms`: `{report['stagger_ms']}`")
     lines.append(f"- `batching_window_ms`: `{report['batching_window_ms']}`")
     lines.append(f"- `text_bucket_width`: `{report['text_bucket_width']}`")
@@ -501,6 +679,8 @@ def write_markdown_report(path: Path, report: dict):
             f"- `vllm_prompt_len_only_grouping`: `{report.get('vllm_prompt_len_only_grouping', False)}`"
         )
     lines.append(f"- `rounds_per_level`: `{report['rounds_per_level']}`")
+    lines.append(f"- `auto_max_new_tokens`: `{report.get('auto_max_new_tokens', False)}`")
+    lines.append(f"- `auto_max_new_tokens_cap`: `{report.get('auto_max_new_tokens_cap', 128)}`")
     lines.append(f"- `warmup_runs`: `{report['warmup_runs']}`")
     lines.append("")
     lines.append("Important note:")
@@ -637,6 +817,8 @@ def main():
     parser.add_argument("--language-id", required=True)
     parser.add_argument("--sentences-file")
     parser.add_argument("--fixed-text")
+    parser.add_argument("--fixed-text-token-budget", type=int, default=0)
+    parser.add_argument("--fixed-text-chunk-mode", choices=["first", "cycle"], default="first")
     parser.add_argument("--concurrency-levels", nargs="+", type=int, default=[1, 2, 4, 6, 8])
     parser.add_argument("--rounds-per-level", type=int, default=2)
     parser.add_argument("--stagger-ms", type=float, default=250.0)
@@ -652,11 +834,12 @@ def main():
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--auto-max-new-tokens", action="store_true")
+    parser.add_argument("--auto-max-new-tokens-cap", type=int, default=128)
     args = parser.parse_args()
 
     args.repetition_penalty = resolve_repetition_penalty(args.impl, args.repetition_penalty)
     sentences = [] if args.fixed_text else load_sentences(args.sentences_file)
-    warmup_text = args.warmup_text or args.fixed_text or sentences[0]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_vllm_enforce_eager = args.vllm_enforce_eager
@@ -695,6 +878,23 @@ def main():
         maybe_sync(args.device)
         load_s = time.perf_counter() - load_start
 
+        text_plan = prepare_request_text_plan(
+            model=model,
+            fixed_text=args.fixed_text,
+            sentences=sentences,
+            language_id=args.language_id,
+            fixed_text_token_budget=args.fixed_text_token_budget,
+            fixed_text_chunk_mode=args.fixed_text_chunk_mode,
+            warmup_text_arg=args.warmup_text,
+        )
+        request_text_mode = text_plan["request_text_mode"]
+        fixed_request_text = text_plan["fixed_request_text"]
+        text_pool = text_plan["text_pool"]
+        warmup_text = text_plan["warmup_text"]
+        ingestion_chunks = text_plan["ingestion_chunks"]
+        cycle_enabled = bool(text_plan.get("cycle_enabled", False))
+        cycle_fallback_reason = text_plan.get("cycle_fallback_reason")
+
         print(f"impl={args.impl}")
         print(f"device={args.device}")
         print(f"load_s={load_s:.4f}")
@@ -713,10 +913,20 @@ def main():
         print(f"stagger_ms={args.stagger_ms}")
         print(f"batching_window_ms={args.batching_window_ms}")
         print(f"text_bucket_width={effective_text_bucket_width}")
-        print(f"request_text_mode={'fixed' if args.fixed_text else 'rotating_sentences'}")
+        print(f"request_text_mode={request_text_mode}")
+        if args.fixed_text_token_budget > 0:
+            print(f"fixed_text_token_budget={args.fixed_text_token_budget}")
+            print(f"fixed_text_chunk_mode={args.fixed_text_chunk_mode}")
+            print(f"ingestion_num_chunks={len(ingestion_chunks)}")
+            print(f"ingestion_chunk_token_lens={[int(item['text_len']) for item in ingestion_chunks]}")
+            print(f"fixed_text_cycle_enabled={cycle_enabled}")
+            if cycle_fallback_reason:
+                print(f"fixed_text_cycle_fallback_reason={cycle_fallback_reason}")
         if args.impl == "vllm_turbo_s3":
             print(f"vllm_prompt_len_only_grouping={not args.allow_vllm_text_bucketing}")
         print(f"rounds_per_level={args.rounds_per_level}")
+        print(f"auto_max_new_tokens={args.auto_max_new_tokens}")
+        print(f"auto_max_new_tokens_cap={args.auto_max_new_tokens_cap}")
         print(f"save_mode={args.save_mode}")
         for note in describe_vllm_hydra_mode(
             impl=args.impl,
@@ -738,6 +948,8 @@ def main():
             min_p=args.min_p,
             top_p=args.top_p,
             max_new_tokens=args.max_new_tokens,
+            auto_max_new_tokens=args.auto_max_new_tokens,
+            auto_max_new_tokens_cap=args.auto_max_new_tokens_cap,
         )
 
         sentence_cursor = 0
@@ -761,16 +973,18 @@ def main():
                         min_p=args.min_p,
                         top_p=args.top_p,
                         max_new_tokens=args.max_new_tokens,
+                        auto_max_new_tokens=args.auto_max_new_tokens,
+                        auto_max_new_tokens_cap=args.auto_max_new_tokens_cap,
                     )
                     for _ in range(level)
                 ]
 
-                if args.fixed_text:
-                    texts = [args.fixed_text] * level
+                if fixed_request_text is not None:
+                    texts = [fixed_request_text] * level
                 else:
                     texts = []
                     for _ in range(level):
-                        texts.append(sentences[sentence_cursor % len(sentences)])
+                        texts.append(text_pool[sentence_cursor % len(text_pool)])
                         sentence_cursor += 1
 
                 if args.impl == "vllm_turbo_s3" and hasattr(model, "generate_many_with_sessions"):
@@ -907,7 +1121,15 @@ def main():
             "language_id": args.language_id,
             "audio_prompt_path": args.audio_prompt_path,
             "sentences_file": str(DEFAULT_SENTENCES_FILE if args.sentences_file is None else Path(args.sentences_file)),
-            "fixed_text": args.fixed_text,
+            "fixed_text": fixed_request_text,
+            "fixed_text_source": text_plan["fixed_text_source"],
+            "fixed_text_token_budget": args.fixed_text_token_budget,
+            "fixed_text_chunk_mode": args.fixed_text_chunk_mode,
+            "ingestion_num_chunks": len(ingestion_chunks),
+            "ingestion_chunk_token_lens": [int(item["text_len"]) for item in ingestion_chunks],
+            "fixed_text_cycle_enabled": cycle_enabled,
+            "fixed_text_cycle_fallback_reason": cycle_fallback_reason,
+            "request_text_mode": request_text_mode,
             "warmup_runs": args.warmup_runs,
             "warmup_text": warmup_text,
             "rounds_per_level": args.rounds_per_level,
@@ -919,6 +1141,8 @@ def main():
                 args.impl == "vllm_turbo_s3" and not args.allow_vllm_text_bucketing
             ),
             "save_mode": args.save_mode,
+            "auto_max_new_tokens": args.auto_max_new_tokens,
+            "auto_max_new_tokens_cap": args.auto_max_new_tokens_cap,
             "levels": sanitize_level_summaries(level_summaries),
             "saved_audio": saved_audio,
         }
