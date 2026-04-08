@@ -45,6 +45,43 @@ LOGGER = logging.getLogger("chatterbox.fastapi_vllm_tts")
 
 
 # ---------------------------------------------------------------------------
+# Shape trace capture
+# ---------------------------------------------------------------------------
+
+class _ShapeLogCapture(logging.Handler):
+    """
+    In-memory ring buffer for chatterbox.shape log lines.
+    Attached to the 'chatterbox.shape' logger at startup so that
+    GET /v1/tts/trace/shapes can return the last N lines without
+    needing to parse a log file.
+    """
+    _MAX = 2000
+
+    def __init__(self):
+        super().__init__()
+        self._lines: collections.deque[dict] = collections.deque(maxlen=self._MAX)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._lines.append({
+            "t": record.created,
+            "msg": self.format(record),
+        })
+
+    def tail(self, n: int) -> list[dict]:
+        items = list(self._lines)
+        return items[-n:] if n < len(items) else items
+
+    def clear(self) -> None:
+        self._lines.clear()
+
+
+_shape_capture = _ShapeLogCapture()
+_shape_capture.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger("chatterbox.shape").addHandler(_shape_capture)
+logging.getLogger("chatterbox.shape").setLevel(logging.DEBUG)
+
+
+# ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
 
@@ -253,7 +290,7 @@ class TTSRequest(BaseModel):
 
     exaggeration: float = 0.5
     cfg_weight: float = 0.0
-    temperature: float = 0.0
+    temperature: float = 0.8
     repetition_penalty: float = 2.0
     min_p: float = 0.05
     top_p: float = 1.0
@@ -956,6 +993,33 @@ async def trace_recent(limit: int = 50) -> dict[str, Any]:
         "limit": max(1, int(limit)),
         "queue_depth_now": scheduler._work_queue.qsize(),
         "batches": scheduler.get_recent_batch_traces(limit=limit),
+    }
+
+
+@app.get("/v1/tts/trace/shapes")
+async def trace_shapes(limit: int = 200, clear: bool = False) -> dict[str, Any]:
+    """
+    Return recent shape trace lines from chatterbox.shape logger.
+
+    Requires CHATTERBOX_TRACE_SHAPES=1 to be set in the environment when the
+    service starts.  Lines are captured from all stages: vllm_t3_bridge
+    (text tokenization, prompt embed build, BOS contract), worker_vllm
+    (speech tokens into S3, S3 output), t3.py (prepare_input_embeds), and
+    s3gen.py (token2mel, hift).
+
+    Query params:
+      limit: how many recent lines to return (default 200)
+      clear: if true, flush the buffer after reading
+    """
+    enabled = bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
+    lines = _shape_capture.tail(max(1, int(limit)))
+    if clear:
+        _shape_capture.clear()
+    return {
+        "trace_enabled": enabled,
+        "hint": "Set CHATTERBOX_TRACE_SHAPES=1 and restart the service to enable tracing." if not enabled else "",
+        "captured": len(lines),
+        "lines": [item["msg"] for item in lines],
     }
 
 

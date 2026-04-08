@@ -1,3 +1,5 @@
+import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,6 +10,11 @@ from ..runtime.session import apply_exaggeration, clone_conditionals
 from ..mtl_tts import SUPPORTED_LANGUAGES
 from .worker import ChatterboxMultilingualStreamingWorker
 from ..vllm_t3_bridge import build_prompt_embeds, make_sampling_params, prepare_vllm_text_tokens
+
+shape_logger = logging.getLogger("chatterbox.shape")
+
+def _trace_shapes() -> bool:
+    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
 
 
 def _find_repeated_suffix(
@@ -55,7 +62,9 @@ def _trim_length_capped_tail(
         "finish_reason_length": 1.0 if finish_reason == "length" else 0.0,
         "output_has_stop_token": 1.0 if stop_token_id in token_ids else 0.0,
         "tail_trimmed": 0.0,
+        "tail_trim_blocked": 0.0,
         "tail_trim_tokens": 0.0,
+        "tail_trim_candidate_index": 0.0,
         "tail_trim_pattern_size": 0.0,
         "tail_trim_repeats": 0.0,
     }
@@ -68,6 +77,15 @@ def _trim_length_capped_tail(
         return token_ids, diagnostics
 
     trim_index = repeated_suffix["trim_index"]
+    diagnostics["tail_trim_candidate_index"] = float(trim_index)
+
+    # A repeated suffix at the end is often garbage from a length-capped decode,
+    # but trimming almost the entire sequence is worse than keeping the raw output.
+    min_kept_tokens = max(32, len(token_ids) // 2)
+    if trim_index < min_kept_tokens:
+        diagnostics["tail_trim_blocked"] = 1.0
+        return token_ids, diagnostics
+
     trimmed = token_ids[:trim_index]
     diagnostics["tail_trimmed"] = 1.0
     diagnostics["tail_trim_tokens"] = float(repeated_suffix["trim_tokens"])
@@ -318,7 +336,9 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         profile["t3_output_has_stop_token"] = trim_diag["output_has_stop_token"]
         profile["t3_generated_tokens"] = trim_diag["generated_tokens"]
         profile["t3_tail_trimmed"] = trim_diag["tail_trimmed"]
+        profile["t3_tail_trim_blocked"] = trim_diag["tail_trim_blocked"]
         profile["t3_tail_trim_tokens"] = trim_diag["tail_trim_tokens"]
+        profile["t3_tail_trim_candidate_index"] = trim_diag["tail_trim_candidate_index"]
         profile["t3_tail_trim_pattern_size"] = trim_diag["tail_trim_pattern_size"]
         profile["t3_tail_trim_repeats"] = trim_diag["tail_trim_repeats"]
         profile["t3_stop_reason_is_stop_token"] = 1.0 if stop_reason == stop_token_id else 0.0
@@ -327,7 +347,33 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         speech_tokens = torch.tensor(token_ids, dtype=torch.long, device=self.device)
         if speech_tokens.ndim == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
-        speech_tokens = drop_invalid_tokens(speech_tokens[0]).to(self.device)
+
+        if _trace_shapes():
+            shape_logger.info("[worker_vllm] _finalize_request.t3_output")
+            shape_logger.info("  finish_reason %s", finish_reason)
+            shape_logger.info("  raw_token_ids len=%s", len(list(output.token_ids) if output is not None else []))
+            shape_logger.info("  raw_token_ids values (first 16) %s", list(output.token_ids)[:16] if output is not None else [])
+            shape_logger.info("  raw_token_ids values (last 8) %s", list(output.token_ids)[-8:] if output is not None else [])
+            shape_logger.info("  token_ids_after_trim len=%s", len(token_ids))
+            shape_logger.info("  stop_token_id %s  present_in_output %s", stop_token_id, stop_token_id in token_ids)
+            shape_logger.info("  tail_trim_blocked %s", bool(trim_diag["tail_trim_blocked"]))
+            shape_logger.info("  tail_trim_candidate_index %s", int(trim_diag["tail_trim_candidate_index"]))
+            shape_logger.info("  token_ids_after_trim values (first 16) %s", token_ids[:16])
+            shape_logger.info("  token_ids_after_trim values (last 8) %s", token_ids[-8:])
+
+        # drop_invalid_tokens strips leading SOS (==6561==start_speech_token) and
+        # trailing EOS (==6562==stop_speech_token).  The T3 vocab uses 6561/6562 as
+        # BOS/EOS so any BOS token inside the output would truncate everything after
+        # it.  Instead, just keep only valid S3 speech token indices (0 .. 6560).
+        speech_tokens_1d = speech_tokens[0]
+        from ..models.s3tokenizer import SPEECH_VOCAB_SIZE
+        valid_mask = speech_tokens_1d < SPEECH_VOCAB_SIZE
+        speech_tokens = speech_tokens_1d[valid_mask].to(self.device)
+
+        if _trace_shapes():
+            shape_logger.info("  speech_tokens (to S3, after valid filter) %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
+            shape_logger.info("  speech_tokens values (first 8) %s", speech_tokens[:8].tolist() if speech_tokens.numel() > 0 else [])
+
         profile["t3_to_s3_tokens_s"] = time.perf_counter() - token_prep_start
 
         s3_start = time.perf_counter()
@@ -337,6 +383,10 @@ class ChatterboxMultilingualVllmWorker(ChatterboxMultilingualStreamingWorker):
         )
         profile.update(self.s3gen.get_last_profile() or {})
         profile["s3_s"] = time.perf_counter() - s3_start
+
+        if _trace_shapes():
+            shape_logger.info("[worker_vllm] _finalize_request.s3_output")
+            shape_logger.info("  wav %s %s", tuple(wav.shape) if hasattr(wav, "shape") else "?", getattr(wav, "dtype", "?"))
         profile["audio_ready_s"] = time.perf_counter() - prepared["request_start"]
         wav = wav.squeeze(0).detach().cpu().numpy()
         watermark_start = time.perf_counter()

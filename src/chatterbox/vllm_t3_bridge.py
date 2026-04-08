@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -12,6 +13,11 @@ from huggingface_hub import snapshot_download
 
 from .models.t3.llama_configs import LLAMA_CONFIGS
 from .models.t3.modules.t3_config import T3Config
+
+shape_logger = logging.getLogger("chatterbox.shape")
+
+def _trace_shapes() -> bool:
+    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
 
 
 VLLM_T3_ARCHITECTURE = "ChatterboxT3ForCausalLM"
@@ -319,6 +325,17 @@ def prepare_vllm_text_tokens(
     _maybe_sync(device)
     pad_s = time.perf_counter() - pad_start
 
+    if _trace_shapes():
+        flat = text_tokens.flatten()
+        shape_logger.info("[vllm_t3_bridge] prepare_vllm_text_tokens")
+        shape_logger.info("  text (raw) %r", text)
+        shape_logger.info("  text (normalized) %r", normalized)
+        shape_logger.info("  language_id %s", language_id)
+        shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
+        shape_logger.info("  text_tokens[0] (first token id) %s", int(flat[0]) if flat.numel() > 0 else "empty")
+        shape_logger.info("  text_tokens[-1] (last token id) %s", int(flat[-1]) if flat.numel() > 0 else "empty")
+        shape_logger.info("  text_tokens values %s", flat.tolist())
+
     if not return_metadata:
         return text_tokens
 
@@ -345,6 +362,15 @@ def build_prompt_embeds(
     _maybe_sync(prompt_builder_t3.device)
     cond_to_device_s = time.perf_counter() - cond_to_device_start
 
+    if _trace_shapes():
+        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.input")
+        shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
+        shape_logger.info("  initial_speech %s %s %s", tuple(initial_speech.shape), initial_speech.dtype, initial_speech.device)
+        shape_logger.info("  t3_cond.speaker_emb %s", tuple(t3_cond.speaker_emb.shape) if hasattr(t3_cond, "speaker_emb") and t3_cond.speaker_emb is not None else None)
+        shape_logger.info("  t3_cond.emotion_adv %s", tuple(t3_cond.emotion_adv.shape) if hasattr(t3_cond, "emotion_adv") and t3_cond.emotion_adv is not None else None)
+        cpt = getattr(t3_cond, "cond_prompt_speech_tokens", None)
+        shape_logger.info("  t3_cond.cond_prompt_speech_tokens %s", tuple(cpt.shape) if cpt is not None else None)
+
     prepare_start = time.perf_counter()
     embeds, _ = prompt_builder_t3.prepare_input_embeds(
         t3_cond=t3_cond,
@@ -352,6 +378,28 @@ def build_prompt_embeds(
         speech_tokens=initial_speech,
         cfg_weight=0.0,
     )
+    if _trace_shapes():
+        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.after_prepare_input_embeds")
+        shape_logger.info("  embeds %s %s %s  (= cond + text + 1xBOS)", tuple(embeds.shape), embeds.dtype, embeds.device)
+
+    # Append a second BOS embedding at speech_pos=0 to match native T3 inference.
+    # T3.inference() builds: inputs_embeds = cat([prepare_input_embeds(...), bos_embed])
+    # where bos_embed = speech_emb(BOS) + speech_pos_emb[0].  Without this extra token
+    # the model context differs from training and it fails to emit EOS naturally.
+    bos_ids = torch.tensor(
+        [[int(prompt_builder_t3.hp.start_speech_token)]],
+        dtype=torch.long,
+        device=prompt_builder_t3.device,
+    )
+    extra_bos = prompt_builder_t3.speech_emb(bos_ids)  # (1, 1, dim)
+    extra_bos = extra_bos + prompt_builder_t3.speech_pos_emb.get_fixed_embedding(0)  # (1, 1, dim)
+    embeds = torch.cat([embeds, extra_bos], dim=1)  # (1, L+1, dim)
+
+    if _trace_shapes():
+        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.after_extra_bos")
+        shape_logger.info("  embeds %s %s %s  (= cond + text + 1xBOS(in_prepare) + 1xBOS(extra, speech_pos=0))", tuple(embeds.shape), embeds.dtype, embeds.device)
+        shape_logger.info("  total prompt seq_len sent to vLLM: %s", embeds.shape[1])
+
     _maybe_sync(prompt_builder_t3.device)
     prepare_s = time.perf_counter() - prepare_start
 
@@ -365,7 +413,8 @@ def build_prompt_embeds(
     prompt_speech_tokens = getattr(t3_cond, "cond_prompt_speech_tokens", None)
     prompt_speech_token_len = 0 if prompt_speech_tokens is None else int(prompt_speech_tokens.shape[-1])
     text_token_len = int(text_tokens.shape[-1])
-    initial_speech_len = int(initial_speech.shape[-1])
+    # +1 for the extra BOS appended above to match native T3 inference contract.
+    initial_speech_len = int(initial_speech.shape[-1]) + 1
     prompt_embed_seq_len = int(prompt_embeds.shape[0])
     prompt_embed_hidden_size = int(prompt_embeds.shape[1]) if prompt_embeds.ndim >= 2 else 0
     cond_seq_len = prompt_embed_seq_len - text_token_len - initial_speech_len

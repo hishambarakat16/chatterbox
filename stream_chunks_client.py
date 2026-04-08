@@ -30,6 +30,7 @@ import concurrent.futures
 import http.client
 import io
 import json
+import math
 import os
 import statistics
 import time
@@ -49,6 +50,121 @@ DEFAULT_TEXT = (
     "يمكنني التحدث عن أي موضوع تريده."
 )
 
+LANGUAGE_PATTERNS: dict[str, list[str]] = {
+    "ar": [
+        "مرحبا، هذا اختبار قصير لقياس سرعة الاستجابة.",
+        "كيف يمكننا تحسين جودة الصوت مع الحفاظ على زمن استجابة منخفض؟",
+        "نريد التأكد من أن أول جزء صوتي يصل بسرعة حتى عند وجود عدة طلبات.",
+        "هذا مثال على جملة متوسطة الطول لاختبار مستويات التزامن المختلفة.",
+    ],
+    "en": [
+        "Hello, this is a short test to measure response speed.",
+        "How can we improve voice quality while keeping latency low?",
+        "We want to confirm that the first audio chunk arrives quickly, even with several requests at once.",
+        "This is a medium-length sentence to test stability across different concurrency levels.",
+    ],
+    "zh": [
+        "你好，这是一个简短的测试，用来测量系统的响应速度。",
+        "我们怎样才能在保持较低延迟的同时继续提升声音质量？",
+        "我们想确认的是，即使同时来了多个请求，第一段音频也能尽快返回。",
+        "这是一句中等长度的话，用来测试不同并发水平下的稳定性。",
+    ],
+}
+
+NO_SPACE_LANGUAGES = {"zh", "ja", "ko"}
+
+LANGUAGE_TOKEN_HEURISTICS: dict[str, dict[str, float]] = {
+    "ar": {
+        "full_base": 24.0,
+        "full_per_unit": 6.0,
+        "full_cap_max": 160.0,
+        "chunk_base": 18.0,
+        "chunk_per_unit": 8.0,
+        "chunk_cap_max": 128.0,
+    },
+    "en": {
+        "full_base": 20.0,
+        "full_per_unit": 4.0,
+        "full_cap_max": 128.0,
+        "chunk_base": 14.0,
+        "chunk_per_unit": 5.0,
+        "chunk_cap_max": 96.0,
+    },
+    "zh": {
+        "full_base": 18.0,
+        "full_per_unit": 3.0,
+        "full_cap_max": 112.0,
+        "chunk_base": 12.0,
+        "chunk_per_unit": 4.0,
+        "chunk_cap_max": 80.0,
+    },
+}
+
+DEFAULT_TOKEN_HEURISTICS = {
+    "full_base": 20.0,
+    "full_per_unit": 4.5,
+    "full_cap_max": 128.0,
+    "chunk_base": 14.0,
+    "chunk_per_unit": 5.0,
+    "chunk_cap_max": 96.0,
+}
+
+
+def _lang_key(language_id: str | None) -> str:
+    return (language_id or "ar").strip().lower()
+
+
+def _text_units(text: str, language_id: str) -> int:
+    lang = _lang_key(language_id)
+    stripped = text.strip()
+    if not stripped:
+        return 1
+    if lang in NO_SPACE_LANGUAGES:
+        punct = " \t\r\n.,!?;:،؛。！？、()[]{}\"'`"
+        return max(1, sum(1 for ch in stripped if ch not in punct))
+    return max(1, len(stripped.split()))
+
+
+def _estimate_chunk_units(text: str, language_id: str, chunk_target_words: int, chunk_max_words: int) -> int:
+    units = _text_units(text, language_id)
+    lang = _lang_key(language_id)
+    if lang in NO_SPACE_LANGUAGES:
+        target_units = max(8, int(chunk_target_words) * 4)
+        max_units = max(target_units, int(chunk_max_words) * 4)
+        return min(units, max_units)
+
+    target_words = max(1, int(chunk_target_words))
+    max_words = max(target_words, int(chunk_max_words))
+    estimated_chunks = max(1, math.ceil(units / target_words))
+    estimated_chunk_words = max(1, math.ceil(units / estimated_chunks))
+    return min(max_words, estimated_chunk_words)
+
+
+def _estimate_token_caps(
+    *,
+    text: str,
+    language_id: str,
+    chunk_target_words: int,
+    chunk_max_words: int,
+) -> dict[str, int]:
+    heuristics = LANGUAGE_TOKEN_HEURISTICS.get(_lang_key(language_id), DEFAULT_TOKEN_HEURISTICS)
+    full_units = _text_units(text, language_id)
+    chunk_units = _estimate_chunk_units(text, language_id, chunk_target_words, chunk_max_words)
+
+    full_cap = int(round(heuristics["full_base"] + heuristics["full_per_unit"] * full_units))
+    full_cap = max(32, min(full_cap, int(heuristics["full_cap_max"])))
+
+    chunk_cap = int(round(heuristics["chunk_base"] + heuristics["chunk_per_unit"] * chunk_units))
+    chunk_cap = max(32, min(chunk_cap, int(heuristics["chunk_cap_max"])))
+
+    return {
+        "text_units": full_units,
+        "chunk_units": chunk_units,
+        "max_new_tokens": full_cap,
+        "auto_max_new_tokens_cap": full_cap,
+        "chunk_auto_max_new_tokens_cap": chunk_cap,
+    }
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -66,18 +182,38 @@ def parse_args() -> argparse.Namespace:
         "--text", action="append", default=[],
         help="Request text. Can be repeated for round-robin assignment.",
     )
+    p.add_argument(
+        "--use-language-patterns",
+        action="store_true",
+        help="Use built-in language-specific sample texts for round-robin requests.",
+    )
     p.add_argument("--language-id", default="ar")
     p.add_argument("--audio-prompt-path", default=None)
-    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Override request max_new_tokens. Default: language-aware estimate from the input text.",
+    )
     p.add_argument("--auto-max-new-tokens", action="store_true", default=True)
     p.add_argument(
         "--no-auto-max-new-tokens",
         dest="auto_max_new_tokens", action="store_false",
     )
-    p.add_argument("--auto-max-new-tokens-cap", type=int, default=128)
+    p.add_argument(
+        "--auto-max-new-tokens-cap",
+        type=int,
+        default=None,
+        help="Override whole-request auto token cap. Default: language-aware estimate from the input text.",
+    )
     p.add_argument("--chunk-target-words", type=int, default=5)
     p.add_argument("--chunk-max-words", type=int, default=8)
-    p.add_argument("--chunk-auto-max-new-tokens-cap", type=int, default=128)
+    p.add_argument(
+        "--chunk-auto-max-new-tokens-cap",
+        type=int,
+        default=None,
+        help="Override per-chunk token cap. Default: language-aware estimate from the input text.",
+    )
     p.add_argument("--timeout-s", type=float, default=180.0)
     p.add_argument("--save-dir", default=None)
     p.add_argument("--summary-json", default=None)
@@ -246,30 +382,74 @@ def _fmt(label: str, val: float) -> str:
 
 def main() -> None:
     args = parse_args()
-    texts = args.text or [DEFAULT_TEXT]
+    lang = _lang_key(args.language_id)
+    pattern_texts = LANGUAGE_PATTERNS.get(lang)
+    if args.text:
+        texts = args.text
+    elif args.use_language_patterns and pattern_texts:
+        texts = pattern_texts
+    elif pattern_texts:
+        texts = pattern_texts[:1]
+    else:
+        texts = [DEFAULT_TEXT]
     num_requests = args.num_requests or args.concurrency
 
     payloads = []
     for i in range(num_requests):
         text = texts[i % len(texts)]
+        estimated_caps = _estimate_token_caps(
+            text=text,
+            language_id=args.language_id,
+            chunk_target_words=args.chunk_target_words,
+            chunk_max_words=args.chunk_max_words,
+        )
+        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else estimated_caps["max_new_tokens"]
+        auto_cap = (
+            args.auto_max_new_tokens_cap
+            if args.auto_max_new_tokens_cap is not None
+            else estimated_caps["auto_max_new_tokens_cap"]
+        )
+        chunk_cap = (
+            args.chunk_auto_max_new_tokens_cap
+            if args.chunk_auto_max_new_tokens_cap is not None
+            else estimated_caps["chunk_auto_max_new_tokens_cap"]
+        )
         p: dict[str, Any] = {
             "text": text,
             "language_id": args.language_id,
-            "max_new_tokens": args.max_new_tokens,
+            "max_new_tokens": max_new_tokens,
             "auto_max_new_tokens": args.auto_max_new_tokens,
-            "auto_max_new_tokens_cap": args.auto_max_new_tokens_cap,
+            "auto_max_new_tokens_cap": auto_cap,
             "chunk_target_words": args.chunk_target_words,
             "chunk_max_words": args.chunk_max_words,
-            "chunk_auto_max_new_tokens_cap": args.chunk_auto_max_new_tokens_cap,
+            "chunk_auto_max_new_tokens_cap": chunk_cap,
         }
         if args.audio_prompt_path:
             p["audio_prompt_path"] = args.audio_prompt_path
-        payloads.append(p)
+        payloads.append({
+            "request": p,
+            "budget": {
+            "text_units": estimated_caps["text_units"],
+            "chunk_units": estimated_caps["chunk_units"],
+            "max_new_tokens": max_new_tokens,
+            "auto_max_new_tokens_cap": auto_cap,
+            "chunk_auto_max_new_tokens_cap": chunk_cap,
+            },
+        })
 
     if not args.quiet:
         print(f"Sending {num_requests} request(s) at concurrency={args.concurrency}")
         print(f"  endpoint : {args.url}")
         print(f"  text[0]  : {texts[0][:80]!r}")
+        first_budget = payloads[0].get("budget", {})
+        print(
+            "  budget[0]: "
+            f"text_units={first_budget.get('text_units')} "
+            f"chunk_units={first_budget.get('chunk_units')} "
+            f"max_new_tokens={first_budget.get('max_new_tokens')} "
+            f"auto_cap={first_budget.get('auto_max_new_tokens_cap')} "
+            f"chunk_cap={first_budget.get('chunk_auto_max_new_tokens_cap')}"
+        )
         print()
 
     wall_start = time.perf_counter()
@@ -280,7 +460,7 @@ def main() -> None:
                 run_stream_request,
                 url=args.url,
                 request_index=i,
-                payload=payloads[i],
+                payload=payloads[i]["request"],
                 timeout_s=args.timeout_s,
                 save_dir=args.save_dir,
             )
@@ -393,9 +573,12 @@ def main() -> None:
         summary = {
             "num_requests": num_requests,
             "concurrency": args.concurrency,
+            "language_id": args.language_id,
             "ok_count": len(ok),
             "error_count": len(err),
             "wall_s": wall_total_s,
+            "texts": texts,
+            "client_token_budgets": [p.get("budget", {}) for p in payloads],
             "results": results,
         }
         with open(args.summary_json, "w") as fh:
