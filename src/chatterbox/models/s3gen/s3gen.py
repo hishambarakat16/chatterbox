@@ -57,24 +57,6 @@ def _maybe_sync(device):
         torch.cuda.synchronize(device)
 
 
-def _tensor_max_length(value, *, fallback_shape_dim: int | None = None) -> int:
-    if value is None:
-        return 0
-    if torch.is_tensor(value):
-        if value.numel() == 0:
-            return 0
-        if value.ndim == 0:
-            return int(value.item())
-        return int(value.max().item())
-    if isinstance(value, np.ndarray):
-        if value.size == 0:
-            return 0
-        return int(value.max())
-    if fallback_shape_dim is not None and hasattr(value, "shape"):
-        return int(value.shape[fallback_shape_dim])
-    return int(value)
-
-
 def drop_invalid_tokens(x):
     assert len(x.shape) <= 2 and x.shape[0] == 1, "only batch size of one allowed for now"
     return x[x < SPEECH_VOCAB_SIZE]
@@ -299,14 +281,6 @@ class S3Token2Mel(torch.nn.Module):
         if speech_token_lens is None:
             speech_token_lens = torch.LongTensor([st.size(-1) for st in speech_tokens]).to(self.device)
 
-        speech_token_len = _tensor_max_length(speech_token_lens, fallback_shape_dim=-1)
-        prompt_token_len = _tensor_max_length(
-            ref_dict.get("prompt_token_len"),
-            fallback_shape_dim=-1,
-        )
-        prompt_feat_frames = int(ref_dict["prompt_feat"].shape[1]) if ref_dict.get("prompt_feat") is not None else 0
-        embedding_dim = int(ref_dict["embedding"].shape[-1]) if ref_dict.get("embedding") is not None else 0
-
         if _trace_s3_enabled():
             shape_logger.info("[models/s3gen/s3gen.py] token2mel.input")
             shape_logger.info("  speech_tokens %s %s %s", tuple(speech_tokens.shape), speech_tokens.dtype, speech_tokens.device)
@@ -328,17 +302,6 @@ class S3Token2Mel(torch.nn.Module):
         )
         _maybe_sync(self.device)
         profile["s3_token2mel_s"] = time.perf_counter() - token2mel_start
-        profile["s3_token2mel_batch_size"] = float(int(speech_tokens.shape[0]))
-        profile["s3_token2mel_speech_token_len"] = float(speech_token_len)
-        profile["s3_token2mel_prompt_token_len"] = float(prompt_token_len)
-        profile["s3_token2mel_total_token_len"] = float(prompt_token_len + speech_token_len)
-        profile["s3_token2mel_prompt_mel_frames"] = float(prompt_feat_frames)
-        profile["s3_token2mel_generated_mel_frames"] = float(int(output_mels.shape[-1]))
-        profile["s3_token2mel_total_mel_frames"] = float(prompt_feat_frames + int(output_mels.shape[-1]))
-        profile["s3_token2mel_mel_channels"] = float(int(output_mels.shape[1]) if output_mels.ndim >= 2 else 0)
-        profile["s3_token2mel_embedding_dim"] = float(embedding_dim)
-        profile["s3_token2mel_ratio"] = float(getattr(self.flow, "token_mel_ratio", 0))
-        profile["s3_token2mel_finalize"] = 1.0 if finalize else 0.0
         self._set_last_profile(profile)
         if _trace_s3_enabled() and _should_trace_event("token2mel.output"):
             shape_logger.info("[models/s3gen/s3gen.py] token2mel.output")
@@ -450,10 +413,6 @@ class S3Token2Wav(S3Token2Mel):
         output_wavs, output_sources = self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
         _maybe_sync(self.device)
         profile["s3_hift_s"] = time.perf_counter() - hift_start
-        profile["s3_hift_input_batch_size"] = float(int(speech_feat.shape[0]) if speech_feat.ndim >= 1 else 0)
-        profile["s3_hift_input_mel_channels"] = float(int(speech_feat.shape[1]) if speech_feat.ndim >= 2 else 0)
-        profile["s3_hift_input_mel_frames"] = float(int(speech_feat.shape[-1]) if speech_feat.ndim >= 1 else 0)
-        profile["s3_hift_output_samples"] = float(int(output_wavs.shape[-1]) if output_wavs.ndim >= 1 else 0)
         self._set_last_profile(profile)
         if _trace_s3_enabled() and _should_trace_event("hift.output"):
             shape_logger.info("[models/s3gen/s3gen.py] hift.output")

@@ -5,32 +5,6 @@ from torch import nn as nn
 from transformers import LlamaConfig, LlamaModel, LlamaPreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-# Transformers ≥4.36 replaced legacy tuple KV caches with DynamicCache objects.
-# Import DynamicCache if available so we can convert at the boundary.
-try:
-    from transformers import DynamicCache as _DynamicCache
-    _HAS_DYNAMIC_CACHE = True
-except ImportError:
-    _HAS_DYNAMIC_CACHE = False
-
-
-def _to_dynamic_cache(past_key_values):
-    """Convert a legacy tuple-of-tuples KV cache to DynamicCache if needed."""
-    if not _HAS_DYNAMIC_CACHE:
-        return past_key_values
-    if past_key_values is None or isinstance(past_key_values, _DynamicCache):
-        return past_key_values
-    return _DynamicCache.from_legacy_cache(past_key_values)
-
-
-def _to_legacy_cache(past_key_values):
-    """Convert a DynamicCache back to legacy tuple-of-tuples format."""
-    if not _HAS_DYNAMIC_CACHE:
-        return past_key_values
-    if past_key_values is None or not isinstance(past_key_values, _DynamicCache):
-        return past_key_values
-    return past_key_values.to_legacy_cache()
-
 
 class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
     """
@@ -120,7 +94,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
 
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
-            past_key_values=_to_dynamic_cache(past_key_values),
+            past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -136,7 +110,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
 
         return CausalLMOutputWithCrossAttentions(
             logits=logits,
-            past_key_values=_to_legacy_cache(tfmr_out.past_key_values),
+            past_key_values=tfmr_out.past_key_values,
             hidden_states=tfmr_out.hidden_states,
             attentions=tfmr_out.attentions,
         )

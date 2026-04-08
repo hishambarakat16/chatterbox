@@ -209,10 +209,8 @@ class T3DecodeScheduler:
                 shape_logger.info("  active_cohorts %s", len(self.active_cohorts))
 
     def _process_one_step(self, cohort: _ActiveScheduledCohort):
-        # Only log the first and last decode step to avoid flooding trace output.
-        _is_first_step = all(s.decode_step == 0 for s in cohort.cohort_state.active_states)
-        if _trace_t3_enabled() and _is_first_step:
-            shape_logger.info("[runtime/t3_scheduler.py] step_cohort (first step only)")
+        if _trace_t3_enabled():
+            shape_logger.info("[runtime/t3_scheduler.py] step_cohort")
             shape_logger.info("  batch_key %s", cohort.cohort_state.batch_key)
             shape_logger.info("  active_requests %s", len(cohort.cohort_state.active_states))
 

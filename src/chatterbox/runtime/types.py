@@ -12,8 +12,6 @@ class GenerationOptions:
     min_p: float = 0.05
     top_p: float = 1.0
     max_new_tokens: int = 1000
-    auto_max_new_tokens: bool = False
-    auto_max_new_tokens_cap: int = 128
 
     def merged(self, **overrides) -> "GenerationOptions":
         data = self.__dict__.copy()

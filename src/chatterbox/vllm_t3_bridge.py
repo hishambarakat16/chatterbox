@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import tempfile
-import time
 from pathlib import Path
 
 import torch
@@ -14,16 +12,37 @@ from huggingface_hub import snapshot_download
 from .models.t3.llama_configs import LLAMA_CONFIGS
 from .models.t3.modules.t3_config import T3Config
 
-shape_logger = logging.getLogger("chatterbox.shape")
-
-def _trace_shapes() -> bool:
-    return bool(os.getenv("CHATTERBOX_TRACE_SHAPES"))
-
 
 VLLM_T3_ARCHITECTURE = "ChatterboxT3ForCausalLM"
 BASE_T3_FILENAME = "t3_mtl23ls_v2.safetensors"
 HYDRA_HEADS_FILENAME = "t3_hydra_heads.safetensors"
 REPO_ID = "ResembleAI/chatterbox"
+
+
+def get_conditioning_seq_len(hp: T3Config | None = None) -> int:
+    hp = hp or T3Config.multilingual()
+    cond_len = 1  # speaker embedding
+    if hp.use_perceiver_resampler:
+        cond_len += 32
+    else:
+        cond_len += int(hp.speech_cond_prompt_len)
+    if hp.emotion_adv:
+        cond_len += 1
+    return cond_len
+
+
+def get_vllm_prompt_layout(hp: T3Config | None = None) -> dict[str, int]:
+    hp = hp or T3Config.multilingual()
+    text_token_offset = int(hp.speech_tokens_dict_size)
+    conditioning_token_id = int(text_token_offset + hp.text_tokens_dict_size)
+    return {
+        "speech_vocab_size": int(hp.speech_tokens_dict_size),
+        "text_vocab_size": int(hp.text_tokens_dict_size),
+        "text_token_offset": text_token_offset,
+        "conditioning_token_id": conditioning_token_id,
+        "conditioning_seq_len": int(get_conditioning_seq_len(hp)),
+        "input_vocab_size": int(conditioning_token_id + 1),
+    }
 
 
 def punc_norm(text: str) -> str:
@@ -93,22 +112,28 @@ def register_vllm_t3_model():
 
 def build_vllm_t3_config(hp: T3Config | None = None) -> dict:
     hp = hp or T3Config.multilingual()
+    prompt_layout = get_vllm_prompt_layout(hp)
     cfg = dict(LLAMA_CONFIGS[hp.llama_config_name])
     cfg.update(
         {
             "architectures": [VLLM_T3_ARCHITECTURE],
-            "vocab_size": hp.speech_tokens_dict_size,
+            "vocab_size": prompt_layout["input_vocab_size"],
             "bos_token_id": hp.start_speech_token,
             "eos_token_id": hp.stop_speech_token,
             "pad_token_id": hp.stop_speech_token,
             "chatterbox_text_vocab_size": hp.text_tokens_dict_size,
             "chatterbox_speech_vocab_size": hp.speech_tokens_dict_size,
+            "chatterbox_input_vocab_size": prompt_layout["input_vocab_size"],
+            "chatterbox_text_token_offset": prompt_layout["text_token_offset"],
+            "chatterbox_conditioning_token_id": prompt_layout["conditioning_token_id"],
+            "chatterbox_conditioning_seq_len": prompt_layout["conditioning_seq_len"],
             "chatterbox_start_text_token": hp.start_text_token,
             "chatterbox_stop_text_token": hp.stop_text_token,
             "chatterbox_start_speech_token": hp.start_speech_token,
             "chatterbox_stop_speech_token": hp.stop_speech_token,
+            "chatterbox_text_pos_embeddings": hp.max_text_tokens + 2,
             "chatterbox_speech_pos_embeddings": hp.max_speech_tokens + 4,
-            "chatterbox_prompt_embeds_required": True,
+            "chatterbox_prompt_embeds_required": False,
             "chatterbox_cfg_supported": False,
             "chatterbox_hydra_supported": False,
             "chatterbox_pos_strategy": "approx_absolute_speech_positions",
@@ -116,6 +141,31 @@ def build_vllm_t3_config(hp: T3Config | None = None) -> dict:
         }
     )
     return cfg
+
+
+def export_vllm_t3_tokenizer(output_dir: str | Path, *, config: dict | None = None) -> None:
+    config = config or build_vllm_t3_config(T3Config.multilingual())
+    output_dir = Path(output_dir)
+
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    vocab_size = int(config["vocab_size"])
+    vocab = {f"tok_{token_id}": token_id for token_id in range(vocab_size)}
+    tokenizer_obj = Tokenizer(WordLevel(vocab=vocab, unk_token="tok_0"))
+    tokenizer_obj.pre_tokenizer = WhitespaceSplit()
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_obj,
+        bos_token=f"tok_{int(config['bos_token_id'])}",
+        eos_token=f"tok_{int(config['eos_token_id'])}",
+        pad_token=f"tok_{int(config['pad_token_id'])}",
+        unk_token="tok_0",
+    )
+    tokenizer.model_max_length = int(config.get("max_position_embeddings", 2048))
+    tokenizer.save_pretrained(output_dir)
 
 
 def resolve_base_t3_checkpoint_dir(
@@ -205,7 +255,7 @@ def export_vllm_t3_model(
         "cfg_supported": False,
         "notes": [
             "This is the first vLLM T3 spike package.",
-            "Prompt embeddings are constructed outside vLLM.",
+            "The served vLLM model reconstructs the T3 prompt internally from token ids and conditioning inputs.",
             "Hydra and CFG are intentionally deferred.",
             "Decode-side learned speech positions are approximate in this spike.",
         ],
@@ -223,6 +273,7 @@ def export_vllm_t3_model(
         json.dumps(export_meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    export_vllm_t3_tokenizer(output_dir, config=config)
 
     target_weights = output_dir / "model.safetensors"
     if target_weights.exists() or target_weights.is_symlink():
@@ -247,13 +298,17 @@ def create_vllm_engine(
     dtype: str = "auto",
     max_model_len: int = 2048,
     enable_prefix_caching: bool = False,
+    enable_chunked_prefill: bool = True,
 ):
     LLM, _, _ = optional_import_vllm()
     register_vllm_t3_model()
+    # Register CFG processor — it is a no-op for requests that don't set
+    # extra_args, so it is always safe to include regardless of cfg_weight.
+    from .vllm_t3_model import T3CFGLogitsProcessor
     return LLM(
         model=str(model_dir),
-        skip_tokenizer_init=True,
-        enable_prompt_embeds=True,
+        skip_tokenizer_init=False,
+        enable_prompt_embeds=False,
         trust_remote_code=False,
         hf_overrides={"architectures": [VLLM_T3_ARCHITECTURE]},
         tensor_parallel_size=tensor_parallel_size,
@@ -262,22 +317,25 @@ def create_vllm_engine(
         dtype=dtype,
         max_model_len=max_model_len,
         enable_prefix_caching=enable_prefix_caching,
+        enable_chunked_prefill=enable_chunked_prefill,
+        enable_mm_embeds=True,
+        logits_processors=[T3CFGLogitsProcessor],
     )
 
 
 def make_sampling_params(*, options, hp: T3Config):
+    # NOTE: vLLM's native repetition_penalty uses prompt_token_ids for scatter
+    # penalty computation (vocab_size = speech_vocab_size ~6563). The T3 prompt
+    # contains conditioning placeholder token IDs that are ABOVE that range
+    # (conditioning_token_id = speech_vocab + text_vocab), which causes an
+    # index-out-of-bounds crash in scatter_add_ whenever repetition_penalty != 1.0.
+    # Repetition control is handled instead by T3CFGLogitsProcessor.
+    # Always pass 1.0 here to disable the vLLM penalty path.
     _, _, SamplingParams = optional_import_vllm()
     return SamplingParams(
         temperature=float(options.temperature),
         top_p=float(options.top_p),
         min_p=float(options.min_p),
-        # repetition_penalty is intentionally fixed at 1.0 (disabled).
-        # vLLM's penalty path calls _make_prompt_token_ids_tensor(), which reads
-        # token_ids_cpu for prompt tokens that were never written for embed-only
-        # requests (prompt_token_ids=None). In mixed prefill+decode batches the
-        # stale values exceed vocab_size and cause a CUDA device-side assert in
-        # scatter_add_. Speech-token repetition is already guarded by the stop
-        # token id; further suppression happens upstream in the T3 bridge.
         repetition_penalty=1.0,
         max_tokens=int(options.max_new_tokens),
         stop_token_ids=[int(hp.stop_speech_token)],
@@ -286,34 +344,107 @@ def make_sampling_params(*, options, hp: T3Config):
     )
 
 
-def _maybe_sync(device: str):
-    if str(device).startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def prepare_vllm_text_tokens(
+def make_cfg_pair_sampling_params(
     *,
-    tokenizer,
-    text: str,
-    language_id: str | None,
-    device: str,
-    return_metadata: bool = False,
-) -> torch.Tensor:
-    total_start = time.perf_counter()
-    normalize_start = time.perf_counter()
-    normalized = punc_norm(text)
-    normalize_s = time.perf_counter() - normalize_start
+    options,
+    hp: T3Config,
+    pair_id: str,
+    min_speech_tokens: int,
+) -> tuple:
+    """
+    Build (cond_sampling_params, uncond_sampling_params) for a CFG pair.
 
-    tokenize_start = time.perf_counter()
+    Both share the same generation settings; they differ only in extra_args,
+    which T3CFGLogitsProcessor reads to identify and link the pair.
+
+    Returns a (cond_sp, uncond_sp) tuple. When cfg_weight == 0 returns
+    (plain_sp, None) so callers can skip submitting the uncond prompt.
+    """
+    _, _, SamplingParams = optional_import_vllm()
+    cfg_weight = float(getattr(options, "cfg_weight", 0.0))
+    stop_token_id = int(hp.stop_speech_token)
+    base_kwargs = dict(
+        temperature=float(options.temperature),
+        top_p=float(options.top_p),
+        min_p=float(options.min_p),
+        repetition_penalty=1.0,
+        max_tokens=int(options.max_new_tokens),
+        stop_token_ids=[stop_token_id],
+        detokenize=False,
+        skip_special_tokens=False,
+    )
+    if cfg_weight <= 0.0:
+        return SamplingParams(**base_kwargs), None
+
+    cond_sp = SamplingParams(
+        **base_kwargs,
+        extra_args={
+            "cfg_weight": cfg_weight,
+            "is_uncond": False,
+            "pair_id": pair_id,
+            "stop_token_id": stop_token_id,
+            "min_speech_tokens": min_speech_tokens,
+        },
+    )
+    uncond_sp = SamplingParams(
+        **base_kwargs,
+        extra_args={
+            "cfg_weight": cfg_weight,
+            "is_uncond": True,
+            "pair_id": pair_id,
+            "stop_token_id": stop_token_id,
+            "min_speech_tokens": min_speech_tokens,
+        },
+    )
+    return cond_sp, uncond_sp
+
+
+def build_vllm_uncond_prompt(*, t3_cond) -> dict:
+    """
+    Build the unconditional vLLM prompt for CFG.
+
+    Uses the same speaker / emotion conditioning as the cond prompt but
+    replaces the text sequence with just SOT + EOT (empty text).  This
+    mirrors the original HF-replay approach where text_emb[uncond].zero_()
+    was used: the model sees "no meaningful text" for the uncond half.
+    """
+    hp = T3Config.multilingual()
+    layout = get_vllm_prompt_layout(hp)
+
+    # Empty text: only the boundary tokens, no content tokens
+    empty_text_ids = [int(hp.start_text_token), int(hp.stop_text_token)]
+    prompt_token_ids = [
+        int(layout["conditioning_token_id"]),
+        *[int(layout["text_token_offset"] + tok) for tok in empty_text_ids],
+        int(hp.start_speech_token),
+        int(hp.start_speech_token),
+    ]
+    conditioning = {
+        "speaker_emb": t3_cond.speaker_emb.detach().cpu(),
+        "cond_prompt_speech_tokens": (
+            None
+            if getattr(t3_cond, "cond_prompt_speech_tokens", None) is None
+            else t3_cond.cond_prompt_speech_tokens.detach().cpu()
+        ),
+        "emotion_adv": (
+            None
+            if getattr(t3_cond, "emotion_adv", None) is None
+            else t3_cond.emotion_adv.detach().cpu()
+        ),
+    }
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "multi_modal_data": {"conditioning": conditioning},
+    }
+
+
+def prepare_vllm_text_tokens(*, tokenizer, text: str, language_id: str | None, device: str) -> torch.Tensor:
+    normalized = punc_norm(text)
     text_tokens = tokenizer.text_to_tokens(
         normalized,
         language_id=language_id.lower() if language_id else None,
     ).to(device)
-    _maybe_sync(device)
-    tokenize_s = time.perf_counter() - tokenize_start
-
-    pad_start = time.perf_counter()
-    text_tokens = torch.nn.functional.pad(
+    return torch.nn.functional.pad(
         torch.nn.functional.pad(
             text_tokens,
             (1, 0),
@@ -322,112 +453,56 @@ def prepare_vllm_text_tokens(
         (0, 1),
         value=int(T3Config.multilingual().stop_text_token),
     )
-    _maybe_sync(device)
-    pad_s = time.perf_counter() - pad_start
-
-    if _trace_shapes():
-        flat = text_tokens.flatten()
-        shape_logger.info("[vllm_t3_bridge] prepare_vllm_text_tokens")
-        shape_logger.info("  text (raw) %r", text)
-        shape_logger.info("  text (normalized) %r", normalized)
-        shape_logger.info("  language_id %s", language_id)
-        shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
-        shape_logger.info("  text_tokens[0] (first token id) %s", int(flat[0]) if flat.numel() > 0 else "empty")
-        shape_logger.info("  text_tokens[-1] (last token id) %s", int(flat[-1]) if flat.numel() > 0 else "empty")
-        shape_logger.info("  text_tokens values %s", flat.tolist())
-
-    if not return_metadata:
-        return text_tokens
-
-    return text_tokens, {
-        "text_normalize_s": normalize_s,
-        "text_tokenize_s": tokenize_s,
-        "text_pad_s": pad_s,
-        "text_tokens_total_s": time.perf_counter() - total_start,
-    }
 
 
-def build_prompt_embeds(
+def build_vllm_prompt(
     *,
-    prompt_builder_t3,
     t3_cond,
     text_tokens: torch.Tensor,
     return_metadata: bool = False,
-) -> torch.Tensor:
-    total_start = time.perf_counter()
-    cond_to_device_start = time.perf_counter()
-    t3_cond = t3_cond.to(device=prompt_builder_t3.device)
-    text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=prompt_builder_t3.device)
-    initial_speech = prompt_builder_t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
-    _maybe_sync(prompt_builder_t3.device)
-    cond_to_device_s = time.perf_counter() - cond_to_device_start
+) -> dict | tuple[dict, dict]:
+    hp = T3Config.multilingual()
+    layout = get_vllm_prompt_layout(hp)
 
-    if _trace_shapes():
-        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.input")
-        shape_logger.info("  text_tokens %s %s %s", tuple(text_tokens.shape), text_tokens.dtype, text_tokens.device)
-        shape_logger.info("  initial_speech %s %s %s", tuple(initial_speech.shape), initial_speech.dtype, initial_speech.device)
-        shape_logger.info("  t3_cond.speaker_emb %s", tuple(t3_cond.speaker_emb.shape) if hasattr(t3_cond, "speaker_emb") and t3_cond.speaker_emb is not None else None)
-        shape_logger.info("  t3_cond.emotion_adv %s", tuple(t3_cond.emotion_adv.shape) if hasattr(t3_cond, "emotion_adv") and t3_cond.emotion_adv is not None else None)
-        cpt = getattr(t3_cond, "cond_prompt_speech_tokens", None)
-        shape_logger.info("  t3_cond.cond_prompt_speech_tokens %s", tuple(cpt.shape) if cpt is not None else None)
+    text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device="cpu")
+    text_token_ids = text_tokens.squeeze(0).tolist()
+    prompt_token_ids = [
+        int(layout["conditioning_token_id"]),
+        *[int(layout["text_token_offset"] + token_id) for token_id in text_token_ids],
+        int(hp.start_speech_token),
+        int(hp.start_speech_token),
+    ]
 
-    prepare_start = time.perf_counter()
-    embeds, _ = prompt_builder_t3.prepare_input_embeds(
-        t3_cond=t3_cond,
-        text_tokens=text_tokens,
-        speech_tokens=initial_speech,
-        cfg_weight=0.0,
-    )
-    if _trace_shapes():
-        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.after_prepare_input_embeds")
-        shape_logger.info("  embeds %s %s %s  (= cond + text + 1xBOS)", tuple(embeds.shape), embeds.dtype, embeds.device)
-
-    # Append a second BOS embedding at speech_pos=0 to match native T3 inference.
-    # T3.inference() builds: inputs_embeds = cat([prepare_input_embeds(...), bos_embed])
-    # where bos_embed = speech_emb(BOS) + speech_pos_emb[0].  Without this extra token
-    # the model context differs from training and it fails to emit EOS naturally.
-    bos_ids = torch.tensor(
-        [[int(prompt_builder_t3.hp.start_speech_token)]],
-        dtype=torch.long,
-        device=prompt_builder_t3.device,
-    )
-    extra_bos = prompt_builder_t3.speech_emb(bos_ids)  # (1, 1, dim)
-    extra_bos = extra_bos + prompt_builder_t3.speech_pos_emb.get_fixed_embedding(0)  # (1, 1, dim)
-    embeds = torch.cat([embeds, extra_bos], dim=1)  # (1, L+1, dim)
-
-    if _trace_shapes():
-        shape_logger.info("[vllm_t3_bridge] build_prompt_embeds.after_extra_bos")
-        shape_logger.info("  embeds %s %s %s  (= cond + text + 1xBOS(in_prepare) + 1xBOS(extra, speech_pos=0))", tuple(embeds.shape), embeds.dtype, embeds.device)
-        shape_logger.info("  total prompt seq_len sent to vLLM: %s", embeds.shape[1])
-
-    _maybe_sync(prompt_builder_t3.device)
-    prepare_s = time.perf_counter() - prepare_start
-
-    cpu_copy_start = time.perf_counter()
-    prompt_embeds = embeds.squeeze(0).detach().cpu()
-    _maybe_sync(prompt_builder_t3.device)
-    cpu_copy_s = time.perf_counter() - cpu_copy_start
+    conditioning = {
+        "speaker_emb": t3_cond.speaker_emb.detach().cpu(),
+        "cond_prompt_speech_tokens": None
+        if getattr(t3_cond, "cond_prompt_speech_tokens", None) is None
+        else t3_cond.cond_prompt_speech_tokens.detach().cpu(),
+        "emotion_adv": None
+        if getattr(t3_cond, "emotion_adv", None) is None
+        else t3_cond.emotion_adv.detach().cpu(),
+    }
+    prompt = {
+        "prompt_token_ids": prompt_token_ids,
+        "multi_modal_data": {"conditioning": conditioning},
+    }
     if not return_metadata:
-        return prompt_embeds
+        return prompt
 
     prompt_speech_tokens = getattr(t3_cond, "cond_prompt_speech_tokens", None)
     prompt_speech_token_len = 0 if prompt_speech_tokens is None else int(prompt_speech_tokens.shape[-1])
     text_token_len = int(text_tokens.shape[-1])
-    # +1 for the extra BOS appended above to match native T3 inference contract.
-    initial_speech_len = int(initial_speech.shape[-1]) + 1
-    prompt_embed_seq_len = int(prompt_embeds.shape[0])
-    prompt_embed_hidden_size = int(prompt_embeds.shape[1]) if prompt_embeds.ndim >= 2 else 0
-    cond_seq_len = prompt_embed_seq_len - text_token_len - initial_speech_len
+    initial_speech_len = 2
+    prompt_seq_len = int(layout["conditioning_seq_len"] + text_token_len + initial_speech_len)
     metadata = {
         "prompt_speech_token_len": prompt_speech_token_len,
         "text_token_len": text_token_len,
         "initial_speech_len": initial_speech_len,
-        "prompt_embed_seq_len": prompt_embed_seq_len,
-        "prompt_embed_hidden_size": prompt_embed_hidden_size,
-        "cond_seq_len": cond_seq_len,
-        "prompt_embed_cond_to_device_s": cond_to_device_s,
-        "prompt_embed_prepare_s": prepare_s,
-        "prompt_embed_cpu_s": cpu_copy_s,
-        "prompt_embed_total_s": time.perf_counter() - total_start,
+        "prompt_seq_len": prompt_seq_len,
+        "prompt_hidden_size": int(hp.n_channels),
+        "cond_seq_len": int(layout["conditioning_seq_len"]),
+        "prompt_token_len_before_mm": int(len(prompt_token_ids)),
+        "conditioning_token_id": int(layout["conditioning_token_id"]),
+        "text_token_offset": int(layout["text_token_offset"]),
     }
-    return prompt_embeds, metadata
+    return prompt, metadata

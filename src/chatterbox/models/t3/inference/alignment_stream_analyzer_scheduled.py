@@ -168,11 +168,7 @@ class ScheduledAlignmentController:
         if hasattr(self.tfmr, "config") and hasattr(self.tfmr.config, "output_attentions"):
             if self.original_output_attentions is None:
                 self.original_output_attentions = self.tfmr.config.output_attentions
-            # Newer transformers rejects output_attentions=True for sdpa; switch to eager.
-            cfg = self.tfmr.config
-            if getattr(cfg, "_attn_implementation", None) == "sdpa":
-                cfg._attn_implementation = "eager"
-            cfg.output_attentions = True
+            self.tfmr.config.output_attentions = True
 
     def step(
         self,

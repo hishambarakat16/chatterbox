@@ -468,8 +468,8 @@ def _advance_scheduled_cohort_greedy(
         next_inputs = [state.next_inputs_embeds for state in cohort.active_states]
         batched_past = _cat_past_key_values([state.past_key_values for state in cohort.active_states])
         batched_inputs = torch.cat(next_inputs, dim=0)
-        if os.getenv("CHATTERBOX_TRACE_SHAPES") and is_first_cached_step:
-            shape_logger.info("[models/t3/inference/scheduled_decode.py] decode.batch (first step only)")
+        if os.getenv("CHATTERBOX_TRACE_SHAPES"):
+            shape_logger.info("[models/t3/inference/scheduled_decode.py] decode.batch")
             shape_logger.info("  requests %s", len(cohort.active_states))
             shape_logger.info("  inputs_embeds %s %s %s", tuple(batched_inputs.shape), batched_inputs.dtype, batched_inputs.device)
         forward_started = time.perf_counter()
