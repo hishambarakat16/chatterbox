@@ -765,6 +765,7 @@ def _load_service_model():
         turbo_s3_checkpoint_dir=os.getenv("TURBO_S3_CHECKPOINT_DIR"),
         vllm_model_dir=os.getenv("VLLM_MODEL_DIR"),
         vllm_export_dir=os.getenv("VLLM_EXPORT_DIR"),
+        vllm_prompt_builder_device=os.getenv("VLLM_PROMPT_BUILDER_DEVICE", "cpu"),
         vllm_tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         vllm_gpu_memory_utilization=float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.5")),
         vllm_enforce_eager=_env_bool("VLLM_ENFORCE_EAGER", False),
