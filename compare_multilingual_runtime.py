@@ -54,6 +54,7 @@ def load_model(
     turbo_s3_checkpoint_dir: str | None = None,
     vllm_model_dir: str | None = None,
     vllm_export_dir: str | None = None,
+    vllm_prompt_builder_device: str = "cpu",
     vllm_tensor_parallel_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.5,
     vllm_enforce_eager: bool = False,
@@ -93,6 +94,7 @@ def load_model(
                 turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
                 vllm_model_dir=vllm_model_dir,
                 vllm_export_dir=vllm_export_dir,
+                vllm_prompt_builder_device=vllm_prompt_builder_device,
                 vllm_tensor_parallel_size=vllm_tensor_parallel_size,
                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
                 vllm_enforce_eager=vllm_enforce_eager,
@@ -127,6 +129,7 @@ def load_model(
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             vllm_model_dir=vllm_model_dir,
             vllm_export_dir=vllm_export_dir,
+            vllm_prompt_builder_device=vllm_prompt_builder_device,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
@@ -180,14 +183,6 @@ def _call_with_supported_kwargs(fn, **kwargs):
     return fn(**accepted)
 
 
-def resolve_repetition_penalty(impl: str, repetition_penalty: float | None) -> float:
-    if repetition_penalty is not None:
-        return repetition_penalty
-    if impl == "vllm_turbo_s3":
-        return 1.0
-    return 2.0
-
-
 def main():
     parser = argparse.ArgumentParser(description="Compare multilingual Chatterbox runtime variants.")
     parser.add_argument("--impl", choices=["baseline", "streaming", "concurrent", "scheduled", "scheduled_turbo_s3", "vllm_turbo_s3"], required=True)
@@ -205,6 +200,7 @@ def main():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
+    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
@@ -215,7 +211,7 @@ def main():
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--repetition-penalty", type=float)
+    parser.add_argument("--repetition-penalty", type=float, default=2.0)
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=1000)
@@ -225,7 +221,6 @@ def main():
     parser.add_argument("--trace-shapes", action="store_true")
     args = parser.parse_args()
 
-    args.repetition_penalty = resolve_repetition_penalty(args.impl, args.repetition_penalty)
     configure_shape_logging(args.trace_shapes)
 
     model = None
@@ -244,6 +239,7 @@ def main():
             turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
             vllm_model_dir=args.vllm_model_dir,
             vllm_export_dir=args.vllm_export_dir,
+            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             vllm_enforce_eager=args.vllm_enforce_eager,
@@ -314,6 +310,7 @@ def main():
             print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
             print(f"vllm_model_dir={args.vllm_model_dir}")
             print(f"vllm_export_dir={args.vllm_export_dir}")
+            print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
             print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_enforce_eager={args.vllm_enforce_eager}")

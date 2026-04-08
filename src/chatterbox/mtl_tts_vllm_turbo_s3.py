@@ -1,12 +1,12 @@
 from pathlib import Path
 import os
-from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
 
 from .models.s3gen import S3Gen
+from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -41,6 +41,19 @@ def _resolve_turbo_s3_checkpoint_dir(turbo_s3_checkpoint_dir: str | None) -> Pat
     )
 
 
+def _load_prompt_builder_t3(ckpt_dir: Path, device: str) -> T3:
+    t3 = T3(T3Config.multilingual())
+    state = load_safetensors(ckpt_dir / "t3_mtl23ls_v2.safetensors")
+    if "model" in state.keys():
+        state = state["model"][0]
+    t3.load_state_dict(state)
+    t3.to(device).eval()
+    # Keep only the prompt-building pieces local. vLLM owns the decoder body.
+    del t3.tfmr
+    t3.compiled = False
+    return t3
+
+
 class ChatterboxMultilingualVllmTurboS3TTS:
     def __init__(self, worker: ChatterboxMultilingualVllmWorker):
         self.sr = worker.sr
@@ -61,13 +74,13 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         turbo_s3_checkpoint_dir: str | None = None,
         vllm_model_dir: str | None = None,
         vllm_export_dir: str | None = None,
+        vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
-        vllm_enable_chunked_prefill: bool = True,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         ckpt_dir = Path(ckpt_dir)
@@ -83,6 +96,11 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             torch.load(base_ckpt_dir / "ve.pt", map_location=map_location, weights_only=True)
         )
         ve.to(device).eval()
+
+        prompt_builder_t3 = _load_prompt_builder_t3(
+            base_ckpt_dir,
+            vllm_prompt_builder_device,
+        )
 
         s3gen = S3Gen(meanflow=True)
         s3gen.load_state_dict(
@@ -105,26 +123,26 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 use_symlink=(not vllm_export_copy),
             )
 
-        engine_kwargs = {
-            "model_dir": vllm_model_dir,
-            "tensor_parallel_size": vllm_tensor_parallel_size,
-            "gpu_memory_utilization": vllm_gpu_memory_utilization,
-            "enforce_eager": vllm_enforce_eager,
-            "dtype": vllm_dtype,
-            "max_model_len": vllm_max_model_len,
-            "enable_prefix_caching": vllm_enable_prefix_caching,
-            "enable_chunked_prefill": vllm_enable_chunked_prefill,
-        }
-        vllm_engine = create_vllm_engine(**engine_kwargs)
+        vllm_engine = create_vllm_engine(
+            model_dir=vllm_model_dir,
+            tensor_parallel_size=vllm_tensor_parallel_size,
+            gpu_memory_utilization=vllm_gpu_memory_utilization,
+            enforce_eager=vllm_enforce_eager,
+            dtype=vllm_dtype,
+            max_model_len=vllm_max_model_len,
+            enable_prefix_caching=vllm_enable_prefix_caching,
+        )
 
         worker = ChatterboxMultilingualVllmWorker(
+            prompt_builder_t3=prompt_builder_t3,
+            prompt_builder_device=vllm_prompt_builder_device,
             vllm_engine=vllm_engine,
             s3gen=s3gen,
             ve=ve,
             tokenizer=tokenizer,
             device=device,
             default_conds=default_conds,
-            t3=SimpleNamespace(hp=T3Config.multilingual()),
+            t3=prompt_builder_t3,
         )
         return cls(worker)
 
@@ -136,13 +154,13 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         turbo_s3_checkpoint_dir: str | None = None,
         vllm_model_dir: str | None = None,
         vllm_export_dir: str | None = None,
+        vllm_prompt_builder_device: str = "cpu",
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_enforce_eager: bool = False,
         vllm_dtype: str = "auto",
         vllm_max_model_len: int = 2048,
         vllm_enable_prefix_caching: bool = False,
-        vllm_enable_chunked_prefill: bool = True,
         vllm_export_copy: bool = False,
     ) -> "ChatterboxMultilingualVllmTurboS3TTS":
         if device == "mps" and not torch.backends.mps.is_available():
@@ -169,23 +187,56 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             vllm_model_dir=vllm_model_dir,
             vllm_export_dir=vllm_export_dir,
+            vllm_prompt_builder_device=vllm_prompt_builder_device,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
             vllm_dtype=vllm_dtype,
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
-            vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
             vllm_export_copy=vllm_export_copy,
         )
 
     def close(self):
+        import gc
+        import torch
+
         engine = getattr(self.worker, "vllm_engine", None)
-        if engine is not None and hasattr(engine, "shutdown"):
+        if engine is not None:
+            # 1. Ask vLLM to shut down its EngineCore process cleanly.
+            if hasattr(engine, "shutdown"):
+                try:
+                    engine.shutdown()
+                except Exception:
+                    pass
+            # 2. Drop the engine reference so Python can GC its resources.
             try:
-                engine.shutdown()
+                self.worker.vllm_engine = None
             except Exception:
                 pass
+            del engine
+
+        # 3. Destroy distributed process group if one was created (tp > 1 or
+        #    vLLM initialised torch.distributed internally).
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+
+        # 4. Destroy vLLM model-parallel groups if the symbol exists
+        #    (older vLLM versions; safe no-op on newer ones).
+        try:
+            from vllm.distributed.parallel_state import destroy_model_parallel
+            destroy_model_parallel()
+        except Exception:
+            pass
+
+        # 5. Release any CUDA memory still cached by PyTorch's allocator.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def create_session(
         self,
@@ -195,10 +246,12 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         exaggeration=0.5,
         cfg_weight=0.0,
         temperature=0.8,
-        repetition_penalty=1.0,
+        repetition_penalty=2.0,
         min_p=0.05,
         top_p=1.0,
         max_new_tokens=1000,
+        auto_max_new_tokens=False,
+        auto_max_new_tokens_cap=128,
         session_id=None,
     ) -> StreamingSession:
         options = GenerationOptions(
@@ -210,6 +263,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.create_session(
             audio_prompt_path=audio_prompt_path,
@@ -230,6 +285,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> torch.Tensor:
         options = session.options.merged(
             language_id=language_id,
@@ -240,6 +297,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.generate(session=session, text=text, options=options)
 
@@ -251,10 +310,12 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         exaggeration=0.5,
         cfg_weight=0.0,
         temperature=0.8,
-        repetition_penalty=1.0,
+        repetition_penalty=2.0,
         min_p=0.05,
         top_p=1.0,
         max_new_tokens=1000,
+        auto_max_new_tokens=False,
+        auto_max_new_tokens_cap=128,
         session: StreamingSession | None = None,
     ) -> torch.Tensor:
         if session is None:
@@ -268,6 +329,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 min_p=min_p,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
+                auto_max_new_tokens=auto_max_new_tokens,
+                auto_max_new_tokens_cap=auto_max_new_tokens_cap,
             )
 
         return self.generate_with_session(
@@ -281,6 +344,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
 
     def generate_many_with_sessions(
@@ -296,6 +361,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> list[dict]:
         options_list = [
             session.options.merged(
@@ -307,6 +374,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
                 min_p=min_p,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
+                auto_max_new_tokens=auto_max_new_tokens,
+                auto_max_new_tokens_cap=auto_max_new_tokens_cap,
             )
             for session in sessions
         ]
@@ -329,6 +398,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
         min_p=None,
         top_p=None,
         max_new_tokens=None,
+        auto_max_new_tokens=None,
+        auto_max_new_tokens_cap=None,
     ) -> dict:
         options = session.options.merged(
             language_id=language_id,
@@ -339,6 +410,8 @@ class ChatterboxMultilingualVllmTurboS3TTS:
             min_p=min_p,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
+            auto_max_new_tokens=auto_max_new_tokens,
+            auto_max_new_tokens_cap=auto_max_new_tokens_cap,
         )
         return self.worker.inspect_prompt_embed(
             session=session,

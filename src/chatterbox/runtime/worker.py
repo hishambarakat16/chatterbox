@@ -58,6 +58,14 @@ class ChatterboxMultilingualStreamingWorker:
     def _default_s3_profile(self) -> dict:
         return {
             "session_conditioning_s": 0.0,
+            "session_audio_load_s": 0.0,
+            "session_resample_16k_s": 0.0,
+            "session_ref_trim_s": 0.0,
+            "session_t3_prompt_tokenize_s": 0.0,
+            "session_t3_prompt_to_device_s": 0.0,
+            "session_t3_prompt_total_s": 0.0,
+            "session_voice_encoder_s": 0.0,
+            "session_t3_cond_build_s": 0.0,
             "s3_ref_mel_s": 0.0,
             "s3_ref_speaker_s": 0.0,
             "s3_ref_tokenize_s": 0.0,
@@ -72,28 +80,57 @@ class ChatterboxMultilingualStreamingWorker:
 
     def build_conditionals_from_wav(self, wav_fpath: str, exaggeration: float) -> tuple[Conditionals, dict]:
         conditioning_start = time.perf_counter()
+        load_start = time.perf_counter()
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        session_profile = {
+            "session_audio_load_s": time.perf_counter() - load_start,
+            "session_resample_16k_s": 0.0,
+            "session_ref_trim_s": 0.0,
+            "session_t3_prompt_tokenize_s": 0.0,
+            "session_t3_prompt_to_device_s": 0.0,
+            "session_t3_prompt_total_s": 0.0,
+            "session_voice_encoder_s": 0.0,
+            "session_t3_cond_build_s": 0.0,
+        }
 
+        resample_start = time.perf_counter()
+        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        session_profile["session_resample_16k_s"] = time.perf_counter() - resample_start
+
+        trim_start = time.perf_counter()
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+        session_profile["session_ref_trim_s"] = time.perf_counter() - trim_start
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
-        session_profile = dict(self.s3gen.get_last_profile() or {})
+        session_profile.update(self.s3gen.get_last_profile() or {})
 
         t3_cond_prompt_tokens = None
         if plen := self.t3.hp.speech_cond_prompt_len:
+            prompt_total_start = time.perf_counter()
             s3_tokzr = self.s3gen.tokenizer
+            prompt_tokenize_start = time.perf_counter()
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+            _maybe_sync(self.device)
+            session_profile["session_t3_prompt_tokenize_s"] = time.perf_counter() - prompt_tokenize_start
+            prompt_to_device_start = time.perf_counter()
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+            _maybe_sync(self.device)
+            session_profile["session_t3_prompt_to_device_s"] = time.perf_counter() - prompt_to_device_start
+            session_profile["session_t3_prompt_total_s"] = time.perf_counter() - prompt_total_start
 
+        voice_encoder_start = time.perf_counter()
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        _maybe_sync(self.device)
+        session_profile["session_voice_encoder_s"] = time.perf_counter() - voice_encoder_start
 
+        cond_build_start = time.perf_counter()
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         _maybe_sync(self.device)
+        session_profile["session_t3_cond_build_s"] = time.perf_counter() - cond_build_start
         conds = Conditionals(t3_cond, s3gen_ref_dict)
         session_profile["session_conditioning_s"] = time.perf_counter() - conditioning_start
         if os.getenv("CHATTERBOX_TRACE_SHAPES") or os.getenv("CHATTERBOX_TRACE_S3_SHAPES"):

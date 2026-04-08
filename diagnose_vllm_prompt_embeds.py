@@ -3,39 +3,23 @@ import json
 import time
 from pathlib import Path
 
+from benchmark_multilingual_concurrency import (
+    describe_vllm_hydra_mode,
+    load_model,
+    maybe_sync,
+)
+
 
 DEFAULT_SENTENCES_FILE = Path(__file__).with_name("arabic_streaming_sentences.txt")
-_RUNTIME_HELPERS = None
-
-
-def runtime_helpers():
-    global _RUNTIME_HELPERS
-    if _RUNTIME_HELPERS is None:
-        from benchmark_multilingual_concurrency import (  # noqa: PLC0415
-            describe_vllm_hydra_mode,
-            load_model,
-            maybe_sync,
-        )
-
-        _RUNTIME_HELPERS = {
-            "describe_vllm_hydra_mode": describe_vllm_hydra_mode,
-            "load_model": load_model,
-            "maybe_sync": maybe_sync,
-        }
-    return _RUNTIME_HELPERS
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Diagnose the custom Chatterbox vLLM input path."
+        description="Diagnose the custom Chatterbox prompt-embed path used by vLLM."
     )
     parser.add_argument(
         "--mode",
-        choices=[
-            "inspect",
-            "sequential_singletons",
-            "batched",
-        ],
+        choices=["inspect", "sequential_singletons", "batched"],
         default="inspect",
     )
     parser.add_argument("--device", default="cuda")
@@ -44,6 +28,7 @@ def parse_args():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
+    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
@@ -52,9 +37,6 @@ def parse_args():
     prefix_group = parser.add_mutually_exclusive_group()
     prefix_group.add_argument("--vllm-enable-prefix-caching", action="store_true")
     prefix_group.add_argument("--no-vllm-prefix-caching", action="store_true")
-    chunked_prefill_group = parser.add_mutually_exclusive_group()
-    chunked_prefill_group.add_argument("--vllm-enable-chunked-prefill", action="store_true")
-    chunked_prefill_group.add_argument("--no-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--language-id", default="ar")
     parser.add_argument("--audio-prompt-path")
     parser.add_argument("--exaggeration", type=float, default=0.5)
@@ -107,7 +89,7 @@ def shape_key(metadata: dict) -> str:
         f"text_tok={metadata['t3_text_token_len']}"
         f"/prompt_speech={metadata['t3_prompt_speech_token_len']}"
         f"/cond={metadata['t3_cond_seq_len']}"
-        f"/prompt_seq={metadata['t3_prompt_seq_len']}"
+        f"/embed={metadata['t3_prompt_embed_seq_len']}"
     )
 
 
@@ -139,21 +121,7 @@ def inspect_requests(model, sessions, texts, args) -> list[dict]:
     return records
 
 
-def build_request_options(session, args):
-    return session.options.merged(
-        language_id=args.language_id,
-        exaggeration=args.exaggeration,
-        cfg_weight=args.cfg_weight,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
-        min_p=args.min_p,
-        top_p=args.top_p,
-        max_new_tokens=args.max_new_tokens,
-    )
-
-
 def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> list[dict]:
-    maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
     for row, session, text in zip(inspect_rows, sessions, texts):
         started = time.perf_counter()
@@ -188,13 +156,7 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
                 "wall_s": round(time.perf_counter() - started, 4),
                 "audio_ready_s": round(float(profile.get("audio_ready_s", 0.0)), 4) if profile else 0.0,
                 "t3_s": round(float(profile.get("t3_s", 0.0)), 4) if profile else 0.0,
-                "prompt_seq_len": int(profile.get("t3_prompt_seq_len", row["t3_prompt_seq_len"])),
-                "prompt_token_len_before_mm": int(
-                    profile.get(
-                        "t3_prompt_token_len_before_mm",
-                        row["t3_prompt_token_len_before_mm"],
-                    )
-                ),
+                "prompt_embed_seq_len": int(profile.get("t3_prompt_embed_seq_len", row["t3_prompt_embed_seq_len"])),
                 "cond_seq_len": int(profile.get("t3_cond_seq_len", row["t3_cond_seq_len"])),
             }
         )
@@ -202,7 +164,6 @@ def run_sequential_singletons(model, sessions, texts, inspect_rows, args) -> lis
 
 
 def run_batched(model, sessions, texts, inspect_rows, args) -> list[dict]:
-    maybe_sync = runtime_helpers()["maybe_sync"]
     results = []
     for batch_index, index_chunk in enumerate(chunked(list(range(len(texts))), args.batch_size)):
         session_chunk = [sessions[idx] for idx in index_chunk]
@@ -274,9 +235,6 @@ def build_summary(*, args, texts, inspect_rows, run_rows) -> dict:
 def main():
     args = parse_args()
     texts = load_texts(args)
-    helpers = runtime_helpers()
-    load_model = helpers["load_model"]
-    describe_vllm_hydra_mode = helpers["describe_vllm_hydra_mode"]
     model = load_model(
         "vllm_turbo_s3",
         args.device,
@@ -285,13 +243,13 @@ def main():
         turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
         vllm_model_dir=args.vllm_model_dir,
         vllm_export_dir=args.vllm_export_dir,
+        vllm_prompt_builder_device=args.vllm_prompt_builder_device,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_dtype=args.vllm_dtype,
         vllm_max_model_len=args.vllm_max_model_len,
         vllm_enable_prefix_caching=args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching,
-        vllm_enable_chunked_prefill=args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill,
     )
 
     sessions = [
@@ -318,9 +276,6 @@ def main():
     print(
         f"vllm_enable_prefix_caching={args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
     )
-    print(
-        f"vllm_enable_chunked_prefill={args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
-    )
     for note in describe_vllm_hydra_mode(
         impl="vllm_turbo_s3",
         hydra_checkpoint_dir=None,
@@ -343,9 +298,7 @@ def main():
                     "t3_text_token_len": row["t3_text_token_len"],
                     "t3_prompt_speech_token_len": row["t3_prompt_speech_token_len"],
                     "t3_cond_seq_len": row["t3_cond_seq_len"],
-                    "t3_prompt_seq_len": row["t3_prompt_seq_len"],
-                    "t3_prompt_hidden_size": row["t3_prompt_hidden_size"],
-                    "t3_prompt_token_len_before_mm": row["t3_prompt_token_len_before_mm"],
+                    "t3_prompt_embed_seq_len": row["t3_prompt_embed_seq_len"],
                     "text": row["text"],
                 },
                 ensure_ascii=False,

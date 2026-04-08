@@ -64,13 +64,13 @@ def load_model(
     turbo_s3_checkpoint_dir: str | None = None,
     vllm_model_dir: str | None = None,
     vllm_export_dir: str | None = None,
+    vllm_prompt_builder_device: str = "cpu",
     vllm_tensor_parallel_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.5,
     vllm_enforce_eager: bool = False,
     vllm_dtype: str = "auto",
     vllm_max_model_len: int = 2048,
     vllm_enable_prefix_caching: bool = False,
-    vllm_enable_chunked_prefill: bool = True,
     vllm_export_copy: bool = False,
 ):
     model_cls = resolve_model_cls(impl)
@@ -104,13 +104,13 @@ def load_model(
                 turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
                 vllm_model_dir=vllm_model_dir,
                 vllm_export_dir=vllm_export_dir,
+                vllm_prompt_builder_device=vllm_prompt_builder_device,
                 vllm_tensor_parallel_size=vllm_tensor_parallel_size,
                 vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
                 vllm_enforce_eager=vllm_enforce_eager,
                 vllm_dtype=vllm_dtype,
                 vllm_max_model_len=vllm_max_model_len,
                 vllm_enable_prefix_caching=vllm_enable_prefix_caching,
-                vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
                 vllm_export_copy=vllm_export_copy,
             )
         return model_cls.from_local(checkpoint_dir, device)
@@ -139,13 +139,13 @@ def load_model(
             turbo_s3_checkpoint_dir=turbo_s3_checkpoint_dir,
             vllm_model_dir=vllm_model_dir,
             vllm_export_dir=vllm_export_dir,
+            vllm_prompt_builder_device=vllm_prompt_builder_device,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             vllm_enforce_eager=vllm_enforce_eager,
             vllm_dtype=vllm_dtype,
             vllm_max_model_len=vllm_max_model_len,
             vllm_enable_prefix_caching=vllm_enable_prefix_caching,
-            vllm_enable_chunked_prefill=vllm_enable_chunked_prefill,
             vllm_export_copy=vllm_export_copy,
         )
     return model_cls.from_pretrained(device)
@@ -244,14 +244,6 @@ def percentile(values: list[float], q: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = index - lower
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
-def resolve_repetition_penalty(impl: str, repetition_penalty: float | None) -> float:
-    if repetition_penalty is not None:
-        return repetition_penalty
-    if impl == "vllm_turbo_s3":
-        return 1.0
-    return 2.0
 
 
 def _call_with_supported_kwargs(fn, **kwargs):
@@ -564,6 +556,7 @@ def main():
     parser.add_argument("--turbo-s3-checkpoint-dir")
     parser.add_argument("--vllm-model-dir")
     parser.add_argument("--vllm-export-dir")
+    parser.add_argument("--vllm-prompt-builder-device", default="cpu")
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
@@ -571,12 +564,10 @@ def main():
     parser.add_argument("--vllm-max-model-len", type=int, default=2048)
     parser.add_argument("--vllm-enable-prefix-caching", action="store_true")
     parser.add_argument("--no-vllm-prefix-caching", action="store_true")
-    parser.add_argument("--vllm-enable-chunked-prefill", action="store_true")
-    parser.add_argument("--no-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--vllm-export-copy", action="store_true")
     parser.add_argument("--cfg-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--repetition-penalty", type=float)
+    parser.add_argument("--repetition-penalty", type=float, default=2.0)
     parser.add_argument("--min-p", type=float, default=0.05)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=1000)
@@ -585,7 +576,6 @@ def main():
     parser.add_argument("--output-dir")
     args = parser.parse_args()
 
-    args.repetition_penalty = resolve_repetition_penalty(args.impl, args.repetition_penalty)
     configure_shape_logging(args.trace_shapes, trace_s3_shapes=args.trace_s3_shapes)
 
     model = None
@@ -604,6 +594,7 @@ def main():
             turbo_s3_checkpoint_dir=args.turbo_s3_checkpoint_dir,
             vllm_model_dir=args.vllm_model_dir,
             vllm_export_dir=args.vllm_export_dir,
+            vllm_prompt_builder_device=args.vllm_prompt_builder_device,
             vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             vllm_enforce_eager=args.vllm_enforce_eager,
@@ -611,9 +602,6 @@ def main():
             vllm_max_model_len=args.vllm_max_model_len,
             vllm_enable_prefix_caching=(
                 args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching
-            ),
-            vllm_enable_chunked_prefill=(
-                args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill
             ),
             vllm_export_copy=args.vllm_export_copy,
         )
@@ -635,6 +623,7 @@ def main():
             print(f"turbo_s3_checkpoint_dir={args.turbo_s3_checkpoint_dir}")
             print(f"vllm_model_dir={args.vllm_model_dir}")
             print(f"vllm_export_dir={args.vllm_export_dir}")
+            print(f"vllm_prompt_builder_device={args.vllm_prompt_builder_device}")
             print(f"vllm_tensor_parallel_size={args.vllm_tensor_parallel_size}")
             print(f"vllm_gpu_memory_utilization={args.vllm_gpu_memory_utilization}")
             print(f"vllm_enforce_eager={args.vllm_enforce_eager}")
@@ -643,10 +632,6 @@ def main():
             print(
                 "vllm_enable_prefix_caching="
                 f"{args.vllm_enable_prefix_caching and not args.no_vllm_prefix_caching}"
-            )
-            print(
-                "vllm_enable_chunked_prefill="
-                f"{args.vllm_enable_chunked_prefill or not args.no_vllm_chunked_prefill}"
             )
             for note in describe_vllm_hydra_mode(
                 impl=args.impl,
